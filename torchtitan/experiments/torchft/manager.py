@@ -24,6 +24,7 @@ from torchtitan.tools.logging import logger
 
 if importlib.util.find_spec("torchft") is not None:
     import torchft
+    from torchft.checkpointing.pg_transport import PGTransport
 
     if TYPE_CHECKING:
         from torchft import local_sgd
@@ -76,6 +77,31 @@ class TorchFTManager(Configurable):
         (https://github.com/pytorch/torchft/blob/360c5c534bdeac959507e9d238ba9f3902d3fda9/torchft/local_sgd.py#L41)
         """
 
+        manager_hostname: str | None = None
+        """
+        The hostname to advertise to the TorchFT lighthouse server if rank == 0.
+        """
+
+        use_pg_checkpoint_transport: bool = False
+        """
+        Whether to use the process group for checkpoint transport.
+        """
+
+        rank0_synchronization_only: bool = False
+        """
+        Whether inter-replica synchronization occurs only among rank 0. This allows training and healing in
+        heterogeneous configurations (i.e., varying sharding degree). Note that this will increase rank 0's
+        memory footprint and introduce potential network contention during inter-replica synchronization.
+        This feature is experimental.
+        """
+
+        copy_pseudogradients_to_cpu: bool = False
+        """
+        Whether to copy the pseudogradients to the CPU before the outer step when process_group is set to "gloo".
+        This flag is introduced as a workaround due to a bug when using a process group with the Gloo backend on
+        AMD GPU tensors. Ignored when process_group is not "gloo" or rank0_synchronization_only is "true".
+        """
+
     def __init__(
         self,
         config: Config,
@@ -87,11 +113,19 @@ class TorchFTManager(Configurable):
         if not has_torchft:
             raise ImportError("torchft is not installed. Please install it.")
 
+        self._rank0_synchronization_only = config.rank0_synchronization_only
+        if self._rank0_synchronization_only:
+            assert config.num_fragments == 1, "num_fragments > 1 not supported with rank 0 synchronization only"
+
         process_group_timeout = timedelta(milliseconds=config.process_group_timeout_ms)
         if config.process_group == "gloo":
             pg = torchft.ProcessGroupGloo(timeout=process_group_timeout)
+            if config.use_pg_checkpoint_transport:
+                pg_checkpoint_transport = PGTransport(pg, timeout=process_group_timeout, device="cpu")
         elif config.process_group == "nccl":
             pg = torchft.ProcessGroupNCCL(timeout=process_group_timeout)
+            if config.use_pg_checkpoint_transport:
+                pg_checkpoint_transport = PGTransport(pg, timeout=process_group_timeout, device="cuda")
         elif config.process_group == "mccl":
             import torchcomms
             from torchft.torchcomms import ProcessGroupTorchComms
@@ -110,6 +144,8 @@ class TorchFTManager(Configurable):
         # If the training method is specific, then the quorum should be synchronous
         self.use_async_quorum = config.semi_sync_method is None
 
+        init_sync = not config.rank0_synchronization_only
+        checkpoint_transport = pg_checkpoint_transport if config.use_pg_checkpoint_transport else None
         self._manager = torchft.Manager(
             pg=pg,
             min_replica_size=config.min_replica_size,
@@ -117,6 +153,11 @@ class TorchFTManager(Configurable):
             state_dict=None,
             use_async_quorum=self.use_async_quorum,
             replica_id=f"torchtitan_ft_{config.replica_id}",
+            hostname=config.manager_hostname,
+            init_sync=init_sync,
+            checkpoint_transport=checkpoint_transport,
+            rank0_synchronization_only=config.rank0_synchronization_only,
+            copy_pseudogradients_to_cpu=config.copy_pseudogradients_to_cpu
         )
         self.group_size = config.group_size
         self.replica_id = config.replica_id
@@ -133,6 +174,12 @@ class TorchFTManager(Configurable):
     def manager(self) -> "torchft.Manager":
         assert self._manager is not None
         return self._manager
+
+    @property
+    def rank0_synchronization_only(self) -> bool:
+        if not hasattr(self, "_rank0_synchronization_only"):
+            return False
+        return self._rank0_synchronization_only
 
     def get_dp_info(self, dp_degree: int, dp_rank: int) -> tuple[int, int]:
         if self.enabled:
