@@ -21,6 +21,42 @@ class FaultTolerance(FTManager.Config):
     is set.
     """
 
+    ###[START] Added for heloco optimizer
+
+    outer_optimizer: str = "nesterov"
+    """
+    Outer optimizer used by DiLoCo. Options: "nesterov", "mla" , "heloco".
+    """
+
+    outer_lr: float = 0.7
+    """
+    Learning rate for the DiLoCo outer optimizer.
+    """
+
+    outer_momentum: float = 0.9
+    """
+    Momentum for the DiLoCo outer optimizer.
+    """
+
+    outer_cos_ok: float = 0.2
+    """
+    HeLoCo alignment threshold. If cos(pseudo-gradient, momentum) is larger
+    than this value, the tensor update is kept unchanged.
+    """
+
+    outer_correction_strength: float = 0.5
+    """
+    HeLoCo correction strength. 0 means no correction; 1 means strongest
+    rotation toward the momentum direction.
+    """
+
+    outer_eps: float = 1e-8
+    """
+    Numerical stability constant for HeLoCo.
+    """
+
+    ### [END] Added for heloco optimizer
+
     should_quantize: bool = False
     """
     Whether to quantize the gradients before allreduce.
