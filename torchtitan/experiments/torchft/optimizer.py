@@ -11,7 +11,7 @@ from typing import Any, TYPE_CHECKING
 import torch.nn as nn
 
 from torchtitan.components.checkpoint_utils import init_optim_state
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 
 if TYPE_CHECKING:
     from torchtitan.experiments.torchft.manager import TorchFTManager
@@ -86,3 +86,27 @@ class TorchFTOptimizersContainer(OptimizersContainer):
             self._use_ft_optimizer = True
         else:
             super().zero_grad(*args, **kwargs)
+
+
+def default_ft_adamw(lr: float = 8e-4, **kwargs: Any) -> TorchFTOptimizersContainer.Config:
+    """Create an OptimizersContainer.Config with a catch-all AdamW param group.
+
+    Use as a convenience for the common case::
+
+        optimizer=default_adamw(lr=3e-4)
+    """
+    return TorchFTOptimizersContainer.Config(
+        param_groups=[
+            ParamGroupConfig(
+                pattern=r".*",
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": lr,
+                    "betas": (0.9, 0.95),
+                    "eps": 1e-8,
+                    "weight_decay": 0.1,
+                    **kwargs,
+                },
+            )
+        ]
+    )
