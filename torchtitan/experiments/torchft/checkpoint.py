@@ -47,7 +47,7 @@ from torchtitan.experiments.torchft.manager import TorchFTManager
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
-from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
+from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 
 
 class TorchFTCheckpointManager(CheckpointManager):
@@ -153,8 +153,8 @@ class TorchFTCheckpointManager(CheckpointManager):
                 # overwrite cached state dict with full_state_dict == True
                 model.cache_state_dict = model._get_state_dict()
 
-                assert isinstance(optimizers, FTOptimizersContainer)
-                def optimizer_init_cache_state_dict(self: FTOptimizersContainer) -> None:
+                assert isinstance(optimizers, TorchFTOptimizersContainer)
+                def optimizer_init_cache_state_dict(self: TorchFTOptimizersContainer) -> None:
                     options = StateDictOptions(
                         full_state_dict=True,
                         flatten_optimizer_state_dict=False
@@ -169,7 +169,7 @@ class TorchFTCheckpointManager(CheckpointManager):
                         for k, v in sd.items()
                     }
 
-                def optimizer_load_state_dict(self: FTOptimizersContainer, state_dict: dict[str, Any]) -> None:
+                def optimizer_load_state_dict(self: TorchFTOptimizersContainer, state_dict: dict[str, Any]) -> None:
                     self.cache_state_dict = {}
                     options = StateDictOptions(
                         full_state_dict=True,
@@ -183,8 +183,8 @@ class TorchFTCheckpointManager(CheckpointManager):
                     list(map(func, self.model_parts, self.optimizers))
                     self.init_cache_state_dict()
 
-                FTOptimizersContainer.init_cache_state_dict = optimizer_init_cache_state_dict
-                FTOptimizersContainer.load_state_dict = optimizer_load_state_dict
+                TorchFTOptimizersContainer.init_cache_state_dict = optimizer_init_cache_state_dict
+                TorchFTOptimizersContainer.load_state_dict = optimizer_load_state_dict
             
             optimizers.init_cache_state_dict()
 
