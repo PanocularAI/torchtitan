@@ -1,0 +1,256 @@
+# Copyright (c) Panocular AI.
+#
+# PureLearnerReplica: the shared base for the decoupled-generation strategies
+# (async_inference, heloco_async_inference). A pure learner runs NO local
+# generation -- one trainer GPU, all training rollouts arrive from a pool of
+# REMOTE generator workers through a queue -- which is prime-rl's
+# decoupled-generation shape (arXiv:2505.07291): inference lives on separate
+# machines from training. Colocating generation with the trainer would just
+# be the single-node "local" baseline with an async buffer, so a pure learner
+# spawns no vLLM at all.
+#
+# This base owns everything the two decoupled strategies share:
+#   - a generator-less actor spawn (_spawn_trainer_only): trainer mesh only,
+#     no GeneratorRouter, no TorchStore;
+#   - the rollout consumer (_consume_remote_rollouts) + bounded buffer +
+#     fail-fast liveness check (_buffer_get_checked) + staleness-bounded batch
+#     assembly (_collect_and_build);
+#   - a no-op _refresh_generators (nothing local to refresh) and a
+#     _validate_fixed that skips trainer-side validation (a pure learner has
+#     no generator; the learning curve is the per-window mean reward of the
+#     remote workers' rollouts, which the mixin's train() already logs as it
+#     consumes them).
+#
+# Subclasses supply: the rollout SOURCE (_next_rollout_batch), the staleness
+# REFERENCE (_staleness_reference), the coordination boundary (_window_sync),
+# and the trainer actor class + any client/relay wiring in setup_async.
+
+import asyncio
+import logging
+from dataclasses import dataclass
+
+from monarch.spmd import setup_torch_elastic_env_async
+
+from torchtitan.experiments.async_rl.controller import RLControllerMixin
+
+from torchtitan.experiments.rl.trainer import RLTrainer
+
+logger = logging.getLogger(__name__)
+
+
+class PureLearnerReplica(RLControllerMixin, RLTrainer):
+    """Base for a trainer that runs no local generation and consumes all
+    training rollouts from a remote generator pool via a queue. Subclasses
+    implement ``_next_rollout_batch`` (the queue source), ``_staleness_reference``
+    (the version this replica compares consumed rollouts against), and
+    ``_window_sync`` (their coordination), and call ``_spawn_trainer_only`` from
+    their ``setup_async``."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RLTrainer.Config):
+        sync_every: int = 4
+        """Local training steps per logged window."""
+        num_outer_steps: int = 0
+        """Fixed number of windows to run (step-bound). Mutually exclusive with
+        train_seconds: set exactly one."""
+        train_seconds: float = 0.0
+        """Wall-clock training budget (time-bound). Mutually exclusive with
+        num_outer_steps: set exactly one."""
+        replica_id: int = 0
+        """Identifier for logging."""
+        num_generators: int = 0
+        """Always 0: a pure learner runs no local vLLM (generation is fully
+        decoupled onto the remote worker pool). Kept as an explicit field so
+        ``async_rl/train.py`` provisions only the trainer GPU and spawns no
+        generator meshes."""
+        max_staleness: int = 4
+        """Maximum version lag (in the subclass's staleness-reference space) of
+        a consumed rollout batch; staler batches are dropped at consume time
+        (prime-rl's async_level, enforced by dropping)."""
+        buffer_groups: int = 0
+        """Rollout-buffer capacity in groups; a full buffer back-pressures the
+        consumer. 0 = two steps' worth (2 * num_groups_per_rollout_batch)."""
+        queue_poll_interval_s: float = 0.5
+        """Seconds to wait before re-polling the rollout source when it yields
+        nothing (only relevant for a non-blocking source, e.g. a remote hub)."""
+
+        def __post_init__(self):
+            RLTrainer.Config.__post_init__(self)
+            if self.sync_every < 1:
+                raise ValueError(f"sync_every must be >= 1, got {self.sync_every}")
+            if (self.num_outer_steps > 0) == (self.train_seconds > 0):
+                raise ValueError(
+                    "Set exactly one of num_outer_steps (step-bound run) or "
+                    "train_seconds (time-bound run); got num_outer_steps="
+                    f"{self.num_outer_steps}, train_seconds={self.train_seconds}"
+                )
+            if self.max_staleness < 1:
+                raise ValueError(
+                    f"max_staleness must be >= 1, got {self.max_staleness}"
+                )
+            if self.num_generators != 0:
+                raise ValueError(
+                    "a pure learner runs no local generators (generation is "
+                    "fully decoupled onto the remote worker pool); "
+                    f"num_generators must be 0, got {self.num_generators}"
+                )
+
+    # ------------------------------------------------------------------ #
+    # Generator-less actor spawn.
+    # ------------------------------------------------------------------ #
+
+    async def _spawn_trainer_only(
+        self, *, trainer_mesh, generator_meshes, policy_trainer_cls
+    ):
+        """Spawn ONLY the trainer actor (one learner GPU, ``policy_trainer_cls``)
+        -- no generator mesh, no GeneratorRouter, no TorchStore. ``generator_meshes``
+        must be empty (train.py spawns none when num_generators=0); it's accepted
+        only to match the launcher's setup_async signature. ``generator_router``
+        stays None (from RLTrainer.__init__), which close() tolerates."""
+        cfg = self.config
+        if generator_meshes:
+            raise ValueError(
+                "a pure learner spawns no generators, but "
+                f"{len(generator_meshes)} generator mesh(es) were provisioned; "
+                "set num_generators=0"
+            )
+        trainer_parallelism = cfg.trainer.parallelism
+        dp_shard = max(trainer_parallelism.data_parallel_shard_degree, 1)
+        self.trainer_dp_degree = (
+            trainer_parallelism.data_parallel_replicate_degree * dp_shard
+        )
+        self._proc_meshes = [trainer_mesh]
+        await setup_torch_elastic_env_async(trainer_mesh)
+        self.trainer = trainer_mesh.spawn(
+            "trainer",
+            policy_trainer_cls,
+            cfg.trainer,
+            model_spec=cfg.model_spec,
+            hf_assets_path=cfg.hf_assets_path,
+            generator_dtype=cfg.generator.model_dtype,
+            compile_config=cfg.compile,
+            output_dir=cfg.dump_folder,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Rollout source + staleness reference (subclass-provided).
+    # ------------------------------------------------------------------ #
+
+    async def _next_rollout_batch(self):
+        """Return one ``(worker_id, version, groups)`` batch from the remote
+        generator pool, or ``None`` if none is available right now (the base
+        consumer then waits ``queue_poll_interval_s`` and retries)."""
+        raise NotImplementedError
+
+    def _staleness_reference(self) -> int:
+        """The current version a consumed rollout's stamped version is compared
+        against for the ``max_staleness`` bound (e.g. the latest published
+        checkpoint version, or the shared parameter-server revision)."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------ #
+    # Consumer side.
+    # ------------------------------------------------------------------ #
+
+    async def _consume_remote_rollouts(self) -> None:
+        """Drain the remote generator pool into the local buffer, tagging each
+        group with the batch's generation version. Runs until cancelled."""
+        while True:
+            batch = await self._next_rollout_batch()
+            if batch is None:
+                await asyncio.sleep(self.config.queue_poll_interval_s)
+                continue
+            _worker_id, version, groups = batch
+            for group in groups:
+                await self._buffer.put((group, version))
+
+    async def _buffer_get_checked(self):
+        """buffer.get that fails fast if the single remote-consumer task dies
+        -- otherwise the trainer would silently wait on the buffer forever
+        (there are no local producers; the consumer task is the only feeder)."""
+        get_task = asyncio.ensure_future(self._buffer.get())
+        try:
+            while not get_task.done():
+                consumer = self._remote_consumer_task
+                if consumer.done():
+                    if not consumer.cancelled() and consumer.exception() is not None:
+                        raise RuntimeError(
+                            "remote rollout consumer died"
+                        ) from consumer.exception()
+                    raise RuntimeError(
+                        "remote rollout consumer exited while the trainer "
+                        "still needs data"
+                    )
+                await asyncio.wait(
+                    {get_task, consumer}, return_when=asyncio.FIRST_COMPLETED
+                )
+            return get_task.result()
+        finally:
+            if not get_task.done():
+                get_task.cancel()
+
+    async def _collect_and_build(self, step: int):
+        """Assemble one training step's batch from the buffer, dropping groups
+        staler than max_staleness (in the subclass's staleness-reference
+        space). This overrides the mixin's generator-fanout collector, so
+        _run_window's always-on pipeline overlaps this pop+build+batch with
+        training instead of driving local generation."""
+        await self.trainer.sync_log_step.call(step)
+        num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
+        rollout_groups = []
+        collected_tokens = 0
+        while collected_tokens < num_tokens_target:
+            group, version = await self._buffer_get_checked()
+            if self._staleness_reference() - version > self.config.max_staleness:
+                self._num_dropped += 1
+                continue
+            rollout_groups.append(group)
+            collected_tokens += sum(
+                len(r.turns[-1].prompt_token_ids)
+                + len(r.turns[-1].completion_token_ids)
+                - 1
+                for r in group.rollouts
+                if r.turns
+            )
+        episodes, _ = self._build_episodes(rollout_groups)
+        microbatches, num_global_valid_tokens, _ = self.batcher.batch(
+            episodes, dp_degree=self.trainer_dp_degree
+        )
+        return rollout_groups, episodes, microbatches, num_global_valid_tokens
+
+    async def _refresh_generators(self) -> None:
+        """No-op: there is no local generator to refresh (the remote workers
+        pull weights from the relay tier, out of band from the train step)."""
+
+    # ------------------------------------------------------------------ #
+    # No trainer-side validation (a pure learner runs no generator).
+    # ------------------------------------------------------------------ #
+
+    async def _validate_fixed(self, step: int):
+        """Validation needs greedy generation, which a pure learner can't do
+        (no vLLM here). Skip it: the learning curve is instead the per-window
+        mean reward of the remote workers' rollouts, which train() already logs
+        as it consumes them (it tracks a greedy held-out eval closely -- corr
+        ~0.77, gap ~0.03 across the overnight runs). Returns no metrics so the
+        mixin's train() logs val=nan without touching a generator."""
+        return []
+
+    # ------------------------------------------------------------------ #
+    # Controller-loop hooks shared by both strategies.
+    # ------------------------------------------------------------------ #
+
+    async def _train_setup(self) -> None:
+        cfg = self.config
+        self._buffer = asyncio.Queue(
+            maxsize=cfg.buffer_groups or 2 * cfg.num_groups_per_rollout_batch
+        )
+        self._num_dropped = 0
+        self._remote_consumer_task = asyncio.create_task(
+            self._consume_remote_rollouts(), name="remote_rollout_consumer"
+        )
+
+    async def _train_cleanup(self) -> None:
+        task = getattr(self, "_remote_consumer_task", None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
