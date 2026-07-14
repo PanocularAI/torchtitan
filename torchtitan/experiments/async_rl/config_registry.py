@@ -292,14 +292,13 @@ def rl_heloco_async_inference_qwen3_0_6b(
     Each trainer pops rollouts from that queue, trains, and pushes its
     pseudo-gradient to the HeLoCo parameter server (no barrier); any trainer
     may consume any worker's rollouts. The hub
-    (torchtitan.experiments.async_rl.heloco_async_inference.server) co-hosts
-    the parameter server, the shared queue, and a relay tier that republishes
-    the CURRENT global theta (the consensus weights, not any one trainer's
-    copy) for the generator pool to pull -- start it with
-    ``python -m torchtitan.experiments.async_rl.heloco_async_inference.server``.
-    rollout_queue_address is required (usually
-    $HELOCO_ASYNC_INFERENCE_HUB_ADDR, the same address workers'
-    relay_addresses/trainer_rollout_address point at). Loss is stock GRPO.
+    (torchtitan.experiments.async_rl.heloco_async_inference.server)
+    publishes the CURRENT global theta (the consensus weights, not any one
+    trainer's copy) to a relay process for the generator pool to pull. Start
+    the coordination plane first: async_inference.relay,
+    async_inference.rollout_queue, then heloco_async_inference.server.
+    rollout_queue_address is required (usually $ROLLOUT_QUEUE_ADDR, the same
+    queue workers' rollout_queue_address points at). Loss is stock GRPO.
     """
     return wrap_replica(
         HeLoCoAsyncInferenceReplica,
@@ -400,11 +399,9 @@ def rl_async_inference_qwen3_0_6b(
     num_outer_steps: int = 0,
     max_staleness: int = 4,
     relay_addresses: str = "",
+    rollout_queue_address: str = "",
     num_shards: int = 4,
     publish_every: int = 1,
-    rollout_queue_host: str = "0.0.0.0",
-    rollout_queue_port: int = 8767,
-    rollout_queue_maxsize: int = 64,
     *,
     model: str = "qwen3",
     flavor: str = "0.6B",
@@ -413,15 +410,17 @@ def rl_async_inference_qwen3_0_6b(
 ) -> AsyncInferenceReplica.Config:
     """Trainer role of prime-rl (arXiv:2505.07291): ONE pure-learner trainer
     (1 GPU, no local vLLM) fed entirely by a pool of remote generator workers
-    (rl_async_inference_worker_*) on their own machines. The trainer consumes
-    rollouts from its embedded queue under a max_staleness bound, trains, and
-    shards + publishes its weights to relay_addresses every publish_every
-    windows (SHARDCAST-style) -- plus an initial publish at startup so the
-    workers can bootstrap. relay_addresses is required -- start relay servers
-    with ``python -m torchtitan.experiments.async_rl.async_inference.relay``
-    first. Workers push rollouts back to this trainer's embedded queue at
-    rollout_queue_host:port -- point their $ASYNC_INFERENCE_TRAINER_ROLLOUT_ADDR
-    at it, and their $ASYNC_INFERENCE_RELAY_ADDRS at the relay servers.
+    (rl_async_inference_worker_*) on their own machines. The trainer pops
+    rollouts from the standalone queue process at rollout_queue_address under
+    a max_staleness bound, trains, and shards + publishes its weights to
+    relay_addresses every publish_every windows (SHARDCAST-style) -- plus an
+    initial publish at startup so the workers can bootstrap. Both addresses
+    are required -- start the servers first:
+    ``python -m torchtitan.experiments.async_rl.async_inference.relay`` and
+    ``python -m torchtitan.experiments.async_rl.async_inference.rollout_queue``.
+    Workers push rollouts to the same queue
+    ($ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
+    ($ASYNC_INFERENCE_RELAY_ADDRS).
     """
     return wrap_replica(
         AsyncInferenceReplica,
@@ -438,11 +437,9 @@ def rl_async_inference_qwen3_0_6b(
         num_outer_steps=num_outer_steps,
         max_staleness=max_staleness,
         relay_addresses=relay_addresses,
+        rollout_queue_address=rollout_queue_address,
         num_shards=num_shards,
         publish_every=publish_every,
-        rollout_queue_host=rollout_queue_host,
-        rollout_queue_port=rollout_queue_port,
-        rollout_queue_maxsize=rollout_queue_maxsize,
     )
 
 
@@ -464,7 +461,7 @@ def rl_async_inference_llama3_8b(**kwargs) -> AsyncInferenceReplica.Config:
 def rl_async_inference_worker_qwen3_0_6b(
     hf_assets_path: str | None = None,
     relay_addresses: str = "",
-    trainer_rollout_address: str = "",
+    rollout_queue_address: str = "",
     worker_id: int = 0,
     group_size: int = 8,
     groups_per_round: int = 2,
@@ -480,8 +477,8 @@ def rl_async_inference_worker_qwen3_0_6b(
     async_inference/worker.py), so this copies only what a generator needs
     out of base_rl_config() rather than going through wrap_replica (which
     assumes an RLTrainer.Config-shaped target). relay_addresses (weights in)
-    and trainer_rollout_address (rollouts out, this worker's counterpart to
-    the trainer's rollout_queue_host:port) are both required.
+    and rollout_queue_address (rollouts out, the standalone queue process both
+    this worker and the trainer talk to) are both required.
     """
     base = base_rl_config(
         model=model,
@@ -497,7 +494,7 @@ def rl_async_inference_worker_qwen3_0_6b(
         group_size=group_size,
         groups_per_round=groups_per_round,
         relay_addresses=relay_addresses,
-        trainer_rollout_address=trainer_rollout_address,
+        rollout_queue_address=rollout_queue_address,
         worker_id=worker_id,
         poll_interval_s=poll_interval_s,
         num_rounds=num_rounds,
@@ -514,7 +511,7 @@ def rl_async_inference_worker_qwen3_1_7b(**kwargs) -> AsyncInferenceWorker.Confi
 def rl_heloco_async_inference_worker_qwen3_0_6b(
     hf_assets_path: str | None = None,
     relay_addresses: str = "",
-    trainer_rollout_address: str = "",
+    rollout_queue_address: str = "",
     worker_id: int = 0,
     group_size: int = 8,
     groups_per_round: int = 8,
@@ -531,9 +528,9 @@ def rl_heloco_async_inference_worker_qwen3_0_6b(
     upgrading opportunistically -- which is the definition of a decoupled
     async generator). These workers are the trainers' SOLE rollout source (no
     trainer here runs any local generation), and there can be many of them
-    feeding many trainers through the one hub. Point both relay_addresses
-    (weights in) and trainer_rollout_address (rollouts out) at the hub's queue
-    address ($HELOCO_ASYNC_INFERENCE_HUB_ADDR). ``groups_per_round`` defaults
+    feeding many trainers through the one hub. Point relay_addresses
+    (weights in) at the relay process and rollout_queue_address (rollouts out)
+    at the shared queue process ($ROLLOUT_QUEUE_ADDR). ``groups_per_round`` defaults
     higher than the base preset so a small generator pool fills a trainer's
     per-window token target in a few rounds.
     """
@@ -551,7 +548,7 @@ def rl_heloco_async_inference_worker_qwen3_0_6b(
         group_size=group_size,
         groups_per_round=groups_per_round,
         relay_addresses=relay_addresses,
-        trainer_rollout_address=trainer_rollout_address,
+        rollout_queue_address=rollout_queue_address,
         worker_id=worker_id,
         poll_interval_s=poll_interval_s,
         num_rounds=num_rounds,

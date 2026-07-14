@@ -378,7 +378,9 @@ class RelayClient:
                     return None
                 resp.raise_for_status()
                 data = await resp.json()
-        except aiohttp.ClientError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            # TimeoutError too: aiohttp raises plain asyncio.TimeoutError (not
+            # a ClientError) on a slow relay; treat it as this relay failing.
             self._record_failure(url)
             return None
         manifest = CheckpointManifest.from_json(data)
@@ -399,7 +401,7 @@ class RelayClient:
                     data = await resp.read()
                 total_bytes += len(data)
                 shard_bytes.append(data)
-        except aiohttp.ClientError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             self._record_failure(url)
             return None
         self._record_success(url, total_bytes, time.monotonic() - t0)

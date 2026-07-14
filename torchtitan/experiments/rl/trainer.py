@@ -9,9 +9,11 @@ RL trainer used for synchronous grpo training.
 """
 
 import asyncio
+import itertools
 import logging
 import math
 import os
+import socket
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +46,36 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+# Below the OS ephemeral range (32768+), so dynamic allocations by unrelated
+# processes can never take these; distinct from the launchers' 29500+ rdzv
+# ports and the coordinator servers' 295xx/87xx defaults.
+_ELASTIC_PORT_BASE = 29800
+_mesh_counter = itertools.count()
+
+
+async def setup_mesh_elastic_env(mesh: ProcMesh) -> None:
+    """setup_torch_elastic_env_async with a deterministic, host-unique port.
+
+    Monarch's default probes for a free MASTER_PORT (bind-0 then close; rank
+    0's TCPStore binds it for real later) — a check-then-use race: sibling
+    replicas on one host probing concurrently can be handed the SAME port,
+    and the loser dies with EADDRINUSE deep in vLLM/torch.distributed init.
+
+    Launchers partition a host's replicas by disjoint, contiguous
+    CUDA_VISIBLE_DEVICES ranges, and a replica spawns at most one mesh per
+    GPU it owns, so (first visible device + this process's mesh counter) is
+    unique across every mesh on the host. Without CUDA_VISIBLE_DEVICES there
+    is no partition (sole tenant / remote host meshes) — keep Monarch's pick.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        await setup_torch_elastic_env_async(mesh)
+        return
+    port = _ELASTIC_PORT_BASE + int(visible.split(",")[0]) + next(_mesh_counter)
+    await setup_torch_elastic_env_async(
+        mesh, master_addr=socket.gethostname(), master_port=port
+    )
 
 
 class GRPOLoss(Configurable):
@@ -395,9 +427,9 @@ class RLTrainer(Configurable):
             # Store proc meshes for cleanup
             self._proc_meshes = [trainer_mesh, *generator_meshes]
 
-            await setup_torch_elastic_env_async(trainer_mesh)
+            await setup_mesh_elastic_env(trainer_mesh)
             for generator_mesh in generator_meshes:
-                await setup_torch_elastic_env_async(generator_mesh)
+                await setup_mesh_elastic_env(generator_mesh)
 
             # Spawn actors on their respective meshes
             self.trainer = trainer_mesh.spawn(

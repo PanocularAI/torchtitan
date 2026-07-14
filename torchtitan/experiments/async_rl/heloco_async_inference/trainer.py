@@ -2,27 +2,29 @@
 #
 # Controller for heloco_async_inference: prime-rl-style decoupled generation
 # scaled to MULTIPLE trainers. N pure-learner HeLoCo trainer replicas (1 GPU
-# each, no local generation) draw ALL training rollouts from a shared,
-# hub-hosted rollout queue fed by a pool of remote generator workers, and
-# coordinate no-barrier through the HeLoCo parameter server. The hub
-# (heloco_async_inference.server) co-hosts the parameter server, the shared
-# queue, and a relay tier that republishes the CURRENT global theta for the
+# each, no local generation) draw ALL training rollouts from one shared
+# rollout-queue process (async_inference.rollout_queue) fed by a pool of
+# remote generator workers, and coordinate no-barrier through the HeLoCo
+# parameter server (heloco_async_inference.server), which publishes the
+# CURRENT global theta to a relay process (async_inference.relay) for the
 # generator pool.
 #
 # The pure-learner shape (no vLLM on the trainer; consume from a remote
 # queue; staleness-bounded batch assembly) is inherited from
 # PureLearnerReplica. This class adds only the HeLoCo coordination (build the
 # torchft client + adopt global theta in setup_async; push pseudo-gradient +
-# adopt new global theta in _window_sync) and the hub-queue rollout source.
+# adopt new global theta in _window_sync) and the shared-queue rollout source.
 
+import asyncio
 import logging
-import pickle
 import time
 from dataclasses import dataclass
 
-import aiohttp
 import torch
 
+from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
+    RolloutQueuePopClient,
+)
 from torchtitan.experiments.async_rl.heloco.actors import HeLoCoPolicyTrainer
 from torchtitan.experiments.async_rl.heloco.client import HeLoCoRLClient
 from torchtitan.experiments.async_rl.heloco.server import param_metadata
@@ -31,54 +33,9 @@ from torchtitan.experiments.async_rl.pure_learner import PureLearnerReplica
 logger = logging.getLogger(__name__)
 
 
-class SharedRolloutQueueClient:
-    """Pops one ``(worker_id, version, groups)`` batch at a time from the
-    heloco_async_inference hub's ``SharedRolloutQueueServer`` -- the pop-side
-    counterpart to ``async_inference.worker.RolloutQueueClient``'s push
-    (unchanged; it already targets this same ``POST /rollouts`` endpoint,
-    just pointed at the hub instead of a single trainer's embedded queue).
-
-    A non-blocking poll: :meth:`pop` returns ``None`` immediately if the
-    queue is empty or the hub is unreachable, never raises. Multiple trainer
-    replicas pop from the SAME hub queue concurrently -- an at-most-once
-    claim per call, so no two trainers ever consume the same batch.
-    """
-
-    def __init__(self, hub_address: str, *, timeout_s: float = 30.0):
-        if not hub_address.strip():
-            raise ValueError(
-                "hub_address is required (set $HELOCO_ASYNC_INFERENCE_HUB_ADDR)"
-            )
-        self.hub_address = hub_address.rstrip("/")
-        self._timeout_s = timeout_s
-
-    async def pop(self):
-        """Returns ``(worker_id, version, groups)`` or ``None`` (empty queue
-        or unreachable hub)."""
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self._timeout_s)
-            ) as session:
-                async with session.post(f"{self.hub_address}/rollouts/pop") as resp:
-                    if resp.status == 204:
-                        return None
-                    if resp.status != 200:
-                        logger.warning(
-                            "rollout pop from %s failed (status=%d)",
-                            self.hub_address,
-                            resp.status,
-                        )
-                        return None
-                    data = await resp.read()
-                    return pickle.loads(data)
-        except aiohttp.ClientError as exc:
-            logger.warning("rollout pop from %s failed: %s", self.hub_address, exc)
-            return None
-
-
 class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
     """A pure-learner HeLoCo trainer whose training rollouts come entirely
-    from the hub's shared rollout queue (fed by a remote generator pool).
+    from the shared rollout-queue process (fed by a remote generator pool).
 
     Inherits the pure-learner consumer/buffer/staleness machinery and the
     generator-less setup from PureLearnerReplica; adds the HeLoCo outer step:
@@ -108,18 +65,18 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
         should_quantize: bool = False
         """fp16/int8 pseudo-gradient wire transfer (must match the server)."""
         rollout_queue_address: str = ""
-        """The heloco_async_inference hub's base URL (e.g.
-        "http://localhost:8768"), usually from
-        $HELOCO_ASYNC_INFERENCE_HUB_ADDR. Required -- launch plumbing, so it's
-        checked in setup_async rather than __post_init__ (ConfigManager calls
-        the --config function with zero args before overlaying CLI flags, so a
-        required-with-empty-default field can't be validated at __post_init__
-        time without breaking the CLI path)."""
+        """The shared rollout-queue process's base URL (e.g.
+        "http://localhost:8767"), usually from $ROLLOUT_QUEUE_ADDR. Required
+        -- launch plumbing, so it's checked in setup_async rather than
+        __post_init__ (ConfigManager calls the --config function with zero
+        args before overlaying CLI flags, so a required-with-empty-default
+        field can't be validated at __post_init__ time without breaking the
+        CLI path)."""
 
     def __init__(self, config: "HeLoCoAsyncInferenceReplica.Config"):
         super().__init__(config)
         self.client: HeLoCoRLClient | None = None
-        self._queue_client: SharedRolloutQueueClient | None = None
+        self._queue_client: RolloutQueuePopClient | None = None
         self._last_known_revision = 0
 
     async def setup_async(self, *, trainer_mesh, generator_meshes):
@@ -130,8 +87,7 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
             raise ValueError("server_address is required (set $DILOCO_SERVER_ADDR)")
         if not cfg.rollout_queue_address:
             raise ValueError(
-                "rollout_queue_address is required "
-                "(set $HELOCO_ASYNC_INFERENCE_HUB_ADDR)"
+                "rollout_queue_address is required (set $ROLLOUT_QUEUE_ADDR)"
             )
 
         await self._spawn_trainer_only(
@@ -162,7 +118,7 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
         # model to the relay for the worker pool.
         global_sd = self.client.pull()
         await self.trainer.load_full_state_dict_cpu.call(global_sd)
-        self._queue_client = SharedRolloutQueueClient(cfg.rollout_queue_address)
+        self._queue_client = RolloutQueuePopClient(cfg.rollout_queue_address)
         # +1: the hub publishes checkpoint versions as server revision + 1
         # (see heloco_async_inference/server.py::_watch_and_publish for why),
         # so this reference must be shifted the same way to stay comparable to
@@ -195,12 +151,20 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
         (the server applies its outer step to the pseudo-gradient), adopt the
         returned global theta, apply any DyLU recommendation, and refresh this
         replica's revision freshness reference for the next window's staleness
-        gate."""
+        gate.
+
+        ``client.push`` is torchft's SYNCHRONOUS client -- a multi-GB
+        quantize/upload/merge/download roundtrip. Run it in a thread so the
+        event loop stays live: the rollout consumer keeps draining the shared
+        queue into the buffer throughout the sync, and the next window starts
+        data-rich instead of stalled. (The trainer GPU still waits for
+        adoption -- the pseudo-gradient/baseline contract -- only the event
+        loop is freed.)"""
         theta_local = self._get_rank_0_value(
             await self.trainer.get_full_state_dict_cpu.call()
         )
         speed = self._sync_every / max(time.perf_counter() - t0, 1e-6)
-        new_global = self.client.push(theta_local, speed=speed)
+        new_global = await asyncio.to_thread(self.client.push, theta_local, speed=speed)
         await self.trainer.load_full_state_dict_cpu.call(new_global)
         if self.client.last_dylu_steps > 0:
             self._sync_every = self.client.last_dylu_steps

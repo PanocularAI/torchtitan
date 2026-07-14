@@ -1,13 +1,15 @@
 # Copyright (c) Panocular AI.
 #
-# Tests for the heloco_async_inference hub (shared rollout queue push/pop,
-# the combined relay+queue app, the revision-watch publish loop) and the
+# Tests for the heloco_async_inference coordination plane (the revision-watch
+# publish loop, over the real HTTP relay wire) and the
 # HeLoCoAsyncInferenceReplica controller (config validation, the HeLoCo
 # window-sync push/pull with no generator refresh, and an end-to-end train
 # loop that proves zero local generation). The pure-learner consumer/buffer/
-# staleness machinery is inherited from PureLearnerReplica and covered by the
-# async_inference tests. CPU-only: no GPU, no vLLM, no Monarch actors --
-# everything above the wire is faked.
+# staleness machinery is inherited from PureLearnerReplica, and the shared
+# rollout queue (push/pop wire protocol, timeout robustness) lives in
+# async_inference.rollout_queue -- both covered by the async_inference tests.
+# CPU-only: no GPU, no vLLM, no Monarch actors -- everything above the wire
+# is faked.
 
 import asyncio
 import itertools
@@ -18,19 +20,15 @@ import torch
 from aiohttp.test_utils import TestServer
 
 from torchtitan.experiments.async_rl.async_inference.relay import (
-    build_manifest,
+    RelayClient,
     RelayServer,
-    shard_state_dict,
 )
 from torchtitan.experiments.async_rl.config_registry import base_rl_config, wrap_replica
 from torchtitan.experiments.async_rl.heloco_async_inference.server import (
     _watch_and_publish,
-    build_hub_app,
-    SharedRolloutQueueServer,
 )
 from torchtitan.experiments.async_rl.heloco_async_inference.trainer import (
     HeLoCoAsyncInferenceReplica,
-    SharedRolloutQueueClient,
 )
 
 
@@ -39,81 +37,12 @@ def _ep(fn):
     return SimpleNamespace(call=fn)
 
 
-# --------------------------------------------------------------------- #
-# SharedRolloutQueueServer: push contract matches RolloutQueueServer's;
-# pop is new (claim-and-remove, empty -> 204).
-# --------------------------------------------------------------------- #
-
-
-async def _start_hub(retain_last=5, queue_maxsize=64):
+async def _start_relay(retain_last=5):
     relay = RelayServer(retain_last=retain_last)
-    queue = SharedRolloutQueueServer(maxsize=queue_maxsize)
-    server = TestServer(build_hub_app(relay, queue))
+    server = TestServer(relay.app())
     await server.start_server()
     base_url = str(server.make_url("")).rstrip("/")
-    return relay, queue, server, base_url
-
-
-def test_push_pop_round_trip_and_backpressure():
-    async def scenario():
-        relay, queue, server, base_url = await _start_hub(queue_maxsize=1)
-        try:
-            client = SharedRolloutQueueClient(base_url)
-            assert await client.pop() is None  # nothing pushed yet
-
-            from torchtitan.experiments.async_rl.async_inference.worker import (
-                RolloutQueueClient,
-            )
-
-            pusher = RolloutQueueClient(base_url)
-            assert (
-                await pusher.send(worker_id=3, version=7, groups=["g1", "g2"]) is True
-            )
-            # maxsize=1, nothing popped yet -> the next push is rejected.
-            assert await pusher.send(0, 8, ["g3"]) is False
-            assert queue.num_received == 1 and queue.num_rejected == 1
-
-            popped = await client.pop()
-            assert popped == (3, 7, ["g1", "g2"])
-            assert queue.num_popped == 1
-            assert await client.pop() is None  # drained
-        finally:
-            await server.close()
-
-    asyncio.run(scenario())
-
-
-def test_hub_serves_relay_and_queue_routes_on_one_app():
-    """The combined app composes both route sets with no prefix rewriting:
-    a relay publish/fetch and a queue push/pop both work against the SAME
-    base_url."""
-
-    async def scenario():
-        relay, queue, server, base_url = await _start_hub()
-        try:
-            from torchtitan.experiments.async_rl.async_inference.relay import (
-                RelayClient,
-            )
-
-            relay_client = RelayClient([base_url])
-            sd = {"w": torch.randn(4)}
-            shards = shard_state_dict(sd, num_shards=1)
-            manifest = build_manifest(1, shards)
-            await relay_client.publish(1, shards, manifest)
-            result = await relay_client.fetch_latest()
-            assert result is not None and result[0] == 1
-
-            queue_client = SharedRolloutQueueClient(base_url)
-            from torchtitan.experiments.async_rl.async_inference.worker import (
-                RolloutQueueClient,
-            )
-
-            assert await RolloutQueueClient(base_url).send(0, 1, ["g"]) is True
-            assert await queue_client.pop() == (0, 1, ["g"])
-        finally:
-            await server.close()
-
-    asyncio.run(scenario())
+    return relay, server, base_url
 
 
 # --------------------------------------------------------------------- #
@@ -122,14 +51,16 @@ def test_hub_serves_relay_and_queue_routes_on_one_app():
 
 
 def test_watch_and_publish_publishes_at_startup_and_on_cadence():
-    """Revision is stable between reads (a FakeServer backed by mutable
-    state, not a one-shot iterator -- _consistent_snapshot itself re-reads
-    the revision, so an iterator would be consumed unpredictably by both
-    that internal check and the outer watch loop). Published checkpoint
-    versions are server revision + 1 (never 0 -- see _watch_and_publish's
-    docstring: AsyncInferenceWorker starts at version 0 and RelayClient.
-    fetch_latest requires a strictly newer version, so a raw revision-0
-    publish could never be fetched by a fresh worker)."""
+    """The publish loop runs in the parameter-server process and publishes to
+    the SEPARATE relay/queue process over HTTP (RelayClient against a real
+    loopback relay here, the split-process wire path). Revision is stable
+    between reads (a FakeServer backed by mutable state, not a one-shot
+    iterator -- _consistent_snapshot itself re-reads the revision). Published
+    checkpoint versions are server revision + 1 (never 0 -- see
+    _watch_and_publish's docstring: AsyncInferenceWorker starts at version 0
+    and RelayClient.fetch_latest requires a strictly newer version, so a raw
+    revision-0 publish could never be fetched by a fresh worker). Publishes
+    are bf16 over the wire."""
     model = torch.nn.Linear(2, 2)
     state = SimpleNamespace(revision=0)
 
@@ -137,15 +68,14 @@ def test_watch_and_publish_publishes_at_startup_and_on_cadence():
         def status(self):
             return {"revision": state.revision}
 
-    relay = RelayServer()
-
     async def scenario():
+        relay, server, base_url = await _start_relay()
         watcher = asyncio.create_task(
             _watch_and_publish(
                 FakeServer(),
                 model,
                 [n for n, _ in model.named_parameters()],
-                relay,
+                RelayClient([base_url]),
                 num_shards=1,
                 publish_every_revisions=1,
                 poll_interval_s=0.01,
@@ -159,9 +89,17 @@ def test_watch_and_publish_publishes_at_startup_and_on_cadence():
 
             state.revision = 1
             await asyncio.wait_for(_poll_until(lambda: relay.latest_version() == 2), 2)
+
+            # The wire checkpoint is bf16 (halved publishes/downloads) and
+            # round-trips through the worker's fetch path.
+            fetched = await RelayClient([base_url]).fetch_latest()
+            assert fetched is not None
+            _version, sd = fetched
+            assert all(t.dtype == torch.bfloat16 for t in sd.values())
         finally:
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
+            await server.close()
 
     asyncio.run(scenario())
 
@@ -214,6 +152,7 @@ def make_replica():
     r = object.__new__(HeLoCoAsyncInferenceReplica)
     r.config = SimpleNamespace(
         queue_poll_interval_s=0,
+        rollout_stall_timeout_s=0,
         max_staleness=4,
         num_groups_per_rollout_batch=2,
     )
@@ -276,6 +215,61 @@ def test_window_sync_pushes_pseudograd_and_updates_revision_without_touching_gen
     asyncio.run(scenario())
 
 
+def test_window_sync_does_not_block_the_event_loop():
+    """client.push is torchft's SYNCHRONOUS multi-GB roundtrip; _window_sync
+    must run it in a thread so the rollout consumer keeps draining the queue
+    during the sync -- a push executed on the event loop would freeze every
+    coroutine for the duration (the old behavior: the buffer stopped filling
+    at every window boundary)."""
+
+    async def scenario():
+        r = make_replica()
+        r._sync_every = 4
+
+        async def get_full():
+            return {"w": torch.zeros(2)}
+
+        async def load_full(sd):
+            del sd
+
+        r.trainer = SimpleNamespace(
+            get_full_state_dict_cpu=_ep(get_full),
+            load_full_state_dict_cpu=_ep(load_full),
+        )
+        r._get_rank_0_value = lambda x: x
+
+        class _SlowClient:
+            revision = 0
+            last_dylu_steps = 0
+
+            def push(self, local_sd, speed):
+                import time as _time
+
+                _time.sleep(0.2)  # thread-blocking, like the real HTTP client
+                return {"w": torch.ones(2)}
+
+        r.client = _SlowClient()
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await asyncio.wait_for(r._window_sync(0.0), 5)
+        finally:
+            ticker_task.cancel()
+            await asyncio.gather(ticker_task, return_exceptions=True)
+        # The loop ran throughout the 0.2s push (>= ~10 ticks; allow slack).
+        assert ticks >= 5, f"event loop was blocked during push (ticks={ticks})"
+
+    asyncio.run(scenario())
+
+
 # --------------------------------------------------------------------- #
 # End-to-end controller loop on fakes (mirrors the GPU smoke's shape) for
 # the PURE-LEARNER trainer: no generator, no generator_router, no
@@ -318,6 +312,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
             buffer_groups=0,
             max_staleness=4,
             queue_poll_interval_s=0,
+            rollout_stall_timeout_s=0,
         )
         r._policy_version = 0
         # Rollouts arrive tagged v1; the trainer's freshness reference is v1

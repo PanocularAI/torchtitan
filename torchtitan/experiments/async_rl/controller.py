@@ -108,13 +108,8 @@ class RLControllerMixin:
             r.reward for g in rollout_groups for r in g.rollouts if r.reward is not None
         ]
         reward_mean = sum(rewards) / len(rewards) if rewards else float("nan")
-        # Staleness (in steps) between the trainer policy that produced these
-        # rollouts' behavior logprobs and the trainer policy right before this
-        # optim_step consumed them. Always >= 0; grows if generation lags
-        # training (expected under the always-on one-step pipeline; an
-        # IS-corrected loss is designed to absorb this bounded staleness).
         ep_versions = [ep.policy_version for ep in episodes]
-        staleness = pre_optim_policy_version - min(ep_versions) if ep_versions else 0
+        staleness = self._batch_staleness(pre_optim_policy_version, ep_versions)
         return {
             "loss": last_loss,
             "reward_mean": reward_mean,
@@ -122,6 +117,20 @@ class RLControllerMixin:
             "num_rollouts": len(rewards),
             "staleness": staleness,
         }
+
+    def _batch_staleness(self, pre_optim_policy_version: int, ep_versions) -> int:
+        """The staleness (in versions) of the just-consumed batch, for the
+        per-window log line. Episodes are stamped with the version their
+        GENERATOR held (``completion.policy_version``), so the two operands
+        must be in the same version space. Here (local generation) they are:
+        generators pull per optim step tagged with the trainer's
+        ``policy_version``, so the gap to the pre-optim policy_version is the
+        steps of lag the IS-corrected loss absorbed. Always >= 0; grows if
+        generation lags training (expected under the always-on one-step
+        pipeline). Pure learners override this: their episodes carry
+        relay/hub checkpoint versions, which a local optim-step counter is
+        not comparable to."""
+        return pre_optim_policy_version - min(ep_versions) if ep_versions else 0
 
     async def _refresh_generators(self) -> None:
         """Bring this replica's generators up to the just-updated local policy:
@@ -166,6 +175,15 @@ class RLControllerMixin:
                     rollout_groups, episodes, microbatches, num_valid
                 )
                 window_rewards.append(last["reward_mean"])
+                # "step: N" is the progress contract an external supervisor greps
+                # for (same line pretrain emits) -- the step trained in iteration
+                # _h is start_step + _h + 1 (the pipelined `global_step` already
+                # points at the NEXT step's collection).
+                logger.info(
+                    "[replica %d] step: %d",
+                    self.config.replica_id,
+                    start_step + _h + 1,
+                )
                 if not math.isfinite(float(last["loss"])):
                     return window_rewards, last, global_step, True
                 await self._after_inner_step(iter_t0)

@@ -29,11 +29,9 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from monarch.spmd import setup_torch_elastic_env_async
-
 from torchtitan.experiments.async_rl.controller import RLControllerMixin
 
-from torchtitan.experiments.rl.trainer import RLTrainer
+from torchtitan.experiments.rl.trainer import RLTrainer, setup_mesh_elastic_env
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +71,14 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         queue_poll_interval_s: float = 0.5
         """Seconds to wait before re-polling the rollout source when it yields
         nothing (only relevant for a non-blocking source, e.g. a remote hub)."""
+        rollout_stall_timeout_s: float = 900.0
+        """Fail the run if no rollout arrives for this many seconds while the
+        trainer is waiting on the buffer. The remote generator pool is this
+        trainer's ONLY rollout source, and a worker crash is invisible from
+        here (the queue/hub stays reachable, just empty forever) -- without
+        this bound the trainer polls silently for the rest of the run. Must
+        comfortably exceed a worker cold start (vLLM engine init + first
+        checkpoint pull + first round, ~3-5 min). 0 disables the bound."""
 
         def __post_init__(self):
             RLTrainer.Config.__post_init__(self)
@@ -120,7 +126,7 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
         self._proc_meshes = [trainer_mesh]
-        await setup_torch_elastic_env_async(trainer_mesh)
+        await setup_mesh_elastic_env(trainer_mesh)
         self.trainer = trainer_mesh.spawn(
             "trainer",
             policy_trainer_cls,
@@ -165,9 +171,15 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
                 await self._buffer.put((group, version))
 
     async def _buffer_get_checked(self):
-        """buffer.get that fails fast if the single remote-consumer task dies
-        -- otherwise the trainer would silently wait on the buffer forever
-        (there are no local producers; the consumer task is the only feeder)."""
+        """buffer.get that fails fast when the feed is gone, instead of
+        waiting forever (there are no local producers):
+          - the single remote-consumer task died or exited; or
+          - nothing has arrived for rollout_stall_timeout_s. A crashed remote
+            WORKER is invisible from here -- the queue/hub stays reachable,
+            just empty forever -- so an empty buffer past any plausible worker
+            cold start means the generator pool is dead."""
+        timeout = self.config.rollout_stall_timeout_s
+        deadline = asyncio.get_running_loop().time() + timeout if timeout > 0 else None
         get_task = asyncio.ensure_future(self._buffer.get())
         try:
             while not get_task.done():
@@ -181,8 +193,21 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
                         "remote rollout consumer exited while the trainer "
                         "still needs data"
                     )
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"no rollout arrived for {timeout:.0f}s -- the "
+                            "remote generator pool is likely dead (worker "
+                            "crash?) or unable to reach this trainer's queue; "
+                            "check the worker logs. (rollout_stall_timeout_s "
+                            "bounds this wait; 0 disables it.)"
+                        )
                 await asyncio.wait(
-                    {get_task, consumer}, return_when=asyncio.FIRST_COMPLETED
+                    {get_task, consumer},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=remaining,
                 )
             return get_task.result()
         finally:
@@ -217,6 +242,17 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
             episodes, dp_degree=self.trainer_dp_degree
         )
         return rollout_groups, episodes, microbatches, num_global_valid_tokens
+
+    def _batch_staleness(self, pre_optim_policy_version: int, ep_versions) -> int:
+        """A pure learner's episodes are stamped with the relay/hub checkpoint
+        version their remote generator loaded -- a SHARED counter that advances
+        per publish, not per local optim step -- so the mixin's default
+        (local ``policy_version`` minus episode version) would subtract across
+        two unrelated spaces and grow without bound. Measure against the same
+        reference the ``max_staleness`` consume gate uses instead: the logged
+        number is then directly comparable to ``config.max_staleness``."""
+        del pre_optim_policy_version  # local optim-step space; not comparable
+        return self._staleness_reference() - min(ep_versions) if ep_versions else 0
 
     async def _refresh_generators(self) -> None:
         """No-op: there is no local generator to refresh (the remote workers

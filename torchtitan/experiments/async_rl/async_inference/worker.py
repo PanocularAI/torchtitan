@@ -11,36 +11,34 @@
 # never through a local trainer push.
 #
 # This worker fetches weights via the relay tier (torchtitan.experiments.async_rl.async_inference.relay)
-# and pushes its generated rollouts back to the trainer's embedded
-# RolloutQueueServer (trainer.py) via RolloutQueueClient (below) -- workers
-# are trusted here, so this is a plain push/queue, not TOPLOC-style
-# cryptographic verification.
+# and pushes its generated rollouts to the standalone rollout-queue process
+# (rollout_queue.py) via RolloutQueuePushClient -- workers are trusted here,
+# so this is a plain push/queue, not TOPLOC-style cryptographic verification.
 #
 # Run as:
 #   ASYNC_INFERENCE_RELAY_ADDRS=http://localhost:8765,http://localhost:8766 \
-#   ASYNC_INFERENCE_TRAINER_ROLLOUT_ADDR=http://localhost:8767 ASYNC_INFERENCE_WORKER_ID=0 \
+#   ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR=http://localhost:8767 ASYNC_INFERENCE_WORKER_ID=0 \
 #     python -m torchtitan.experiments.async_rl.async_inference.worker \
 #       --module async_rl --config rl_async_inference_worker_qwen3_0_6b
 
 import asyncio
 import logging
 import os
-import pickle
 import time
 from dataclasses import dataclass, field, replace
-
-import aiohttp
 
 # Must be set before torch is imported (transitively, below).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torchstore as ts  # noqa: E402
 from monarch.actor import this_host  # noqa: E402
-from monarch.spmd import setup_torch_elastic_env_async  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
 from torchtitan.experiments.async_rl.async_inference.relay import (
     RelayClient,
+)  # noqa: E402
+from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
+    RolloutQueuePushClient,
 )  # noqa: E402
 
 from torchtitan.experiments.async_rl.train import (
@@ -53,51 +51,9 @@ from torchtitan.experiments.rl.examples.alphabet_sort import (
 )  # noqa: E402
 from torchtitan.experiments.rl.renderer import RendererConfig  # noqa: E402
 from torchtitan.experiments.rl.train import _compute_world_size  # noqa: E402
+from torchtitan.experiments.rl.trainer import setup_mesh_elastic_env  # noqa: E402
 
 logger = logging.getLogger(__name__)
-
-
-class RolloutQueueClient:
-    """Pushes rollout batches to the trainer's embedded RolloutQueueServer
-    (trainer.py).
-
-    One pickle+HTTP POST per batch. A rejection (503, queue full) or
-    connection failure is logged and the batch is dropped rather than
-    retried: blocking generation to retry a stuck trainer defeats the point
-    of decoupled generation, and the trainer's own max_staleness bound
-    already tolerates -- and is designed around -- losing some rollouts.
-    """
-
-    def __init__(self, trainer_address: str, *, timeout_s: float = 30.0):
-        if not trainer_address.strip():
-            raise ValueError(
-                "trainer_address is required (set $ASYNC_INFERENCE_TRAINER_ROLLOUT_ADDR)"
-            )
-        self.trainer_address = trainer_address.rstrip("/")
-        self._timeout_s = timeout_s
-
-    async def send(self, worker_id: int, version: int, groups: list) -> bool:
-        """Returns True if the trainer accepted the batch, False otherwise
-        (rejected or unreachable) -- never raises on a transport failure."""
-        payload = pickle.dumps((worker_id, version, groups))
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self._timeout_s)
-            ) as session:
-                async with session.post(
-                    f"{self.trainer_address}/rollouts", data=payload
-                ) as resp:
-                    if resp.status == 204:
-                        return True
-                    logger.warning(
-                        "rollout push to %s rejected (status=%d)",
-                        self.trainer_address,
-                        resp.status,
-                    )
-                    return False
-        except aiohttp.ClientError as exc:
-            logger.warning("rollout push to %s failed: %s", self.trainer_address, exc)
-            return False
 
 
 class AsyncInferenceWorker:
@@ -128,11 +84,12 @@ class AsyncInferenceWorker:
         ConfigManager calls the --config function with zero args before
         overlaying CLI flags, so validating a required-with-empty-default
         field in __post_init__ would break the CLI path."""
-        trainer_rollout_address: str = ""
-        """The trainer's embedded rollout-queue base URL (e.g.
-        "http://localhost:8767"), usually from $ASYNC_INFERENCE_TRAINER_ROLLOUT_ADDR.
-        Required -- same launch-plumbing reasoning as relay_addresses;
-        checked by RolloutQueueClient's own constructor."""
+        rollout_queue_address: str = ""
+        """The standalone rollout-queue process's base URL (e.g.
+        "http://localhost:8767"), usually from
+        $ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR. Required -- same launch-plumbing
+        reasoning as relay_addresses; checked by RolloutQueuePushClient's own
+        constructor."""
         worker_id: int = 0
         poll_interval_s: float = 2.0
         """Seconds between relay polls before the first checkpoint has been
@@ -166,7 +123,9 @@ class AsyncInferenceWorker:
         self._relay_client = RelayClient(
             [u.strip() for u in config.relay_addresses.split(",") if u.strip()]
         )
-        self._rollout_queue_client = RolloutQueueClient(config.trainer_rollout_address)
+        self._rollout_queue_client = RolloutQueuePushClient(
+            config.rollout_queue_address
+        )
         self._version = 0
         self.generator = None
         self._proc_mesh = None
@@ -175,7 +134,7 @@ class AsyncInferenceWorker:
     async def setup_async(self, *, generator_mesh) -> None:
         cfg = self.config
         self._proc_mesh = generator_mesh
-        await setup_torch_elastic_env_async(generator_mesh)
+        await setup_mesh_elastic_env(generator_mesh)
 
         self.generator = generator_mesh.spawn(
             "generator",
@@ -192,7 +151,7 @@ class AsyncInferenceWorker:
         # LocalRankStrategy resolves ITS CALLER's client id from $RANK/
         # $LOCAL_RANK (torchstore/strategy.py); every other TorchStore caller
         # in this package puts/pulls through a Monarch actor endpoint, whose
-        # process gets those env vars from setup_torch_elastic_env_async
+        # process gets those env vars from setup_mesh_elastic_env
         # above. This driver calls ts.put_state_dict directly (below, in
         # _load_checkpoint -- there's no trainer actor to delegate to), so it
         # needs its OWN client id: a lone, unreplicated coordinator is rank 0
@@ -260,36 +219,51 @@ class AsyncInferenceWorker:
             )
 
     async def run(self) -> None:
-        """Poll the relay, load a newer checkpoint when one appears, and
-        free-run generation: once we hold weights, generate + push a rollout
-        round every iteration -- never waiting for a newer checkpoint, which
-        would deadlock the trainer (the trainer's max_staleness bound is what
-        tolerates the resulting version skew). Before the first checkpoint is
-        loaded, poll every poll_interval_s. Stops after config.num_rounds
-        counted rounds (0 = run until cancelled).
+        """Free-run generation with a BACKGROUND checkpoint prefetch: a
+        newer checkpoint downloads from the relay concurrently with the
+        current round's generation (the vLLM awaits yield the event loop),
+        so the GPU never idles through a multi-GB fetch -- only the brief
+        engine weight swap between rounds pauses generation. The worker never
+        waits for a newer checkpoint before generating (that would deadlock
+        the trainer; its max_staleness bound tolerates the version skew).
+        Before the first checkpoint lands, poll every poll_interval_s. Stops
+        after config.num_rounds counted rounds (0 = run until cancelled).
 
         The mean reward of the rollouts generated here is the benchmark's
         learning-curve signal: the trainer logs it per window as it consumes
         them (RLControllerMixin.train's ``reward`` field), so a decoupled swarm
         needs no separate greedy validator to measure progress."""
         rounds = 0
-        while self.config.num_rounds == 0 or rounds < self.config.num_rounds:
-            result = await self._relay_client.fetch_latest(min_version=self._version)
-            if result is not None:
-                version, state_dict = result
-                await self._load_checkpoint(version, state_dict)
-            if self._version == 0:
-                # No weights loaded yet -- nothing to generate from.
-                await asyncio.sleep(self.config.poll_interval_s)
-                continue
-            t0 = time.perf_counter()
-            await self._generate_and_send_round()
-            factor = self.config.round_slowdown_factor
-            if factor > 1.0:
-                # Heterogeneous-hardware emulation: stretch this round to
-                # factor x its measured duration (a slower inference GPU).
-                await asyncio.sleep((factor - 1.0) * (time.perf_counter() - t0))
-            rounds += 1
+        fetch = asyncio.ensure_future(
+            self._relay_client.fetch_latest(min_version=self._version)
+        )
+        try:
+            while self.config.num_rounds == 0 or rounds < self.config.num_rounds:
+                if fetch.done():
+                    result = fetch.result()  # fetch_latest never raises: None on fail
+                    if result is not None:
+                        version, state_dict = result
+                        # The only generation pause: the engine weight swap.
+                        await self._load_checkpoint(version, state_dict)
+                    fetch = asyncio.ensure_future(
+                        self._relay_client.fetch_latest(min_version=self._version)
+                    )
+                if self._version == 0:
+                    # No weights loaded yet -- nothing to generate from.
+                    await asyncio.sleep(self.config.poll_interval_s)
+                    continue
+                t0 = time.perf_counter()
+                await self._generate_and_send_round()
+                factor = self.config.round_slowdown_factor
+                if factor > 1.0:
+                    # Heterogeneous-hardware emulation: stretch this round to
+                    # factor x its measured duration (a slower inference GPU).
+                    await asyncio.sleep((factor - 1.0) * (time.perf_counter() - t0))
+                rounds += 1
+        finally:
+            if not fetch.done():
+                fetch.cancel()
+                await asyncio.gather(fetch, return_exceptions=True)
 
     async def close(self) -> None:
         if self.generator is not None:
@@ -305,7 +279,7 @@ async def _main() -> None:
     config = ConfigManager().parse_args()
     for field_name, env_name, cast in (
         ("relay_addresses", "ASYNC_INFERENCE_RELAY_ADDRS", str),
-        ("trainer_rollout_address", "ASYNC_INFERENCE_TRAINER_ROLLOUT_ADDR", str),
+        ("rollout_queue_address", "ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR", str),
         ("worker_id", "ASYNC_INFERENCE_WORKER_ID", int),
         ("round_slowdown_factor", "ASYNC_INFERENCE_ROUND_SLOWDOWN", float),
     ):

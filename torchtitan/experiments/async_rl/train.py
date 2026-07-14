@@ -44,7 +44,7 @@ _ENV_OVERRIDES = {
     "num_replicas": (("DILOCO_NUM_REPLICAS",), int),
     "relay_addresses": (("ASYNC_INFERENCE_RELAY_ADDRS",), str),
     "replica_id": (("DILOCO_REPLICA_ID", "ASYNC_INFERENCE_REPLICA_ID"), int),
-    "rollout_queue_address": (("HELOCO_ASYNC_INFERENCE_HUB_ADDR",), str),
+    "rollout_queue_address": (("ROLLOUT_QUEUE_ADDR",), str),
 }
 
 

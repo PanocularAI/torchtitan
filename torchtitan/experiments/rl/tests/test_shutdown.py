@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from torchtitan.experiments.rl import train
-from torchtitan.experiments.rl.actors.generator import VLLMGenerator
+from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.batcher import Batcher
 from torchtitan.experiments.rl.generator_router import GeneratorRouter
 from torchtitan.experiments.rl.rollout_recorder import RolloutSampleRecorder
@@ -99,7 +99,11 @@ def _make_stub_rl_trainer():
                 _tokenizer=SimpleNamespace(eos_token_id=0),
             )
         )
-        generator = SimpleNamespace(sampling=SimpleNamespace())
+        # A real SamplingConfig: __init__ passes it through dataclasses.replace
+        # (seed + stop_token_ids overlay), which rejects a SimpleNamespace.
+        generator = SimpleNamespace(
+            sampling=SamplingConfig(), debug=SimpleNamespace(seed=None)
+        )
         rollouter = SimpleNamespace(build=lambda: SimpleNamespace())
 
         def to_dict(self):

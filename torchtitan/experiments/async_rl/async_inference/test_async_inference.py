@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import aiohttp
 import pytest
 import torch
+from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 import torchtitan.experiments.async_rl.async_inference.worker as worker_mod
@@ -29,14 +30,15 @@ from torchtitan.experiments.async_rl.async_inference.relay import (
     ShardIntegrityError,
     verify_shard,
 )
-from torchtitan.experiments.async_rl.async_inference.trainer import (
-    AsyncInferenceReplica,
+from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
+    RolloutQueuePopClient,
+    RolloutQueuePushClient,
     RolloutQueueServer,
 )
-from torchtitan.experiments.async_rl.async_inference.worker import (
-    AsyncInferenceWorker,
-    RolloutQueueClient,
+from torchtitan.experiments.async_rl.async_inference.trainer import (
+    AsyncInferenceReplica,
 )
+from torchtitan.experiments.async_rl.async_inference.worker import AsyncInferenceWorker
 
 
 def _ep(fn):
@@ -156,26 +158,32 @@ async def _start_rollout_queue(maxsize=64):
 
 
 def test_rollout_queue_wire_protocol_and_client_robustness():
-    """push/consume round trip; a full queue rejects the push (client sees
-    False, server counts it); malformed payloads get 400 without crashing
-    the server; and send() reports failure as False rather than raising --
-    a dead trainer endpoint must not take the worker down."""
+    """push/pop round trip over the wire; a full queue rejects the push
+    (client sees False, server counts it); malformed payloads get 400 without
+    crashing the server; and send() reports failure as False rather than
+    raising -- a dead queue endpoint must not take the worker down."""
 
     async def scenario():
         # Nothing listening: send() must return False, not raise.
-        assert await RolloutQueueClient("http://localhost:1").send(0, 1, ["g"]) is False
+        assert (
+            await RolloutQueuePushClient("http://localhost:1").send(0, 1, ["g"])
+            is False
+        )
         server, test_server, base_url = await _start_rollout_queue(maxsize=1)
         try:
-            client = RolloutQueueClient(base_url)
-            accepted = await client.send(worker_id=3, version=7, groups=["g1", "g2"])
+            pusher = RolloutQueuePushClient(base_url)
+            popper = RolloutQueuePopClient(base_url)
+            assert await popper.pop() is None  # nothing pushed yet
+            accepted = await pusher.send(worker_id=3, version=7, groups=["g1", "g2"])
             assert accepted is True
-            # Nothing has consumed yet, so the queue (maxsize=1) is now full.
-            assert await client.send(0, 8, ["g3"]) is False
+            # Nothing has popped yet, so the queue (maxsize=1) is now full.
+            assert await pusher.send(0, 8, ["g3"]) is False
             assert server.num_received == 1
             assert server.num_rejected == 1
 
-            worker_id, version, groups = await server.get()
-            assert worker_id == 3 and version == 7 and groups == ["g1", "g2"]
+            assert await popper.pop() == (3, 7, ["g1", "g2"])
+            assert server.num_popped == 1
+            assert await popper.pop() is None  # drained (at-most-once claims)
 
             async with aiohttp.ClientSession() as session:
                 for payload in (
@@ -190,6 +198,31 @@ def test_rollout_queue_wire_protocol_and_client_robustness():
             assert server.num_received == 1  # nothing malformed was enqueued
         finally:
             await test_server.close()
+
+    asyncio.run(scenario())
+
+
+def test_pop_swallows_slow_queue_timeout():
+    """Regression: pop() promises never to raise, but aiohttp reports a slow
+    server as plain asyncio.TimeoutError (NOT a ClientError) -- one slow
+    response killed a replica's rollout consumer mid-benchmark. It must come
+    back as None instead."""
+
+    async def scenario():
+        async def hang(request):
+            await asyncio.sleep(30)
+
+        app = web.Application()
+        app.router.add_post("/rollouts/pop", hang)
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            client = RolloutQueuePopClient(
+                str(server.make_url("")).rstrip("/"), timeout_s=0.1
+            )
+            assert await asyncio.wait_for(client.pop(), 5) is None
+        finally:
+            await server.close()
 
     asyncio.run(scenario())
 
@@ -235,27 +268,62 @@ def make_async_inference_replica(*, publish_every=1):
     )
     r._buffer = asyncio.Queue()
     r._num_dropped = 0
+    r._publish_task = None
     return r
 
 
-def test_window_sync_publishes_only_on_boundary():
+def test_window_sync_publishes_only_on_boundary_in_background():
+    """Boundary windows START a background publish (the window never blocks on
+    sharding/POSTing GBs); non-boundary windows don't. The published tensors
+    go over the wire as bf16."""
+
     async def scenario():
         r = make_async_inference_replica(publish_every=2)
 
         stats1 = await r._window_sync(t0=0.0)
         assert stats1.startswith("buffer: depth=0 dropped=0")  # base stats line
-        assert "relay: published" not in stats1  # window 1: not a boundary
-        assert r._relay_client.published == []
+        assert "relay" not in stats1  # window 1: not a boundary
+        assert r._publish_task is None and r._relay_client.published == []
 
         stats2 = await r._window_sync(t0=0.0)
-        assert "relay: published v1" in stats2
+        assert "relay: publish started (background)" in stats2
+        await r._publish_task  # drain the background publish
         assert len(r._relay_client.published) == 1
         version, num_shards, manifest = r._relay_client.published[0]
         assert version == 1 and num_shards == 2 and manifest.version == 1
 
         stats3 = await r._window_sync(t0=0.0)
-        assert "relay: published" not in stats3
+        assert "relay" not in stats3
         assert len(r._relay_client.published) == 1  # still just one publish
+
+    asyncio.run(scenario())
+
+
+def test_window_sync_skips_publish_while_previous_in_flight():
+    """A boundary that lands while the previous publish is still uploading
+    must SKIP (workers just keep the last version a bit longer) -- never
+    queue a second concurrent publish or block the window."""
+
+    async def scenario():
+        r = make_async_inference_replica(publish_every=1)
+        release = asyncio.Event()
+        real_publish = r._relay_client.publish
+
+        async def slow_publish(version, shard_bytes, manifest):
+            await release.wait()
+            await real_publish(version, shard_bytes, manifest)
+
+        r._relay_client.publish = slow_publish
+
+        stats1 = await r._window_sync(t0=0.0)
+        assert "relay: publish started (background)" in stats1
+        stats2 = await r._window_sync(t0=0.0)  # previous still in flight
+        assert "relay: publish skipped (previous in flight)" in stats2
+
+        release.set()
+        await r._publish_task
+        assert len(r._relay_client.published) == 1
+        assert r._checkpoint_version == 1  # the skipped boundary minted no version
 
     asyncio.run(scenario())
 
@@ -379,6 +447,7 @@ def make_replica(*, max_staleness=4, checkpoint_version=10):
         buffer_groups=8,
         max_staleness=max_staleness,
         queue_poll_interval_s=0,
+        rollout_stall_timeout_s=0,
     )
     r._buffer = asyncio.Queue(maxsize=8)
     r._num_dropped = 0
@@ -406,6 +475,35 @@ def test_buffer_get_fails_fast_when_consumer_dies(consumer, match):
             await r._buffer_get_checked()
 
     asyncio.run(scenario())
+
+
+def test_buffer_get_fails_fast_on_rollout_stall():
+    """Regression for the silent 15h hang: a crashed remote WORKER leaves the
+    consumer task alive and the queue reachable-but-empty forever, which the
+    consumer-death check can't see -- the stall timeout must bound the wait."""
+
+    async def scenario():
+        r = make_replica()
+        r.config.rollout_stall_timeout_s = 0.05
+        # Consumer stays alive but never feeds the buffer (dead worker pool).
+        r._remote_consumer_task = asyncio.create_task(asyncio.sleep(30))
+        with pytest.raises(RuntimeError, match="no rollout arrived"):
+            await asyncio.wait_for(r._buffer_get_checked(), 5)
+        r._remote_consumer_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_batch_staleness_is_measured_against_the_checkpoint_reference():
+    """Regression: the logged staleness must live in the SAME version space as
+    the max_staleness consume gate (relay/hub checkpoint versions), NOT the
+    trainer's local optim-step counter -- episodes carry worker-stamped
+    checkpoint versions, and subtracting those from a per-step policy_version
+    grew without bound (~+7/window) while the actual gate never fired."""
+    r = make_replica(checkpoint_version=10)
+    # Local optim-step counter (first arg) must be ignored entirely.
+    assert r._batch_staleness(999, [8, 9, 10]) == 2  # 10 - min(8,9,10)
+    assert r._batch_staleness(999, []) == 0
 
 
 def test_collect_and_build_drops_groups_stale_against_checkpoint_version():
@@ -439,15 +537,15 @@ def test_collect_and_build_drops_groups_stale_against_checkpoint_version():
 # --------------------------------------------------------------------- #
 
 
-class _InfiniteQueueServer:
-    """Embedded rollout queue that always has a batch tagged at ``version``
+class _InfiniteQueueClient:
+    """Pop client on a queue that always has a batch tagged at ``version``
     (the remote worker pool, never empty)."""
 
     def __init__(self, *, version=1, groups_per_batch=4):
         self.version = version
         self.groups_per_batch = groups_per_batch
 
-    async def get(self):
+    async def pop(self):
         return (
             0,
             self.version,
@@ -467,6 +565,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
             buffer_groups=0,
             max_staleness=4,
             queue_poll_interval_s=0,
+            rollout_stall_timeout_s=0,
             publish_every=999,  # never fires mid-run (initial publish covered elsewhere)
             num_shards=2,
         )
@@ -475,7 +574,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
         r._window_count = 0
         r._num_dropped = 0
         # Rollouts arrive tagged v1; staleness reference is v1 -> nothing dropped.
-        r._rollout_queue_server = _InfiniteQueueServer(version=1)
+        r._queue_client = _InfiniteQueueClient(version=1)
         r._relay_client = _FakeRelayClient()
 
         versions = itertools.count(1)
