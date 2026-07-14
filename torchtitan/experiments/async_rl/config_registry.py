@@ -40,15 +40,15 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.experiments import rl as _rl_pkg
-from torchtitan.experiments.async_rl.async_inference.trainer import (
-    AsyncInferenceReplica,
+from torchtitan.experiments.async_rl.prime.trainer import (
+    PrimeReplica,
 )
-from torchtitan.experiments.async_rl.async_inference.worker import AsyncInferenceWorker
+from torchtitan.experiments.async_rl.prime.worker import PrimeWorker
 
 from torchtitan.experiments.async_rl.diloco.trainer import DiLoCoRLReplica
 from torchtitan.experiments.async_rl.heloco.trainer import HeLoCoRLReplica
-from torchtitan.experiments.async_rl.heloco_async_inference.trainer import (
-    HeLoCoAsyncInferenceReplica,
+from torchtitan.experiments.async_rl.prime_heloco.trainer import (
+    PrimeHeLoCoReplica,
 )
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
@@ -269,7 +269,7 @@ def rl_heloco_llama3_8b(**kwargs) -> HeLoCoRLReplica.Config:
     return rl_heloco_qwen3_0_6b(**kwargs)
 
 
-def rl_heloco_async_inference_qwen3_0_6b(
+def rl_prime_heloco_qwen3_0_6b(
     gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     sync_every: int = 4,
@@ -283,25 +283,25 @@ def rl_heloco_async_inference_qwen3_0_6b(
     flavor: str = "0.6B",
     trainer_tensor_parallel_degree: int = 1,
     generator_tensor_parallel_degree: int = 1,
-) -> HeLoCoAsyncInferenceReplica.Config:
+) -> PrimeHeLoCoReplica.Config:
     """Prime-rl-style decoupled generation (arXiv:2505.07291) scaled to
     MULTIPLE trainers: N PURE-LEARNER HeLoCo trainer replicas (1 GPU each at
     the default TP=1 -- no local generation, no vLLM on the trainer) plus a
-    separate pool of rl_heloco_async_inference_worker_* generator processes on
+    separate pool of rl_prime_heloco_worker_* generator processes on
     their own machines that free-run rollouts into a hub-hosted shared queue.
     Each trainer pops rollouts from that queue, trains, and pushes its
     pseudo-gradient to the HeLoCo parameter server (no barrier); any trainer
     may consume any worker's rollouts. The hub
-    (torchtitan.experiments.async_rl.heloco_async_inference.server)
+    (torchtitan.experiments.async_rl.prime_heloco.server)
     publishes the CURRENT global theta (the consensus weights, not any one
     trainer's copy) to a relay process for the generator pool to pull. Start
-    the coordination plane first: async_inference.relay,
-    async_inference.rollout_queue, then heloco_async_inference.server.
+    the coordination plane first: prime.relay,
+    prime.rollout_queue, then prime_heloco.server.
     rollout_queue_address is required (usually $ROLLOUT_QUEUE_ADDR, the same
     queue workers' rollout_queue_address points at). Loss is stock GRPO.
     """
     return wrap_replica(
-        HeLoCoAsyncInferenceReplica,
+        PrimeHeLoCoReplica,
         base_rl_config(
             gpu_memory_limit,
             hf_assets_path,
@@ -319,23 +319,23 @@ def rl_heloco_async_inference_qwen3_0_6b(
     )
 
 
-def rl_heloco_async_inference_qwen3_1_7b(
+def rl_prime_heloco_qwen3_1_7b(
     **kwargs,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """1.7B preset; see rl_heloco_async_inference_qwen3_0_6b for the strategy
+) -> PrimeHeLoCoReplica.Config:
+    """1.7B preset; see rl_prime_heloco_qwen3_0_6b for the strategy
     docstring."""
     kwargs.setdefault("flavor", "1.7B")
-    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
+    return rl_prime_heloco_qwen3_0_6b(**kwargs)
 
 
-def rl_heloco_async_inference_llama3_8b(**kwargs) -> HeLoCoAsyncInferenceReplica.Config:
+def rl_prime_heloco_llama3_8b(**kwargs) -> PrimeHeLoCoReplica.Config:
     """Llama3-8B preset -- a second model family, proving the
     _MODEL_REGISTRY_BY_MODEL extension point works end to end with no other
-    changes. See rl_heloco_async_inference_qwen3_0_6b for the strategy
+    changes. See rl_prime_heloco_qwen3_0_6b for the strategy
     docstring."""
     kwargs.setdefault("model", "llama3")
     kwargs.setdefault("flavor", "8B")
-    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
+    return rl_prime_heloco_qwen3_0_6b(**kwargs)
 
 
 def rl_diloco_qwen3_0_6b(
@@ -391,7 +391,7 @@ def rl_diloco_llama3_8b(**kwargs) -> DiLoCoRLReplica.Config:
     return rl_diloco_qwen3_0_6b(**kwargs)
 
 
-def rl_async_inference_qwen3_0_6b(
+def rl_prime_qwen3_0_6b(
     gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     sync_every: int = 4,
@@ -407,23 +407,23 @@ def rl_async_inference_qwen3_0_6b(
     flavor: str = "0.6B",
     trainer_tensor_parallel_degree: int = 1,
     generator_tensor_parallel_degree: int = 1,
-) -> AsyncInferenceReplica.Config:
+) -> PrimeReplica.Config:
     """Trainer role of prime-rl (arXiv:2505.07291): ONE pure-learner trainer
     (1 GPU, no local vLLM) fed entirely by a pool of remote generator workers
-    (rl_async_inference_worker_*) on their own machines. The trainer pops
+    (rl_prime_worker_*) on their own machines. The trainer pops
     rollouts from the standalone queue process at rollout_queue_address under
     a max_staleness bound, trains, and shards + publishes its weights to
     relay_addresses every publish_every windows (SHARDCAST-style) -- plus an
     initial publish at startup so the workers can bootstrap. Both addresses
     are required -- start the servers first:
-    ``python -m torchtitan.experiments.async_rl.async_inference.relay`` and
-    ``python -m torchtitan.experiments.async_rl.async_inference.rollout_queue``.
+    ``python -m torchtitan.experiments.async_rl.prime.relay`` and
+    ``python -m torchtitan.experiments.async_rl.prime.rollout_queue``.
     Workers push rollouts to the same queue
-    ($ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
-    ($ASYNC_INFERENCE_RELAY_ADDRS).
+    ($PRIME_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
+    ($PRIME_RELAY_ADDRS).
     """
     return wrap_replica(
-        AsyncInferenceReplica,
+        PrimeReplica,
         base_rl_config(
             gpu_memory_limit,
             hf_assets_path,
@@ -443,22 +443,22 @@ def rl_async_inference_qwen3_0_6b(
     )
 
 
-def rl_async_inference_qwen3_1_7b(**kwargs) -> AsyncInferenceReplica.Config:
-    """1.7B preset; see rl_async_inference_qwen3_0_6b for the strategy docstring."""
+def rl_prime_qwen3_1_7b(**kwargs) -> PrimeReplica.Config:
+    """1.7B preset; see rl_prime_qwen3_0_6b for the strategy docstring."""
     kwargs.setdefault("flavor", "1.7B")
-    return rl_async_inference_qwen3_0_6b(**kwargs)
+    return rl_prime_qwen3_0_6b(**kwargs)
 
 
-def rl_async_inference_llama3_8b(**kwargs) -> AsyncInferenceReplica.Config:
+def rl_prime_llama3_8b(**kwargs) -> PrimeReplica.Config:
     """Llama3-8B preset -- a second model family, proving the
     _MODEL_REGISTRY_BY_MODEL extension point works end to end with no other
-    changes. See rl_async_inference_qwen3_0_6b for the strategy docstring."""
+    changes. See rl_prime_qwen3_0_6b for the strategy docstring."""
     kwargs.setdefault("model", "llama3")
     kwargs.setdefault("flavor", "8B")
-    return rl_async_inference_qwen3_0_6b(**kwargs)
+    return rl_prime_qwen3_0_6b(**kwargs)
 
 
-def rl_async_inference_worker_qwen3_0_6b(
+def rl_prime_worker_qwen3_0_6b(
     hf_assets_path: str | None = None,
     relay_addresses: str = "",
     rollout_queue_address: str = "",
@@ -471,10 +471,10 @@ def rl_async_inference_worker_qwen3_0_6b(
     model: str = "qwen3",
     flavor: str = "0.6B",
     generator_tensor_parallel_degree: int = 1,
-) -> AsyncInferenceWorker.Config:
-    """Inference-worker role of the async-inference relay swarm: no trainer
+) -> PrimeWorker.Config:
+    """Inference-worker role of the prime relay swarm: no trainer
     fields apply here (this role has no trainer actor -- see
-    async_inference/worker.py), so this copies only what a generator needs
+    prime/worker.py), so this copies only what a generator needs
     out of base_rl_config() rather than going through wrap_replica (which
     assumes an RLTrainer.Config-shaped target). relay_addresses (weights in)
     and rollout_queue_address (rollouts out, the standalone queue process both
@@ -485,7 +485,7 @@ def rl_async_inference_worker_qwen3_0_6b(
         flavor=flavor,
         generator_tensor_parallel_degree=generator_tensor_parallel_degree,
     )
-    return AsyncInferenceWorker.Config(
+    return PrimeWorker.Config(
         model_spec=base.model_spec,
         hf_assets_path=hf_assets_path or base.hf_assets_path,
         generator=base.generator,
@@ -501,14 +501,14 @@ def rl_async_inference_worker_qwen3_0_6b(
     )
 
 
-def rl_async_inference_worker_qwen3_1_7b(**kwargs) -> AsyncInferenceWorker.Config:
-    """1.7B preset; see rl_async_inference_worker_qwen3_0_6b for the strategy
+def rl_prime_worker_qwen3_1_7b(**kwargs) -> PrimeWorker.Config:
+    """1.7B preset; see rl_prime_worker_qwen3_0_6b for the strategy
     docstring."""
     kwargs.setdefault("flavor", "1.7B")
-    return rl_async_inference_worker_qwen3_0_6b(**kwargs)
+    return rl_prime_worker_qwen3_0_6b(**kwargs)
 
 
-def rl_heloco_async_inference_worker_qwen3_0_6b(
+def rl_prime_heloco_worker_qwen3_0_6b(
     hf_assets_path: str | None = None,
     relay_addresses: str = "",
     rollout_queue_address: str = "",
@@ -521,9 +521,9 @@ def rl_heloco_async_inference_worker_qwen3_0_6b(
     model: str = "qwen3",
     flavor: str = "0.6B",
     generator_tensor_parallel_degree: int = 1,
-) -> AsyncInferenceWorker.Config:
-    """Inference-worker (generator) role of the heloco_async_inference swarm:
-    the exact same AsyncInferenceWorker process as rl_async_inference_worker_*
+) -> PrimeWorker.Config:
+    """Inference-worker (generator) role of the prime_heloco swarm:
+    the exact same PrimeWorker process as rl_prime_worker_*
     (all workers free-run -- generate continuously at their current weights,
     upgrading opportunistically -- which is the definition of a decoupled
     async generator). These workers are the trainers' SOLE rollout source (no
@@ -539,7 +539,7 @@ def rl_heloco_async_inference_worker_qwen3_0_6b(
         flavor=flavor,
         generator_tensor_parallel_degree=generator_tensor_parallel_degree,
     )
-    return AsyncInferenceWorker.Config(
+    return PrimeWorker.Config(
         model_spec=base.model_spec,
         hf_assets_path=hf_assets_path or base.hf_assets_path,
         generator=base.generator,
@@ -555,9 +555,9 @@ def rl_heloco_async_inference_worker_qwen3_0_6b(
     )
 
 
-def rl_heloco_async_inference_worker_qwen3_1_7b(
+def rl_prime_heloco_worker_qwen3_1_7b(
     **kwargs,
-) -> AsyncInferenceWorker.Config:
-    """1.7B preset; see rl_heloco_async_inference_worker_qwen3_0_6b."""
+) -> PrimeWorker.Config:
+    """1.7B preset; see rl_prime_heloco_worker_qwen3_0_6b."""
     kwargs.setdefault("flavor", "1.7B")
-    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
+    return rl_prime_heloco_worker_qwen3_0_6b(**kwargs)

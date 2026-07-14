@@ -1,11 +1,11 @@
 # Copyright (c) Panocular AI.
 #
-# Trainer role of the async-inference relay swarm: prime-rl (arXiv:2505.07291).
+# Trainer role of the prime relay swarm: prime-rl (arXiv:2505.07291).
 #
 # A PURE-LEARNER trainer (one GPU, no local generation of any kind) whose
 # training rollouts come entirely from a pool of REMOTE generator workers on
 # separate machines, pushed into a standalone rollout-queue process
-# (async_inference.rollout_queue) this trainer pops from. The trainer
+# (prime.rollout_queue) this trainer pops from. The trainer
 # consumes with a max_staleness bound, trains, and publishes its weights to a
 # relay tier (SHARDCAST-style) so the workers can pull the next policy version.
 # Generation on the same node as the trainer would just be the single-node
@@ -23,13 +23,13 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan.experiments.async_rl.async_inference.actors import SnapshotPolicyTrainer
-from torchtitan.experiments.async_rl.async_inference.relay import (
+from torchtitan.experiments.async_rl.prime.actors import SnapshotPolicyTrainer
+from torchtitan.experiments.async_rl.prime.relay import (
     build_manifest,
     RelayClient,
     shard_state_dict,
 )
-from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
+from torchtitan.experiments.async_rl.prime.rollout_queue import (
     RolloutQueuePopClient,
 )
 from torchtitan.experiments.async_rl.pure_learner import PureLearnerReplica
@@ -37,7 +37,7 @@ from torchtitan.experiments.async_rl.pure_learner import PureLearnerReplica
 logger = logging.getLogger(__name__)
 
 
-class AsyncInferenceReplica(PureLearnerReplica):
+class PrimeReplica(PureLearnerReplica):
     """prime-rl: one pure-learner trainer + a pool of remote generator workers.
 
     Inherits the pure-learner consumer/buffer/staleness machinery and the
@@ -62,7 +62,7 @@ class AsyncInferenceReplica(PureLearnerReplica):
         """Comma-separated relay server base URLs (e.g.
         "http://localhost:8765,http://localhost:8766"). Required -- every
         published checkpoint version is uploaded to all of them. Launch
-        plumbing (usually from $ASYNC_INFERENCE_RELAY_ADDRS via train.py), so
+        plumbing (usually from $PRIME_RELAY_ADDRS via train.py), so
         it's checked in setup_async rather than __post_init__ (ConfigManager
         calls the --config function with zero args before overlaying CLI
         flags, so a required-with-empty-default field can't be validated at
@@ -74,7 +74,7 @@ class AsyncInferenceReplica(PureLearnerReplica):
         """Windows between relay publishes (1 = publish every window)."""
         rollout_queue_address: str = ""
         """Base URL of the standalone rollout-queue process
-        (async_inference.rollout_queue) this trainer pops from, e.g.
+        (prime.rollout_queue) this trainer pops from, e.g.
         "http://localhost:8767". Required -- launch plumbing (usually from
         $ROLLOUT_QUEUE_ADDR via train.py), so it's checked in setup_async
         rather than __post_init__ (same reasoning as relay_addresses)."""
@@ -88,7 +88,7 @@ class AsyncInferenceReplica(PureLearnerReplica):
                     f"publish_every must be >= 1, got {self.publish_every}"
                 )
 
-    def __init__(self, config: "AsyncInferenceReplica.Config"):
+    def __init__(self, config: "PrimeReplica.Config"):
         super().__init__(config)
         self._relay_client: RelayClient | None = None
         self._checkpoint_version = 0
@@ -104,7 +104,7 @@ class AsyncInferenceReplica(PureLearnerReplica):
         cfg = self.config
         if not cfg.relay_addresses:
             raise ValueError(
-                "relay_addresses is required (set $ASYNC_INFERENCE_RELAY_ADDRS)"
+                "relay_addresses is required (set $PRIME_RELAY_ADDRS)"
             )
         if not cfg.rollout_queue_address:
             raise ValueError(

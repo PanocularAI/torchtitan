@@ -1,6 +1,6 @@
 # Copyright (c) Panocular AI.
 #
-# Checkpoint distribution for the async-inference swarm: prime-rl-style
+# Checkpoint distribution for the prime swarm: prime-rl-style
 # SHARDCAST (arXiv:2505.07291, INTELLECT-2), in three pieces that share one
 # module because they share one wire format:
 #
@@ -24,7 +24,7 @@
 # Needs torch (state-dict tensors) but never the torchtitan training stack or
 # vLLM, so the standalone relay-server process stays CPU-only, like heloco's
 # parameter server (heloco/server.py). Run one relay node per box with:
-#   python -m torchtitan.experiments.async_rl.async_inference.relay --port 8765
+#   python -m torchtitan.experiments.async_rl.prime.relay --port 8765
 
 import argparse
 import asyncio
@@ -449,7 +449,7 @@ class RelayClient:
 
 async def _serve(host: str, port: int, retain_last: int) -> None:
     runner = await run_relay_server(host=host, port=port, retain_last=retain_last)
-    print(f"ASYNC_INFERENCE_RELAY_ADDR=http://{host}:{port}", flush=True)
+    print(f"PRIME_RELAY_ADDR=http://{host}:{port}", flush=True)
     logger.info("relay server serving; ctrl-c to stop")
     try:
         while True:
@@ -462,7 +462,7 @@ async def _serve(host: str, port: int, retain_last: int) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="async-inference relay server")
+    parser = argparse.ArgumentParser(description="prime relay server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(

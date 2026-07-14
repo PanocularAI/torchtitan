@@ -1,6 +1,6 @@
 # Copyright (c) Panocular AI.
 #
-# Parameter-server process for the heloco_async_inference strategy: the
+# Parameter-server process for the prime_heloco strategy: the
 # HeLoCo parameter server plus a publish loop that pushes each new global
 # checkpoint to the SEPARATE relay process over HTTP.
 #
@@ -13,8 +13,8 @@
 #     threads) + a watch loop on server.status()["revision"] that, every
 #     publish_every_revisions commits, snapshots the global model (bf16),
 #     shards it, and publishes to the relay via RelayClient.
-#   - async_inference.relay: checkpoint distribution to the generator pool.
-#   - async_inference.rollout_queue: the shared rollout queue every trainer
+#   - prime.relay: checkpoint distribution to the generator pool.
+#   - prime.rollout_queue: the shared rollout queue every trainer
 #     replica pops from and every generator worker pushes into.
 
 import argparse
@@ -24,7 +24,7 @@ import logging
 import aiohttp
 import torch
 
-from torchtitan.experiments.async_rl.async_inference.relay import (
+from torchtitan.experiments.async_rl.prime.relay import (
     build_manifest,
     RelayClient,
     shard_state_dict,
@@ -94,13 +94,13 @@ async def _watch_and_publish(
     tick rather than crashing the parameter server.
 
     Published checkpoint versions are ``server revision + 1``, never the raw
-    revision: ``AsyncInferenceWorker`` starts at version 0 and
+    revision: ``PrimeWorker`` starts at version 0 and
     ``RelayClient.fetch_latest`` requires ``manifest.version > min_version``
     (strict), so a checkpoint published under version 0 could never be
     fetched by a freshly-started worker -- a constant +1 shift avoids that
     bootstrap deadlock. The same shift is applied wherever a revision needs
     to be compared as a checkpoint version (see
-    ``HeLoCoAsyncInferenceReplica._last_known_revision``), so relative
+    ``PrimeHeLoCoReplica._last_known_revision``), so relative
     staleness math is unaffected."""
     last_published_revision = -1
     while True:
@@ -140,7 +140,7 @@ async def _watch_and_publish(
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(
-        description="heloco_async_inference hub (param server + relay + shared rollout queue)"
+        description="prime_heloco hub (param server + relay + shared rollout queue)"
     )
     parser.add_argument(
         "--outer_method", choices=["heloco", "diloco"], default="heloco"
@@ -167,7 +167,7 @@ def main() -> None:
         "--relay_addr",
         type=str,
         required=True,
-        help="base URL of the relay process (async_inference.relay) this "
+        help="base URL of the relay process (prime.relay) this "
         "parameter server publishes checkpoints to, e.g. http://host:8768",
     )
     parser.add_argument(
@@ -184,7 +184,7 @@ def main() -> None:
     )
     parser.add_argument("--publish_poll_interval_s", type=float, default=1.0)
     # Config selects the model_spec / hf_assets_path (same registry the
-    # replicas use), e.g. --module async_rl --config rl_heloco_async_inference_qwen3_0_6b
+    # replicas use), e.g. --module async_rl --config rl_prime_heloco_qwen3_0_6b
     parser.add_argument("--module", type=str, default="async_rl")
     parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()
@@ -210,7 +210,7 @@ def main() -> None:
         should_quantize=args.should_quantize,
     )
 
-    # Replicas read these from the environment (see launch_heloco_async_inference.sh).
+    # Replicas read these from the environment (see launch_prime_heloco.sh).
     print(f"DILOCO_SERVER_ADDR={server.address()}", flush=True)
     print(f"DILOCO_HB_ADDR={server.heartbeat_address()}", flush=True)
     logger.info(

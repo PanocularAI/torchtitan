@@ -1,7 +1,7 @@
 # Copyright (c) Panocular AI.
 #
 # On-GPU trainer actor with a full-parameter CPU snapshot/restore pair, used
-# by AsyncInferenceReplica to read the whole model out for relay publishing
+# by PrimeReplica to read the whole model out for relay publishing
 # (see trainer.py's setup_async). Not specific to any sync protocol --
 # torchtitan.experiments.async_rl.heloco.actors.HeLoCoPolicyTrainer implements
 # an analogous snapshot/restore pair for its own parameter-server exchange,

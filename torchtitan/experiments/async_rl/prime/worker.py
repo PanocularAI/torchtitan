@@ -1,25 +1,25 @@
 # Copyright (c) Panocular AI.
 #
-# Standalone inference-worker process for the async-inference relay swarm.
+# Standalone inference-worker process for the prime relay swarm.
 #
 # This role has NO trainer actor at all. `torchtitan.experiments.rl.trainer
 # .RLTrainer.setup_async` always spawns a `PolicyTrainer` and binds
 # TorchStore's storage volumes to the trainer mesh -- a coupling this role
 # deliberately doesn't have, so it can't reuse that setup path. This spawns
 # just a generator actor and binds TorchStore to ITS OWN mesh instead; weight
-# updates arrive exclusively through the relay tier (torchtitan.experiments.async_rl.async_inference.relay),
+# updates arrive exclusively through the relay tier (torchtitan.experiments.async_rl.prime.relay),
 # never through a local trainer push.
 #
-# This worker fetches weights via the relay tier (torchtitan.experiments.async_rl.async_inference.relay)
+# This worker fetches weights via the relay tier (torchtitan.experiments.async_rl.prime.relay)
 # and pushes its generated rollouts to the standalone rollout-queue process
 # (rollout_queue.py) via RolloutQueuePushClient -- workers are trusted here,
 # so this is a plain push/queue, not TOPLOC-style cryptographic verification.
 #
 # Run as:
-#   ASYNC_INFERENCE_RELAY_ADDRS=http://localhost:8765,http://localhost:8766 \
-#   ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR=http://localhost:8767 ASYNC_INFERENCE_WORKER_ID=0 \
-#     python -m torchtitan.experiments.async_rl.async_inference.worker \
-#       --module async_rl --config rl_async_inference_worker_qwen3_0_6b
+#   PRIME_RELAY_ADDRS=http://localhost:8765,http://localhost:8766 \
+#   PRIME_ROLLOUT_QUEUE_ADDR=http://localhost:8767 PRIME_WORKER_ID=0 \
+#     python -m torchtitan.experiments.async_rl.prime.worker \
+#       --module async_rl --config rl_prime_worker_qwen3_0_6b
 
 import asyncio
 import logging
@@ -34,10 +34,10 @@ import torchstore as ts  # noqa: E402
 from monarch.actor import this_host  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
-from torchtitan.experiments.async_rl.async_inference.relay import (
+from torchtitan.experiments.async_rl.prime.relay import (
     RelayClient,
 )  # noqa: E402
-from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
+from torchtitan.experiments.async_rl.prime.rollout_queue import (
     RolloutQueuePushClient,
 )  # noqa: E402
 
@@ -56,8 +56,8 @@ from torchtitan.experiments.rl.trainer import setup_mesh_elastic_env  # noqa: E4
 logger = logging.getLogger(__name__)
 
 
-class AsyncInferenceWorker:
-    """Inference-only node in the async-inference relay swarm (see module
+class PrimeWorker:
+    """Inference-only node in the prime relay swarm (see module
     docstring for the trainer-less design and rollout-feedback scope
     boundary)."""
 
@@ -78,8 +78,8 @@ class AsyncInferenceWorker:
         checkpoint load."""
         relay_addresses: str = ""
         """Comma-separated relay server base URLs. Required -- launch
-        plumbing (usually from $ASYNC_INFERENCE_RELAY_ADDRS), so -- like
-        AsyncInferenceReplica.relay_addresses -- it's checked at construction time
+        plumbing (usually from $PRIME_RELAY_ADDRS), so -- like
+        PrimeReplica.relay_addresses -- it's checked at construction time
         (RelayClient itself raises on an empty list) rather than here:
         ConfigManager calls the --config function with zero args before
         overlaying CLI flags, so validating a required-with-empty-default
@@ -87,7 +87,7 @@ class AsyncInferenceWorker:
         rollout_queue_address: str = ""
         """The standalone rollout-queue process's base URL (e.g.
         "http://localhost:8767"), usually from
-        $ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR. Required -- same launch-plumbing
+        $PRIME_ROLLOUT_QUEUE_ADDR. Required -- same launch-plumbing
         reasoning as relay_addresses; checked by RolloutQueuePushClient's own
         constructor."""
         worker_id: int = 0
@@ -118,7 +118,7 @@ class AsyncInferenceWorker:
                     f"{self.round_slowdown_factor}"
                 )
 
-    def __init__(self, config: "AsyncInferenceWorker.Config"):
+    def __init__(self, config: "PrimeWorker.Config"):
         self.config = config
         self._relay_client = RelayClient(
             [u.strip() for u in config.relay_addresses.split(",") if u.strip()]
@@ -181,7 +181,7 @@ class AsyncInferenceWorker:
     async def _generate_and_send_round(self) -> None:
         """Generate groups_per_round rollout groups against the current
         weights, then push them to the trainer's rollout queue. Mirrors
-        AsyncInferenceReplica._collect_groups_on's generate_fn wiring (same
+        PrimeReplica._collect_groups_on's generate_fn wiring (same
         rollouter.run_group_rollouts contract), minus the training-batch
         plumbing this role has no use for -- the trainer assembles training
         batches from these groups itself once they land in its buffer."""
@@ -278,15 +278,15 @@ async def _main() -> None:
 
     config = ConfigManager().parse_args()
     for field_name, env_name, cast in (
-        ("relay_addresses", "ASYNC_INFERENCE_RELAY_ADDRS", str),
-        ("rollout_queue_address", "ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR", str),
-        ("worker_id", "ASYNC_INFERENCE_WORKER_ID", int),
-        ("round_slowdown_factor", "ASYNC_INFERENCE_ROUND_SLOWDOWN", float),
+        ("relay_addresses", "PRIME_RELAY_ADDRS", str),
+        ("rollout_queue_address", "PRIME_ROLLOUT_QUEUE_ADDR", str),
+        ("worker_id", "PRIME_WORKER_ID", int),
+        ("round_slowdown_factor", "PRIME_ROUND_SLOWDOWN", float),
     ):
         if os.environ.get(env_name):
             setattr(config, field_name, cast(os.environ[env_name]))
 
-    worker = AsyncInferenceWorker(config)
+    worker = PrimeWorker(config)
     generator_ws = _compute_world_size(config.generator.parallelism)
     provisioner = PerHostProvisioner(total_gpus=generator_ws)
     generator_mesh = this_host().spawn_procs(
@@ -300,7 +300,7 @@ async def _main() -> None:
 
 
 def run_worker() -> None:
-    """Entrypoint body for `python -m torchtitan.experiments.async_rl.async_inference.worker`."""
+    """Entrypoint body for `python -m torchtitan.experiments.async_rl.prime.worker`."""
     asyncio.run(_main())
 
 
