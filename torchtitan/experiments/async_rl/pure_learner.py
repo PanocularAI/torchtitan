@@ -1,7 +1,7 @@
 # Copyright (c) Panocular AI.
 #
 # PureLearnerReplica: the shared base for the decoupled-generation strategies
-# (prime, prime_heloco). A pure learner runs NO local
+# (async_inference, heloco_async_inference). A pure learner runs NO local
 # generation -- one trainer GPU, all training rollouts arrive from a pool of
 # REMOTE generator workers through a queue -- which is prime-rl's
 # decoupled-generation shape (arXiv:2505.07291): inference lives on separate

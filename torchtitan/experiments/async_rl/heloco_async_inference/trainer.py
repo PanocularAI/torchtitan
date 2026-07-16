@@ -1,12 +1,12 @@
 # Copyright (c) Panocular AI.
 #
-# Controller for prime_heloco: prime-rl-style decoupled generation
+# Controller for heloco_async_inference: prime-rl-style decoupled generation
 # scaled to MULTIPLE trainers. N pure-learner HeLoCo trainer replicas (1 GPU
 # each, no local generation) draw ALL training rollouts from one shared
-# rollout-queue process (prime.rollout_queue) fed by a pool of
+# rollout-queue process (async_inference.rollout_queue) fed by a pool of
 # remote generator workers, and coordinate no-barrier through the HeLoCo
-# parameter server (prime_heloco.server), which publishes the
-# CURRENT global theta to a relay process (prime.relay) for the
+# parameter server (heloco_async_inference.server), which publishes the
+# CURRENT global theta to a relay process (async_inference.relay) for the
 # generator pool.
 #
 # The pure-learner shape (no vLLM on the trainer; consume from a remote
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan.experiments.async_rl.prime.rollout_queue import (
+from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
     RolloutQueuePopClient,
 )
 from torchtitan.experiments.async_rl.heloco.actors import HeLoCoPolicyTrainer
@@ -33,7 +33,7 @@ from torchtitan.experiments.async_rl.pure_learner import PureLearnerReplica
 logger = logging.getLogger(__name__)
 
 
-class PrimeHeLoCoReplica(PureLearnerReplica):
+class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
     """A pure-learner HeLoCo trainer whose training rollouts come entirely
     from the shared rollout-queue process (fed by a remote generator pool).
 
@@ -73,7 +73,7 @@ class PrimeHeLoCoReplica(PureLearnerReplica):
         field can't be validated at __post_init__ time without breaking the
         CLI path)."""
 
-    def __init__(self, config: "PrimeHeLoCoReplica.Config"):
+    def __init__(self, config: "HeLoCoAsyncInferenceReplica.Config"):
         super().__init__(config)
         self.client: HeLoCoRLClient | None = None
         self._queue_client: RolloutQueuePopClient | None = None
@@ -120,7 +120,7 @@ class PrimeHeLoCoReplica(PureLearnerReplica):
         await self.trainer.load_full_state_dict_cpu.call(global_sd)
         self._queue_client = RolloutQueuePopClient(cfg.rollout_queue_address)
         # +1: the hub publishes checkpoint versions as server revision + 1
-        # (see prime_heloco/server.py::_watch_and_publish for why),
+        # (see heloco_async_inference/server.py::_watch_and_publish for why),
         # so this reference must be shifted the same way to stay comparable to
         # the revision workers stamp on their rollout batches.
         self._last_known_revision = self.client.revision + 1

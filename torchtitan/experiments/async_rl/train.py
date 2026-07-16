@@ -6,13 +6,13 @@
 #   python -m torchtitan.experiments.async_rl.train \
 #       --module async_rl --config rl_heloco_qwen3_0_6b
 #
-# and likewise for rl_diloco_* / rl_prime_* configs, or a
+# and likewise for rl_diloco_* / rl_async_inference_* configs, or a
 # benchmark config via --module torchtitan.experiments.async_rl.___benchmark
 # --config bench_local_qwen3_0_6b. Launch plumbing (server/lighthouse/relay
 # addresses, replica ids) comes from the environment -- exported by the
 # ___benchmark/launch_*.sh scripts -- rather than CLI flags, so one launch
-# script serves any config; see _ENV_OVERRIDES below. The prime
-# inference-worker role has its own entrypoint (prime/worker.py):
+# script serves any config; see _ENV_OVERRIDES below. The async_inference
+# inference-worker role has its own entrypoint (async_inference/worker.py):
 # it spawns no trainer, so it doesn't fit this replica lifecycle.
 
 import os
@@ -42,8 +42,8 @@ _ENV_OVERRIDES = {
     "heartbeat_address": (("DILOCO_HB_ADDR",), str),
     "lighthouse_address": (("DILOCO_LIGHTHOUSE_ADDR",), str),
     "num_replicas": (("DILOCO_NUM_REPLICAS",), int),
-    "relay_addresses": (("PRIME_RELAY_ADDRS",), str),
-    "replica_id": (("DILOCO_REPLICA_ID", "PRIME_REPLICA_ID"), int),
+    "relay_addresses": (("ASYNC_INFERENCE_RELAY_ADDRS",), str),
+    "replica_id": (("DILOCO_REPLICA_ID", "ASYNC_INFERENCE_REPLICA_ID"), int),
     "rollout_queue_address": (("ROLLOUT_QUEUE_ADDR",), str),
 }
 

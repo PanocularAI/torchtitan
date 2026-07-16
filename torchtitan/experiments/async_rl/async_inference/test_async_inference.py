@@ -1,9 +1,9 @@
 # Copyright (c) Panocular AI.
 #
-# prime relay swarm (prime-rl): relay sharding round-trip/integrity,
+# async-inference relay swarm (prime-rl): relay sharding round-trip/integrity,
 # RelayServer publish/fetch, the rollout-return queue wire protocol,
-# PrimeWorker's free-running poll loop, and the pure-learner
-# PrimeReplica (remote-rollout consumer, fail-fast buffer liveness,
+# AsyncInferenceWorker's free-running poll loop, and the pure-learner
+# AsyncInferenceReplica (remote-rollout consumer, fail-fast buffer liveness,
 # staleness dropping against the published checkpoint version, publish
 # cadence, and an end-to-end train loop that proves zero local generation).
 # CPU-only: no GPU, no vLLM, no Monarch actors -- everything above the wire
@@ -20,8 +20,8 @@ import torch
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-import torchtitan.experiments.async_rl.prime.worker as worker_mod
-from torchtitan.experiments.async_rl.prime.relay import (
+import torchtitan.experiments.async_rl.async_inference.worker as worker_mod
+from torchtitan.experiments.async_rl.async_inference.relay import (
     build_manifest,
     reassemble_state_dict,
     RelayClient,
@@ -30,15 +30,15 @@ from torchtitan.experiments.async_rl.prime.relay import (
     ShardIntegrityError,
     verify_shard,
 )
-from torchtitan.experiments.async_rl.prime.rollout_queue import (
+from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
     RolloutQueuePopClient,
     RolloutQueuePushClient,
     RolloutQueueServer,
 )
-from torchtitan.experiments.async_rl.prime.trainer import (
-    PrimeReplica,
+from torchtitan.experiments.async_rl.async_inference.trainer import (
+    AsyncInferenceReplica,
 )
-from torchtitan.experiments.async_rl.prime.worker import PrimeWorker
+from torchtitan.experiments.async_rl.async_inference.worker import AsyncInferenceWorker
 
 
 def _ep(fn):
@@ -228,7 +228,7 @@ def test_pop_swallows_slow_queue_timeout():
 
 
 # --------------------------------------------------------------------- #
-# PrimeReplica's remote-rollout consumer: worker-pushed batches must land
+# AsyncInferenceReplica's remote-rollout consumer: worker-pushed batches must land
 # in the SAME buffer the local per-engine producers feed, tagged with the
 # batch's version exactly like a local producer tags its own puts.
 # --------------------------------------------------------------------- #
@@ -250,10 +250,10 @@ class _FakeRelayClient:
         return self._results.pop(0) if self._results else None
 
 
-def make_prime_replica(*, publish_every=1):
-    """A pure-learner PrimeReplica with only the window-sync/publish
+def make_async_inference_replica(*, publish_every=1):
+    """A pure-learner AsyncInferenceReplica with only the window-sync/publish
     state, skipping RLTrainer.__init__ (no actors, no generators)."""
-    r = object.__new__(PrimeReplica)
+    r = object.__new__(AsyncInferenceReplica)
     r.config = SimpleNamespace(publish_every=publish_every, num_shards=2)
     r._relay_client = _FakeRelayClient()
     r._checkpoint_version = 0
@@ -278,7 +278,7 @@ def test_window_sync_publishes_only_on_boundary_in_background():
     go over the wire as bf16."""
 
     async def scenario():
-        r = make_prime_replica(publish_every=2)
+        r = make_async_inference_replica(publish_every=2)
 
         stats1 = await r._window_sync(t0=0.0)
         assert stats1.startswith("buffer: depth=0 dropped=0")  # base stats line
@@ -305,7 +305,7 @@ def test_window_sync_skips_publish_while_previous_in_flight():
     queue a second concurrent publish or block the window."""
 
     async def scenario():
-        r = make_prime_replica(publish_every=1)
+        r = make_async_inference_replica(publish_every=1)
         release = asyncio.Event()
         real_publish = r._relay_client.publish
 
@@ -329,7 +329,7 @@ def test_window_sync_skips_publish_while_previous_in_flight():
 
 
 # --------------------------------------------------------------------- #
-# PrimeWorker poll loop.
+# AsyncInferenceWorker poll loop.
 # --------------------------------------------------------------------- #
 
 
@@ -373,7 +373,7 @@ def make_worker(monkeypatch, results, *, num_rounds=0, groups_per_round=1):
     async def fake_pull(version):
         pull_calls.append(version)
 
-    w = object.__new__(PrimeWorker)
+    w = object.__new__(AsyncInferenceWorker)
     w.config = SimpleNamespace(
         worker_id=0,
         num_rounds=num_rounds,
@@ -393,7 +393,7 @@ def make_worker(monkeypatch, results, *, num_rounds=0, groups_per_round=1):
 
 
 def test_worker_free_runs_without_a_newer_checkpoint(monkeypatch):
-    """Regression for the prime_heloco window-0 deadlock: the
+    """Regression for the heloco_async_inference window-0 deadlock: the
     worker loads the first checkpoint (v1), then keeps generating rounds at
     that SAME version even though the relay never publishes anything newer
     (fetch_latest returns None forever after the first). A checkpoint-gated
@@ -435,9 +435,9 @@ async def _return(value):
 
 
 def make_replica(*, max_staleness=4, checkpoint_version=10):
-    """A pure-learner PrimeReplica with only the consumer state,
+    """A pure-learner AsyncInferenceReplica with only the consumer state,
     skipping RLTrainer.__init__ (no actors, no generators)."""
-    r = object.__new__(PrimeReplica)
+    r = object.__new__(AsyncInferenceReplica)
     r.config = SimpleNamespace(
         replica_id=0,
         sync_every=2,
@@ -555,7 +555,7 @@ class _InfiniteQueueClient:
 
 def test_train_end_to_end_pure_learner_on_fakes():
     async def scenario():
-        r = object.__new__(PrimeReplica)
+        r = object.__new__(AsyncInferenceReplica)
         r.config = SimpleNamespace(
             replica_id=0,
             sync_every=2,

@@ -382,7 +382,7 @@ def test_provisioner_slices_pool_and_rejects_over_allocation(monkeypatch):
 
 
 def test_package_import_stays_cpu_light():
-    """The heloco parameter server and prime relay server are
+    """The heloco parameter server and async_inference relay server are
     CPU-only processes that import their parent packages; a bare package
     import must not pull vLLM/monarch or the RL actor stack (which is why
     the __init__.py files re-export nothing)."""

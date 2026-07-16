@@ -1,13 +1,13 @@
 # Copyright (c) Panocular AI.
 #
-# Tests for the prime_heloco coordination plane (the revision-watch
+# Tests for the heloco_async_inference coordination plane (the revision-watch
 # publish loop, over the real HTTP relay wire) and the
-# PrimeHeLoCoReplica controller (config validation, the HeLoCo
+# HeLoCoAsyncInferenceReplica controller (config validation, the HeLoCo
 # window-sync push/pull with no generator refresh, and an end-to-end train
 # loop that proves zero local generation). The pure-learner consumer/buffer/
 # staleness machinery is inherited from PureLearnerReplica, and the shared
 # rollout queue (push/pop wire protocol, timeout robustness) lives in
-# prime.rollout_queue -- both covered by the prime tests.
+# async_inference.rollout_queue -- both covered by the async_inference tests.
 # CPU-only: no GPU, no vLLM, no Monarch actors -- everything above the wire
 # is faked.
 
@@ -19,16 +19,16 @@ import pytest
 import torch
 from aiohttp.test_utils import TestServer
 
-from torchtitan.experiments.async_rl.prime.relay import (
+from torchtitan.experiments.async_rl.async_inference.relay import (
     RelayClient,
     RelayServer,
 )
 from torchtitan.experiments.async_rl.config_registry import base_rl_config, wrap_replica
-from torchtitan.experiments.async_rl.prime_heloco.server import (
+from torchtitan.experiments.async_rl.heloco_async_inference.server import (
     _watch_and_publish,
 )
-from torchtitan.experiments.async_rl.prime_heloco.trainer import (
-    PrimeHeLoCoReplica,
+from torchtitan.experiments.async_rl.heloco_async_inference.trainer import (
+    HeLoCoAsyncInferenceReplica,
 )
 
 
@@ -57,7 +57,7 @@ def test_watch_and_publish_publishes_at_startup_and_on_cadence():
     between reads (a FakeServer backed by mutable state, not a one-shot
     iterator -- _consistent_snapshot itself re-reads the revision). Published
     checkpoint versions are server revision + 1 (never 0 -- see
-    _watch_and_publish's docstring: PrimeWorker starts at version 0
+    _watch_and_publish's docstring: AsyncInferenceWorker starts at version 0
     and RelayClient.fetch_latest requires a strictly newer version, so a raw
     revision-0 publish could never be fetched by a fresh worker). Publishes
     are bf16 over the wire."""
@@ -110,14 +110,14 @@ async def _poll_until(condition, interval=0.01):
 
 
 # --------------------------------------------------------------------- #
-# PrimeHeLoCoReplica.Config validation.
+# HeLoCoAsyncInferenceReplica.Config validation.
 # --------------------------------------------------------------------- #
 
 
 def test_config_pure_learner_defaults_and_validation():
     base = base_rl_config()
     cfg = wrap_replica(
-        PrimeHeLoCoReplica,
+        HeLoCoAsyncInferenceReplica,
         base,
         num_outer_steps=1,
     )
@@ -126,14 +126,14 @@ def test_config_pure_learner_defaults_and_validation():
     assert cfg.num_generators == 0
     with pytest.raises(ValueError, match="max_staleness must be >= 1"):
         wrap_replica(
-            PrimeHeLoCoReplica,
+            HeLoCoAsyncInferenceReplica,
             base,
             num_outer_steps=1,
             max_staleness=0,
         )
     with pytest.raises(ValueError, match="num_generators must be 0"):
         wrap_replica(
-            PrimeHeLoCoReplica,
+            HeLoCoAsyncInferenceReplica,
             base,
             num_outer_steps=1,
             num_generators=2,
@@ -142,14 +142,14 @@ def test_config_pure_learner_defaults_and_validation():
 
 # --------------------------------------------------------------------- #
 # HeLoCo outer step (window sync). The consumer/buffer/staleness machinery is
-# inherited from PureLearnerReplica and covered by the prime tests.
+# inherited from PureLearnerReplica and covered by the async_inference tests.
 # --------------------------------------------------------------------- #
 
 
 def make_replica():
-    """A PrimeHeLoCoReplica with only the window-sync state, skipping
+    """A HeLoCoAsyncInferenceReplica with only the window-sync state, skipping
     RLTrainer.__init__ (no actors, no torchft client)."""
-    r = object.__new__(PrimeHeLoCoReplica)
+    r = object.__new__(HeLoCoAsyncInferenceReplica)
     r.config = SimpleNamespace(
         queue_poll_interval_s=0,
         rollout_stall_timeout_s=0,
@@ -302,7 +302,7 @@ class _InfiniteQueueClient:
 
 def test_train_end_to_end_pure_learner_on_fakes():
     async def scenario():
-        r = object.__new__(PrimeHeLoCoReplica)
+        r = object.__new__(HeLoCoAsyncInferenceReplica)
         r.config = SimpleNamespace(
             replica_id=0,
             sync_every=2,

@@ -3,21 +3,21 @@
 # The rollout queue: a standalone CPU process buffering rollout batches
 # between the generator workers (push) and the trainer replicas (pop), used
 # by BOTH decoupled strategies:
-#   - prime: one trainer pops (the queue used to be embedded in the
+#   - async_inference: one trainer pops (the queue used to be embedded in the
 #     trainer process; standalone, a trainer stall can never back up worker
 #     pushes and queue traffic never shares the trainer's event loop).
-#   - prime_heloco: N trainers pop from the same queue (any trainer
+#   - heloco_async_inference: N trainers pop from the same queue (any trainer
 #     consumes any worker's rollouts, at-most-once).
 #
 # Deliberately dumb: a bounded FIFO of pickled ``(worker_id, version,
 # groups)`` batches. Full -> push rejected (503; the worker drops the batch
 # -- the trainer's max_staleness bound is designed around lost rollouts).
 # Empty -> pop returns 204 (the trainer polls). Runs next to the relay
-# process (prime.relay) but separately from it, so multi-GB
+# process (async_inference.relay) but separately from it, so multi-GB
 # checkpoint traffic and rollout traffic never queue behind each other.
 #
 # Run as:
-#   python -m torchtitan.experiments.async_rl.prime.rollout_queue \
+#   python -m torchtitan.experiments.async_rl.async_inference.rollout_queue \
 #     --port 8767
 
 import argparse
@@ -107,7 +107,7 @@ class RolloutQueuePushClient:
     def __init__(self, queue_address: str, *, timeout_s: float = 30.0):
         if not queue_address.strip():
             raise ValueError(
-                "queue_address is required (set $PRIME_ROLLOUT_QUEUE_ADDR)"
+                "queue_address is required (set $ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR)"
             )
         self.queue_address = queue_address.rstrip("/")
         self._timeout_s = timeout_s

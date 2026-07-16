@@ -10,10 +10,10 @@
 #   - torchtitan.experiments.async_rl.diloco -- N workers sync through a
 #     torchft Manager/Lighthouse quorum, stock synchronous DiLoCo
 #     (DiLoCoRLReplica).
-#   - torchtitan.experiments.async_rl.prime -- one trainer replica
-#     (PrimeReplica: prime-rl-style decoupled generation, arXiv:2505.07291)
+#   - torchtitan.experiments.async_rl.async_inference -- one trainer replica
+#     (AsyncInferenceReplica: prime-rl-style decoupled generation, arXiv:2505.07291)
 #     broadcasts weights outward through a relay-server tier to independent
-#     PrimeWorker processes (SHARDCAST-style); workers push generated
+#     AsyncInferenceWorker processes (SHARDCAST-style); workers push generated
 #     rollouts back into the trainer's embedded rollout queue.
 #
 # (A single-worker/no-coordination baseline lives only in
@@ -31,5 +31,5 @@
 #
 # Deliberately no re-exports: importing a coordinator pulls torchtitan's RL
 # stack including vLLM (~10s), which the CPU-only processes (heloco parameter
-# server, prime relay server) must not pay just for importing their
+# server, async_inference relay server) must not pay just for importing their
 # parent package. Import classes from their defining submodule.

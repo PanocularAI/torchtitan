@@ -3,7 +3,7 @@
 # Shared controller machinery for the async_rl coordination strategies.
 #
 # RLControllerMixin is everything the coordinators (heloco / diloco /
-# prime) have in common, in three layers:
+# async_inference) have in common, in three layers:
 #
 #   1. The LlamaRL-style generation/training split (arXiv:2505.24034):
 #      _collect_and_build (generator-mesh + CPU work) vs _train_on
@@ -136,7 +136,7 @@ class RLControllerMixin:
         """Bring this replica's generators up to the just-updated local policy:
         stage the trainer weights, then drain-and-pull every engine. Overridden
         by controllers that decouple the pull from the train step
-        (PrimeReplica stages only; its producers pull per-round)."""
+        (AsyncInferenceReplica stages only; its producers pull per-round)."""
         await self.trainer.push_model_state_dict.call()
         await self.generator_router.pull_model_state_dict(
             policy_version=self._policy_version
