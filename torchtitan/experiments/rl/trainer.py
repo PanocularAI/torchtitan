@@ -22,8 +22,11 @@ from dataclasses import dataclass, field, replace
 # must run before torch import
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+from typing import Annotated
+
 import torch
 import torchstore as ts
+import tyro
 from monarch.actor import ProcMesh
 from monarch.spmd import setup_torch_elastic_env_async
 
@@ -181,7 +184,11 @@ class RLTrainer(Configurable):
     class Config(Configurable.Config):
         """Top-level config for RL training."""
 
-        model_spec: ModelSpec | None = None
+        # NOTE: suppressed from tyro CLI parsing (same as Trainer.Config):
+        # tyro otherwise recurses into the default INSTANCE's config tree,
+        # which breaks on the HF backend's PretrainedConfig (TYPE_CHECKING
+        # forward refs to torch that can't be evaluated).
+        model_spec: Annotated[ModelSpec | None, tyro.conf.Suppress] = None
         """Model specification shared by trainer and generator.
         Set programmatically via config_registry (not from CLI)."""
 

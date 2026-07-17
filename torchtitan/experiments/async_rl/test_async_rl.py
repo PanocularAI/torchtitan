@@ -75,8 +75,10 @@ def test_new_model_needs_only_registry_dict_entries():
     fails with a clear error rather than a silent bogus default."""
     from torchtitan.models.qwen3 import model_registry as qwen3_model_registry
 
-    _MODEL_REGISTRY_BY_MODEL["_fake_for_test"] = lambda flavor, attn_backend: (
-        qwen3_model_registry("0.6B", attn_backend=attn_backend)
+    _MODEL_REGISTRY_BY_MODEL["_fake_for_test"] = (
+        lambda flavor, *, attn_backend, hf_assets_path: qwen3_model_registry(
+            "0.6B", attn_backend=attn_backend
+        )
     )
     _RENDERER_NAME_BY_MODEL["_fake_for_test"] = "auto"
     try:
@@ -401,3 +403,67 @@ def test_package_import_stays_cpu_light():
     )
     assert out.returncode == 0, out.stderr
     assert "light" in out.stdout
+
+
+def test_hf_backend_registry_resolution():
+    """The HF transformers backend resolves through the same table-driven
+    contract: dims come from the checkpoint's config.json (not derived), the
+    titan-shaped layers view satisfies the trainer/generator assertion
+    expression, and the near-identity state-dict adapter is wired."""
+    from torchtitan.models.common.attention import VarlenAttention
+
+    cfg = base_rl_config(model="hf", flavor="Qwen3-0.6B")
+    spec = cfg.model_spec
+    # the exact expression asserted by rl/actors/trainer.py and generator.py
+    inner = spec.model.layers[0].attention.inner_attention
+    assert isinstance(inner, VarlenAttention.Config)
+    attn = spec.model.layers[0].attention
+    assert attn.head_dim == 128, "must come from config.json, not dim/n_heads"
+    assert attn.n_kv_heads == 8
+    assert spec.state_dict_adapter is not None
+    assert cfg.renderer.name == "auto"
+    assert cfg.hf_assets_path.endswith("Qwen3-0.6B")
+    # trained untied (FSDP); the adapter aliases embeddings into lm_head at load
+    assert spec.model.tie_word_embeddings is False
+
+
+def test_hf_backend_covers_every_strategy():
+    """Every coordination strategy (and both decoupled worker roles) has an HF
+    preset that is a pure model/flavor redirect of its native counterpart —
+    the strategies themselves are model-agnostic, so the redirect plus the
+    registry tables is the whole integration surface. Resolve each preset and
+    check the HF markers that distinguish it from a native config."""
+    from torchtitan.experiments.async_rl.config_registry import (
+        rl_async_inference_hf_qwen3_0_6b,
+        rl_async_inference_worker_hf_qwen3_0_6b,
+        rl_diloco_hf_qwen3_0_6b,
+        rl_heloco_async_inference_hf_qwen3_0_6b,
+        rl_heloco_async_inference_worker_hf_qwen3_0_6b,
+        rl_heloco_hf_qwen3_0_6b,
+    )
+
+    for preset in (
+        rl_diloco_hf_qwen3_0_6b,
+        rl_heloco_hf_qwen3_0_6b,
+        rl_async_inference_hf_qwen3_0_6b,
+        rl_heloco_async_inference_hf_qwen3_0_6b,
+        rl_async_inference_worker_hf_qwen3_0_6b,
+        rl_heloco_async_inference_worker_hf_qwen3_0_6b,
+    ):
+        cfg = preset()
+        spec = cfg.model_spec
+        assert spec.name == "hf_transformers_rl", preset.__name__
+        assert spec.state_dict_adapter is not None, preset.__name__
+        assert cfg.renderer.name == "auto", preset.__name__
+        assert cfg.hf_assets_path.endswith("Qwen3-0.6B"), preset.__name__
+        assert spec.model.tie_word_embeddings is False, preset.__name__
+
+
+def test_hf_backend_1_7b_flavor_registered():
+    """The Qwen3-1.7B HF flavor resolves dims from ITS checkpoint config (not
+    0.6B's): 28 layers, hidden 2048, and the shared example_checkpoint dir."""
+    cfg = base_rl_config(model="hf", flavor="Qwen3-1.7B")
+    assert cfg.hf_assets_path.endswith("Qwen3-1.7B")
+    assert cfg.model_spec.model.num_hidden_layers == 28
+    assert cfg.model_spec.model.hidden_size == 2048
+    assert ("hf", "Qwen3-1.7B") in _DEFAULT_HF_ASSETS_PATH

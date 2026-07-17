@@ -64,9 +64,28 @@ from torchtitan.experiments.rl.trainer import GRPOLoss, RLTrainer
 from torchtitan.models.llama3 import model_registry as _llama3_model_registry
 from torchtitan.models.qwen3 import model_registry as _qwen3_model_registry
 
+def _hf_model_registry(flavor, *, attn_backend, hf_assets_path):
+    # Lazy: pulls transformers, only needed when the "hf" model is selected.
+    from torchtitan.experiments.transformers_modeling_backend.rl import (
+        model_registry,
+    )
+
+    return model_registry(
+        flavor, attn_backend=attn_backend, hf_assets_path=hf_assets_path
+    )
+
+
+#: Entries share one signature: (flavor, *, attn_backend, hf_assets_path).
+#: Native registries ignore hf_assets_path (they load weights via their own
+#: state-dict adapters); the "hf" backend resolves its ARCHITECTURE from it.
 _MODEL_REGISTRY_BY_MODEL = {
-    "qwen3": _qwen3_model_registry,
-    "llama3": _llama3_model_registry,
+    "qwen3": lambda flavor, *, attn_backend, hf_assets_path: _qwen3_model_registry(
+        flavor, attn_backend=attn_backend
+    ),
+    "llama3": lambda flavor, *, attn_backend, hf_assets_path: _llama3_model_registry(
+        flavor, attn_backend=attn_backend
+    ),
+    "hf": _hf_model_registry,
 }
 
 #: Renderer (chat-template) name per model -- see
@@ -75,6 +94,9 @@ _MODEL_REGISTRY_BY_MODEL = {
 _RENDERER_NAME_BY_MODEL = {
     "qwen3": "qwen3",
     "llama3": "default",
+    # Arbitrary HF architectures: resolve the chat template from the
+    # checkpoint's own tokenizer (renderers "auto" path).
+    "hf": "auto",
 }
 
 _EXAMPLE_CHECKPOINT_DIR = os.path.join(_rl_pkg.__path__[0], "example_checkpoint")
@@ -89,6 +111,9 @@ _DEFAULT_HF_ASSETS_PATH = {
     ("qwen3", "0.6B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-0.6B"),
     ("qwen3", "1.7B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-1.7B"),
     ("llama3", "8B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Llama-3.1-8B"),
+    # HF backend A/B baselines: same checkpoints as the native qwen3 presets.
+    ("hf", "Qwen3-0.6B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-0.6B"),
+    ("hf", "Qwen3-1.7B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-1.7B"),
 }
 
 
@@ -136,7 +161,11 @@ def base_rl_config(
         )
     model_registry = _MODEL_REGISTRY_BY_MODEL[model]
     return RLTrainer.Config(
-        model_spec=model_registry(flavor, attn_backend="varlen"),
+        model_spec=model_registry(
+            flavor,
+            attn_backend="varlen",
+            hf_assets_path=resolved_hf_assets_path,
+        ),
         hf_assets_path=resolved_hf_assets_path,
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -269,6 +298,32 @@ def rl_heloco_llama3_8b(**kwargs) -> HeLoCoRLReplica.Config:
     return rl_heloco_qwen3_0_6b(**kwargs)
 
 
+def rl_heloco_hf_qwen3_0_6b(**kwargs) -> HeLoCoRLReplica.Config:
+    """Qwen3-0.6B on the HF transformers modeling backend (see
+    rl_diloco_hf_qwen3_0_6b for the backend notes; rl_heloco_qwen3_0_6b for
+    the strategy docstring)."""
+    kwargs.setdefault("model", "hf")
+    kwargs.setdefault("flavor", "Qwen3-0.6B")
+    return rl_heloco_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_hf_qwen3_1_7b(**kwargs) -> HeLoCoRLReplica.Config:
+    """1.7B HF-backend preset; see rl_heloco_hf_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "Qwen3-1.7B")
+    return rl_heloco_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_hf(**kwargs) -> HeLoCoRLReplica.Config:
+    """Model-agnostic HF-backend preset; see rl_diloco_hf."""
+    if os.environ.get("RL_HF_ASSETS_PATH"):
+        # ConfigManager calls config fns with NO args and only overlays CLI
+        # flags onto the returned dataclass's FIELDS — too late for the
+        # model_spec built here. Launchers that fetch a HF repo export the
+        # checkpoint dir so the architecture resolves from it at call time.
+        kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
+    return rl_heloco_hf_qwen3_0_6b(**kwargs)
+
+
 def rl_heloco_async_inference_qwen3_0_6b(
     gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
@@ -338,6 +393,36 @@ def rl_heloco_async_inference_llama3_8b(**kwargs) -> HeLoCoAsyncInferenceReplica
     return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
 
 
+def rl_heloco_async_inference_hf_qwen3_0_6b(
+    **kwargs,
+) -> HeLoCoAsyncInferenceReplica.Config:
+    """Qwen3-0.6B on the HF transformers modeling backend (see
+    rl_diloco_hf_qwen3_0_6b for the backend notes;
+    rl_heloco_async_inference_qwen3_0_6b for the strategy docstring)."""
+    kwargs.setdefault("model", "hf")
+    kwargs.setdefault("flavor", "Qwen3-0.6B")
+    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_hf_qwen3_1_7b(
+    **kwargs,
+) -> HeLoCoAsyncInferenceReplica.Config:
+    """1.7B HF-backend preset; see rl_heloco_async_inference_hf_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "Qwen3-1.7B")
+    return rl_heloco_async_inference_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_hf(**kwargs) -> HeLoCoAsyncInferenceReplica.Config:
+    """Model-agnostic HF-backend preset; see rl_diloco_hf."""
+    if os.environ.get("RL_HF_ASSETS_PATH"):
+        # ConfigManager calls config fns with NO args and only overlays CLI
+        # flags onto the returned dataclass's FIELDS — too late for the
+        # model_spec built here. Launchers that fetch a HF repo export the
+        # checkpoint dir so the architecture resolves from it at call time.
+        kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
+    return rl_heloco_async_inference_hf_qwen3_0_6b(**kwargs)
+
+
 def rl_diloco_qwen3_0_6b(
     gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
@@ -381,6 +466,42 @@ def rl_diloco_qwen3_1_7b(**kwargs) -> DiLoCoRLReplica.Config:
     """1.7B preset; see rl_diloco_qwen3_0_6b for the strategy docstring."""
     kwargs.setdefault("flavor", "1.7B")
     return rl_diloco_qwen3_0_6b(**kwargs)
+
+
+def rl_diloco_hf_qwen3_0_6b(**kwargs) -> DiLoCoRLReplica.Config:
+    """Qwen3-0.6B via the HF transformers modeling backend — the architecture
+    comes from the checkpoint's config.json, the modules ARE transformers
+    modules, and weights load through the near-identity HF adapter. Same
+    GRPO/DiLoCo recipe as rl_diloco_qwen3_0_6b (its A/B baseline), including
+    trainer-side per-layer compile (aot_eager) and generator-side CUDA-graph
+    capture. Generator-side per-layer compile is auto-disabled by the vLLM
+    wrapper for HF backends: the transformers AttentionInterface dict dispatch
+    (attention_instances[layer_idx]) specializes dynamo per layer x shape and
+    exceeds any fullgraph recompile budget."""
+    kwargs.setdefault("model", "hf")
+    kwargs.setdefault("flavor", "Qwen3-0.6B")
+    return rl_diloco_qwen3_0_6b(**kwargs)
+
+
+def rl_diloco_hf_qwen3_1_7b(**kwargs) -> DiLoCoRLReplica.Config:
+    """1.7B HF-backend preset; see rl_diloco_hf_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "Qwen3-1.7B")
+    return rl_diloco_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_diloco_hf(**kwargs) -> DiLoCoRLReplica.Config:
+    """Model-agnostic HF-backend preset: the checkpoint (and therefore the
+    architecture) comes entirely from --hf_assets_path — pass it explicitly
+    (launchers that fetch a HF repo always do). The flavor default is only the
+    fallback checkpoint for bare CLI runs. Same for the rl_heloco_hf /
+    rl_async_inference_hf / rl_heloco_async_inference_hf (+_worker_) family."""
+    if os.environ.get("RL_HF_ASSETS_PATH"):
+        # ConfigManager calls config fns with NO args and only overlays CLI
+        # flags onto the returned dataclass's FIELDS — too late for the
+        # model_spec built here. Launchers that fetch a HF repo export the
+        # checkpoint dir so the architecture resolves from it at call time.
+        kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
+    return rl_diloco_hf_qwen3_0_6b(**kwargs)
 
 
 def rl_diloco_llama3_8b(**kwargs) -> DiLoCoRLReplica.Config:
@@ -458,6 +579,32 @@ def rl_async_inference_llama3_8b(**kwargs) -> AsyncInferenceReplica.Config:
     return rl_async_inference_qwen3_0_6b(**kwargs)
 
 
+def rl_async_inference_hf_qwen3_0_6b(**kwargs) -> AsyncInferenceReplica.Config:
+    """Qwen3-0.6B on the HF transformers modeling backend (see
+    rl_diloco_hf_qwen3_0_6b for the backend notes;
+    rl_async_inference_qwen3_0_6b for the strategy docstring)."""
+    kwargs.setdefault("model", "hf")
+    kwargs.setdefault("flavor", "Qwen3-0.6B")
+    return rl_async_inference_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_hf_qwen3_1_7b(**kwargs) -> AsyncInferenceReplica.Config:
+    """1.7B HF-backend preset; see rl_async_inference_hf_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "Qwen3-1.7B")
+    return rl_async_inference_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_hf(**kwargs) -> AsyncInferenceReplica.Config:
+    """Model-agnostic HF-backend preset; see rl_diloco_hf."""
+    if os.environ.get("RL_HF_ASSETS_PATH"):
+        # ConfigManager calls config fns with NO args and only overlays CLI
+        # flags onto the returned dataclass's FIELDS — too late for the
+        # model_spec built here. Launchers that fetch a HF repo export the
+        # checkpoint dir so the architecture resolves from it at call time.
+        kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
+    return rl_async_inference_hf_qwen3_0_6b(**kwargs)
+
+
 def rl_async_inference_worker_qwen3_0_6b(
     hf_assets_path: str | None = None,
     relay_addresses: str = "",
@@ -506,6 +653,32 @@ def rl_async_inference_worker_qwen3_1_7b(**kwargs) -> AsyncInferenceWorker.Confi
     docstring."""
     kwargs.setdefault("flavor", "1.7B")
     return rl_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_worker_hf_qwen3_0_6b(**kwargs) -> AsyncInferenceWorker.Config:
+    """Qwen3-0.6B HF-backend worker (see rl_diloco_hf_qwen3_0_6b for the
+    backend notes; rl_async_inference_worker_qwen3_0_6b for the role
+    docstring)."""
+    kwargs.setdefault("model", "hf")
+    kwargs.setdefault("flavor", "Qwen3-0.6B")
+    return rl_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_worker_hf_qwen3_1_7b(**kwargs) -> AsyncInferenceWorker.Config:
+    """1.7B HF-backend worker; see rl_async_inference_worker_hf_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "Qwen3-1.7B")
+    return rl_async_inference_worker_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_worker_hf(**kwargs) -> AsyncInferenceWorker.Config:
+    """Model-agnostic HF-backend worker; see rl_diloco_hf."""
+    if os.environ.get("RL_HF_ASSETS_PATH"):
+        # ConfigManager calls config fns with NO args and only overlays CLI
+        # flags onto the returned dataclass's FIELDS — too late for the
+        # model_spec built here. Launchers that fetch a HF repo export the
+        # checkpoint dir so the architecture resolves from it at call time.
+        kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
+    return rl_async_inference_worker_hf_qwen3_0_6b(**kwargs)
 
 
 def rl_heloco_async_inference_worker_qwen3_0_6b(
@@ -561,3 +734,34 @@ def rl_heloco_async_inference_worker_qwen3_1_7b(
     """1.7B preset; see rl_heloco_async_inference_worker_qwen3_0_6b."""
     kwargs.setdefault("flavor", "1.7B")
     return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_worker_hf_qwen3_0_6b(
+    **kwargs,
+) -> AsyncInferenceWorker.Config:
+    """Qwen3-0.6B HF-backend worker (see rl_diloco_hf_qwen3_0_6b for the
+    backend notes; rl_heloco_async_inference_worker_qwen3_0_6b for the role
+    docstring)."""
+    kwargs.setdefault("model", "hf")
+    kwargs.setdefault("flavor", "Qwen3-0.6B")
+    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_worker_hf_qwen3_1_7b(
+    **kwargs,
+) -> AsyncInferenceWorker.Config:
+    """1.7B HF-backend worker; see
+    rl_heloco_async_inference_worker_hf_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "Qwen3-1.7B")
+    return rl_heloco_async_inference_worker_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_worker_hf(**kwargs) -> AsyncInferenceWorker.Config:
+    """Model-agnostic HF-backend worker; see rl_diloco_hf."""
+    if os.environ.get("RL_HF_ASSETS_PATH"):
+        # ConfigManager calls config fns with NO args and only overlays CLI
+        # flags onto the returned dataclass's FIELDS — too late for the
+        # model_spec built here. Launchers that fetch a HF repo export the
+        # checkpoint dir so the architecture resolves from it at call time.
+        kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
+    return rl_heloco_async_inference_worker_hf_qwen3_0_6b(**kwargs)

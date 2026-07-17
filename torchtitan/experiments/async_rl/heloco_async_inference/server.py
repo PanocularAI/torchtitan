@@ -18,6 +18,7 @@
 #     replica pops from and every generator worker pushes into.
 
 import argparse
+import os
 import asyncio
 import logging
 
@@ -187,13 +188,22 @@ def main() -> None:
     # replicas use), e.g. --module async_rl --config rl_heloco_async_inference_qwen3_0_6b
     parser.add_argument("--module", type=str, default="async_rl")
     parser.add_argument("--config", type=str, required=True)
+    # Overrides the preset's default checkpoint dir so the global model loads
+    # the exact checkpoint the trainers load (launchers that fetch a HF repo
+    # point every role at the fetched dir).
+    parser.add_argument("--hf_assets_path", type=str, default=None)
     args = parser.parse_args()
 
     from torchtitan.config.manager import ConfigManager
 
-    replica_cfg = ConfigManager().parse_args(
-        ["--module", args.module, "--config", args.config]
-    )
+    cfg_args = ["--module", args.module, "--config", args.config]
+    if args.hf_assets_path:
+        # Env (not just the CLI overlay): the rl_*_hf presets resolve the
+        # ARCHITECTURE from RL_HF_ASSETS_PATH at config-fn time; the flag
+        # overlay below only retargets where the checkpoint loads from.
+        os.environ["RL_HF_ASSETS_PATH"] = args.hf_assets_path
+        cfg_args.append(f"--hf_assets_path={args.hf_assets_path}")
+    replica_cfg = ConfigManager().parse_args(cfg_args)
     model = build_global_model(replica_cfg.model_spec, replica_cfg.hf_assets_path)
     param_names, _, _ = param_metadata(model)
 

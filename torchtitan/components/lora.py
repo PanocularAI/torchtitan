@@ -158,6 +158,14 @@ class LoRAConverter(ModelConfigConverter):
         """Module names to apply LoRA to (matched against the last segment of the FQN).
         None means all Linear layers. An empty list means no layers."""
 
+        freeze_embeddings: bool = False
+        """Also freeze Embedding modules (PEFT-style adapter-only training).
+        With weight tying the embedding IS the output head, so leaving it
+        trainable silently unfreezes the head."""
+
+        freeze_norms: bool = False
+        """Also freeze norm modules (RMSNorm/LayerNorm/GroupNorm)."""
+
     def __init__(self, config: Config, **kwargs):
         if config.rank <= 0:
             raise ValueError(f"LoRA rank must be positive, got {config.rank}")
@@ -193,7 +201,8 @@ class LoRAConverter(ModelConfigConverter):
 
         Target Linear modules get their config replaced with
         ``LoRALinear.Config``.  Non-target Linear modules are wrapped
-        with ``FrozenConfig``.
+        with ``FrozenConfig``, as are Embedding / norm modules when
+        ``freeze_embeddings`` / ``freeze_norms`` are set.
         """
         matched = set()
 
@@ -220,3 +229,21 @@ class LoRAConverter(ModelConfigConverter):
                 f"LoRA target_modules {sorted(unmatched)} did not match any "
                 f"Linear.Config in the model config tree."
             )
+
+        # Second pass: optionally freeze non-Linear leaves the first pass
+        # cannot reach, so ONLY the adapters train (PEFT semantics).
+        from torchtitan.models.common.embedding import Embedding
+        from torchtitan.models.common.nn_modules import GroupNorm, LayerNorm, RMSNorm
+
+        freeze_classes: list[type] = []
+        if self.config.freeze_embeddings:
+            freeze_classes.append(Embedding.Config)
+        if self.config.freeze_norms:
+            freeze_classes.extend((RMSNorm.Config, LayerNorm.Config, GroupNorm.Config))
+        for freeze_cls in freeze_classes:
+            for _fqn, cfg, parent, attr in model_config.traverse(freeze_cls):
+                wrapped = FrozenConfig(inner=cfg)
+                if isinstance(parent, list):
+                    parent[attr] = wrapped
+                else:
+                    setattr(parent, attr, wrapped)

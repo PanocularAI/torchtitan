@@ -100,3 +100,43 @@ def test_lora_rank_validation():
         LoRAConverter(LoRAConverter.Config(rank=0))
     with pytest.raises(ValueError, match="rank must be positive"):
         LoRAConverter(LoRAConverter.Config(rank=-1))
+
+
+def test_lora_freeze_embeddings_and_norms():
+    """freeze_embeddings/freeze_norms leave ONLY adapters trainable (PEFT semantics)."""
+    model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=8,
+                alpha=16.0,
+                target_modules=["wq", "wkv", "wo"],
+                freeze_embeddings=True,
+                freeze_norms=True,
+            ),
+        ],
+    )
+    model = model_spec.model.build()
+    model.init_states()
+
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    frozen = [n for n, p in model.named_parameters() if not p.requires_grad]
+    assert trainable, "no trainable params at all"
+    non_adapter = [n for n in trainable if "lora_a" not in n and "lora_b" not in n]
+    assert not non_adapter, f"non-adapter params still trainable: {non_adapter[:8]}"
+    assert any("tok_embeddings" in n for n in frozen), "embedding not frozen"
+    assert any("norm" in n for n in frozen), "norms not frozen"
+
+
+def test_lora_default_leaves_embeddings_trainable():
+    """Without the freeze options, converter behavior is unchanged (Linears only)."""
+    model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(rank=8, alpha=16.0, target_modules=["wq"]),
+        ],
+    )
+    model = model_spec.model.build()
+    model.init_states()
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert any("tok_embeddings" in n for n in trainable)

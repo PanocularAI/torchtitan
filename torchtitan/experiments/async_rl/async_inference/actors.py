@@ -18,6 +18,8 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 
+from torch.distributed.tensor import distribute_tensor, DTensor
+
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 
@@ -62,22 +64,38 @@ class SnapshotPolicyTrainer(PolicyTrainer):
     ) -> None:
         """Load full theta (native-named, fp32, CPU) back into the FSDP/TP model.
 
-        ``broadcast_from_rank0=True`` distributes from the rank that received the
-        weights to the rest of the trainer mesh. ``strict=False`` because we
-        send parameters only (buffers aren't part of the exchange). After the
-        discontinuous theta jump we clear the inner optimizer state (stale
-        momentum would bias the next window) but leave ``policy_version``
-        monotone so staleness tracking stays correct.
+        Every rank receives the full dict (the controller `.call()`s the whole
+        trainer mesh), so each param is distributed onto its own mesh/placement
+        here rather than via ``full_state_dict=True, broadcast_from_rank0=True``:
+        that path discovers shardings by walking ``named_children()``, which the
+        HF transformers backend overrides to the titan-alias view
+        (tok_embeddings/layers/...) whose FQNs never match these canonical
+        names — full CPU tensors would then reach DTensor params unconverted
+        and fail the copy. Keying off the model's own state dict is
+        backend-neutral. ``strict=False`` because we send parameters only
+        (buffers aren't part of the exchange). After the discontinuous theta
+        jump we clear the inner optimizer state (stale momentum would bias the
+        next window) but leave ``policy_version`` monotone so staleness
+        tracking stays correct.
         """
         train_dtype = TORCH_DTYPE_MAP[self.config.training.dtype]
-        sd = {k: v.to(dtype=train_dtype) for k, v in global_sd.items()}
+        local_sd = get_model_state_dict(self.model)
+        sd = {}
+        for k, v in global_sd.items():
+            ref = local_sd.get(k)
+            if ref is None:
+                continue
+            v = v.to(dtype=train_dtype)
+            if isinstance(ref, DTensor):
+                v = distribute_tensor(
+                    v.to(device=ref.device), ref.device_mesh, ref.placements
+                )
+            sd[k] = v
 
         set_model_state_dict(
             self.model,
             model_state_dict=sd,
-            options=StateDictOptions(
-                full_state_dict=True, broadcast_from_rank0=True, strict=False
-            ),
+            options=StateDictOptions(strict=False),
         )
 
         self.optimizers.zero_grad(set_to_none=True)

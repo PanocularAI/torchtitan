@@ -26,6 +26,9 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field, replace
+from typing import Annotated
+
+import tyro
 
 # Must be set before torch is imported (transitively, below).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -52,6 +55,7 @@ from torchtitan.experiments.rl.examples.alphabet_sort import (
 from torchtitan.experiments.rl.renderer import RendererConfig  # noqa: E402
 from torchtitan.experiments.rl.train import _compute_world_size  # noqa: E402
 from torchtitan.experiments.rl.trainer import setup_mesh_elastic_env  # noqa: E402
+from torchtitan.protocols.model_spec import ModelSpec  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +67,14 @@ class AsyncInferenceWorker:
 
     @dataclass(kw_only=True, slots=True)
     class Config:
-        model_spec: object
-        hf_assets_path: str
+        # Suppressed from the CLI like RLTrainer.Config.model_spec: tyro would
+        # otherwise recurse into the resolved spec's pickled model config (the
+        # HF backend's PretrainedConfig trips it with a NameError on torch).
+        # The concrete ModelSpec | None annotation matters — with a bare
+        # `object`, tyro narrows to the default instance's type and recurses
+        # anyway, Suppress notwithstanding.
+        model_spec: Annotated[ModelSpec | None, tyro.conf.Suppress] = None
+        hf_assets_path: str = ""
         generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
         rollouter: object = field(default_factory=AlphabetSortRollouter.Config)
         renderer: RendererConfig = field(

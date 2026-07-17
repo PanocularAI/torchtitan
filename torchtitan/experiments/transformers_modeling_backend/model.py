@@ -13,7 +13,16 @@ import torch
 from torch import nn
 from torch.nn import init
 from transformers import AutoConfig
+import transformers.configuration_utils as _hf_configuration_utils
 from transformers.configuration_utils import PretrainedConfig
+
+# transformers >= 5 annotates PretrainedConfig.dtype with a TYPE_CHECKING-only
+# "torch.dtype" forward ref, so typing.get_type_hints() on any Config that
+# mixes PretrainedConfig in (ours below) raises NameError — tyro's CLI
+# introspection of the worker/generator configs is the first caller to hit it.
+# Provide the name at the ref's defining module so the annotation evaluates.
+if not hasattr(_hf_configuration_utils, "torch"):
+    _hf_configuration_utils.torch = torch
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
@@ -80,6 +89,22 @@ _TT_SPECIFIC_ATTRIBUTES = [
 ]
 
 
+@dataclass
+class _AttentionConfigShim:
+    """Titan-shaped attention-config view for Config.layers (see property)."""
+
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    inner_attention: object
+
+
+@dataclass
+class _LayerConfigShim:
+    attention: _AttentionConfigShim
+    moe: None = None
+
+
 class HFTransformerModel(BaseModel):
     # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor inputs.
     _skip_lm_head: bool = False
@@ -97,6 +122,7 @@ class HFTransformerModel(BaseModel):
             titan_dense_config,
             # HuggingFace specific args
             attn_implementation: str = "sdpa_torchtitan",
+            inject_titan_dims: bool = True,
             **kwargs,
         ):
             # Explicitly call PretrainedConfig.__init__ (not via MRO, since
@@ -120,7 +146,7 @@ class HFTransformerModel(BaseModel):
             self._titan_injected_model_args = {}
             self._configure_hf_attention(attn_implementation)
 
-            self._initialize_dense_attributes(titan_dense_config)
+            self._initialize_dense_attributes(titan_dense_config, inject_titan_dims)
 
         def build(self, **kwargs):
             """Override build() to use _replace() instead of dataclasses.replace().
@@ -157,7 +183,7 @@ class HFTransformerModel(BaseModel):
                     )
             return clone
 
-        def _initialize_dense_attributes(self, titan_dense_config):
+        def _initialize_dense_attributes(self, titan_dense_config, inject_titan_dims=True):
             """Initialize all dense model attributes."""
             # Set mapped attributes (TorchTitan <-> HuggingFace)
             for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
@@ -170,17 +196,65 @@ class HFTransformerModel(BaseModel):
                 if hasattr(titan_dense_config, attr_name):
                     setattr(self, attr_name, getattr(titan_dense_config, attr_name))
 
-            # Update passed_args
-            self._titan_injected_model_args.update(titan_dense_config.__dict__)
+            # Update passed_args. update_from_config re-applies these AFTER the
+            # checkpoint's config.json loads, so injected dims OVERRIDE the
+            # repo's real values. inject_titan_dims=False keeps the titan dims
+            # as starting values only, letting the checkpoint config govern the
+            # architecture — required when the built model must match a real
+            # checkpoint (weight loading / fine-tuning), where a stale injected
+            # n_layers desyncs num_hidden_layers from the derived layer_types
+            # and the model build IndexErrors.
+            if inject_titan_dims:
+                self._titan_injected_model_args.update(titan_dense_config.__dict__)
 
         def _configure_hf_attention(self, attn_implementation: str):
             """Configure HuggingFace attention settings."""
             self._titan_injected_model_args["attn_implementation"] = attn_implementation
             self.attn_implementation = attn_implementation
             # NOTE:(3outeille):This will force create_causal_mask to return None
-            AttentionInterface._global_mapping[
-                attn_implementation
-            ] = sdpa_attention_forward
+            if attn_implementation == "varlen_torchtitan":
+                # RL path: torchtitan's flash-varlen kernel driven by packed
+                # cu_seqlens (per-document isolation). Lazy import: rl/ is a
+                # subpackage of this one.
+                from .rl.attention import titan_varlen_attention_forward
+
+                AttentionInterface._global_mapping[
+                    attn_implementation
+                ] = titan_varlen_attention_forward
+            else:
+                AttentionInterface._global_mapping[
+                    attn_implementation
+                ] = sdpa_attention_forward
+
+        @property
+        def layers(self):
+            """Titan-shaped read-only view of the per-layer attention config.
+
+            The RL trainer/generator and VLLMModelWrapper read
+            model_spec.model.layers[0].attention.{inner_attention,n_heads,
+            n_kv_heads,head_dim} off native configs; this shim serves those
+            reads without a native layer tree. One independent shim instance
+            per layer index (not `[shim] * n`, which would alias every index
+            to the same object) even though the HF architecture is uniform
+            across layers today -- a per-index list is what callers other
+            than layers[0] (e.g. pipeline-parallel layer slicing) expect."""
+            from torchtitan.models.common.attention import VarlenAttention
+
+            is_varlen = self.attn_implementation == "varlen_torchtitan"
+            n_heads = self.num_attention_heads
+            n_kv_heads = getattr(self, "num_key_value_heads", None) or n_heads
+            head_dim = getattr(self, "head_dim", None) or self.hidden_size // n_heads
+            return [
+                _LayerConfigShim(
+                    attention=_AttentionConfigShim(
+                        n_heads=n_heads,
+                        n_kv_heads=n_kv_heads,
+                        head_dim=head_dim,
+                        inner_attention=VarlenAttention.Config() if is_varlen else None,
+                    )
+                )
+                for _ in range(self.num_hidden_layers)
+            ]
 
         def _create_getter_setter_dynamically(self, has_moe: bool):
             """
@@ -222,11 +296,20 @@ class HFTransformerModel(BaseModel):
             config=None,
             **kwargs,
         ):
-            training = config.training
-            parallelism = config.parallelism
-            debug = config.debug
-            # Extract HF model ID from the extended config
-            hf_model_id = getattr(config, "hf_model", "")
+            # Callers vary: the pretrain Trainer.Config has training/debug;
+            # the RL registry's resolve-time config has neither. Treat each
+            # as optional (mirrors Decoder.Config).
+            training = getattr(config, "training", None)
+            debug = getattr(config, "debug", None)
+            # HF model ID (or local checkpoint dir): from the runtime config,
+            # else baked onto this Config (the RL registry sets hf_model to the
+            # checkpoint dir so every update_from_config call site resolves).
+            hf_model_id = getattr(config, "hf_model", "") or getattr(self, "hf_model", "")
+            if not hf_model_id:
+                raise ValueError(
+                    "update_from_config needs config.hf_model or a Config with "
+                    "hf_model set (repo id or local dir with config.json)"
+                )
             # Load HF config (overwrites our HF attributes)
             hf_model_config = AutoConfig.from_pretrained(
                 hf_model_id,
@@ -248,9 +331,11 @@ class HFTransformerModel(BaseModel):
                 if hasattr(self, key) and value is not None:
                     setattr(self, key, value)
 
-            self.max_seq_len = training.seq_len
+            if training is not None:
+                self.max_seq_len = training.seq_len
 
-            self.deterministic = debug.deterministic
+            if debug is not None:
+                self.deterministic = debug.deterministic
 
             # Configure HF-specific settings to match TorchTitan settings
             # TODO: false ?
@@ -259,7 +344,13 @@ class HFTransformerModel(BaseModel):
             self.use_cache = False
             self.initializer_range = 1.0  # use as std for normal init in embedding
 
-            if not hasattr(self, "inter_dim"):  # Only for llama model
+            # Only DERIVE ffn/head dims when the checkpoint's config doesn't
+            # provide them — overwriting real values breaks weight loading
+            # (e.g. Qwen3-0.6B has head_dim=128 != dim/n_heads=64 and
+            # intermediate_size=3072 != the llama-style derivation).
+            if getattr(hf_model_config, "intermediate_size", None) is None and not hasattr(
+                self, "inter_dim"
+            ):  # Only for llama model
                 ffn_hidden_size = 4 * self.dim
                 ffn_hidden_size = int(2 * ffn_hidden_size / 3)
                 if self.ffn_dim_multiplier is not None:
@@ -268,7 +359,20 @@ class HFTransformerModel(BaseModel):
                     (ffn_hidden_size + self.multiple_of - 1) // self.multiple_of
                 )
 
-            self.head_dim = self.dim // self.num_attention_heads
+            # An explicit checkpoint head_dim is only meaningful for the
+            # checkpoint's own geometry. When the injected titan dims changed
+            # hidden_size/num_heads (debugmodel shrink), keeping it desyncs
+            # models that build o_proj from hidden_size alone (e.g. helium:
+            # attention emits n_heads x checkpoint-head_dim but o_proj expects
+            # hidden_size). The RL registry mirrors checkpoint dims exactly,
+            # so this never triggers there and real head_dims survive.
+            geometry_changed = self.dim != getattr(
+                hf_model_config, "hidden_size", self.dim
+            ) or self.num_attention_heads != getattr(
+                hf_model_config, "num_attention_heads", self.num_attention_heads
+            )
+            if getattr(hf_model_config, "head_dim", None) is None or geometry_changed:
+                self.head_dim = self.dim // self.num_attention_heads
 
             return self
 
@@ -335,6 +439,25 @@ class HFTransformerModel(BaseModel):
                 "Weight initialization might not match TorchTitan."
             )
 
+        # AttentionInterface registration is PROCESS-LOCAL, but configs travel
+        # across process boundaries (Monarch actors receive a pickled config
+        # whose _configure_hf_attention ran in the parent). Re-register the
+        # configured implementation here — where the model is actually built —
+        # without overwriting an existing registration (e.g. the vLLM paged fn
+        # the generator wrapper installs before build).
+        impl = getattr(config, "attn_implementation", "") or getattr(
+            config, "_attn_implementation", ""
+        )
+        if impl and impl not in AttentionInterface._global_mapping:
+            if impl == "varlen_torchtitan":
+                from .rl.attention import titan_varlen_attention_forward
+
+                AttentionInterface._global_mapping[impl] = (
+                    titan_varlen_attention_forward
+                )
+            else:
+                AttentionInterface._global_mapping[impl] = sdpa_attention_forward
+
         self.model = model_cls(config=config)
         self.max_seq_len = config.max_seq_len
         self.cp_mesh = None
@@ -380,7 +503,9 @@ class HFTransformerModel(BaseModel):
             if hasattr(self, "mlp") and self.mlp is not None:
                 self.mlp.layer_idx = layer_idx
 
-        def _initialize_weights_patched(self, module):
+        def _initialize_weights_patched(self, module, is_custom_code: bool = False):
+            # transformers >= 5 passes is_custom_code; accepted (and ignored)
+            # so non-meta builds don't TypeError.
             # NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
             # The default _initialize_weights sets _is_hf_initialized = True even on a meta device,
             # which prevents subsequent proper initialization.
@@ -517,6 +642,26 @@ class HFTransformerModel(BaseModel):
                 if hasattr(module, "bias") and module.bias is not None:
                     module.bias.data.zero_()
 
+            elif "RotaryEmbedding" in module.__class__.__name__ and hasattr(
+                module, "original_inv_freq"
+            ):
+                # inv_freq is persistent=False: never in checkpoints, so after a
+                # meta build + to_empty it holds garbage unless recomputed here.
+                # Mirrors transformers' base _init_weights rotary branch, which
+                # this patch otherwise replaces wholesale.
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+                rope_fn = (
+                    ROPE_INIT_FUNCTIONS[module.rope_type]
+                    if module.rope_type != "default"
+                    else module.compute_default_rope_parameters
+                )
+                buffer_value, _ = rope_fn(module.config)
+                buffer_value = buffer_value.to(module.inv_freq.device)
+                with torch.no_grad():
+                    module.inv_freq.copy_(buffer_value)
+                    module.original_inv_freq.copy_(buffer_value)
+
         decoder_layer_cls.__init__ = _decoder_layer_init_patched
         PreTrainedModel._init_weights = _init_weights_patched
         PreTrainedModel._initialize_weights = _initialize_weights_patched
@@ -641,17 +786,40 @@ class HFTransformerModel(BaseModel):
                 "Could not find rotary_emb in the model. Please check the model structure."
             )
 
-    def forward(self, *args, **kwargs):
-        local_seq_len = self.max_seq_len
-        local_seq_len //= (
-            self.cp_mesh.size()
-            if self.cp_mesh is not None and self.cp_mesh.size() > 1
-            else 1
+    def get_attention_masks(self, positions: torch.Tensor):
+        """RL trainer contract (rl/actors/trainer.py): varlen metadata from
+        packed per-document positions (documents start where positions == 0)."""
+        from torchtitan.models.common.attention import (
+            create_varlen_metadata_for_document,
         )
-        kwargs["position_ids"] = torch.arange(
-            local_seq_len, device=args[0].device
-        ).unsqueeze(0)
-        output = self.model.model(*args, **kwargs)
+
+        return create_varlen_metadata_for_document(positions)
+
+    def forward(self, *args, attention_masks=None, positions=None, **kwargs):
+        if positions is not None:
+            # RL packed path: positions carry per-document restarts (RoPE) and
+            # attention_masks is the VarlenMetadata whose cu_seqlens the
+            # varlen_torchtitan attention interface consumes (per-document
+            # isolation). Mirrors the native Decoder RL forward contract.
+            if attention_masks is not None:
+                kwargs.update(
+                    cu_seq_lens_q=attention_masks.cu_seq_q,
+                    cu_seq_lens_k=attention_masks.cu_seq_k,
+                    max_length_q=attention_masks.max_q,
+                    max_length_k=attention_masks.max_k,
+                )
+            output = self.model.model(*args, position_ids=positions, **kwargs)
+        else:
+            local_seq_len = self.max_seq_len
+            local_seq_len //= (
+                self.cp_mesh.size()
+                if self.cp_mesh is not None and self.cp_mesh.size() > 1
+                else 1
+            )
+            kwargs["position_ids"] = torch.arange(
+                local_seq_len, device=args[0].device
+            ).unsqueeze(0)
+            output = self.model.model(*args, **kwargs)
         if self._skip_lm_head:
             return output.last_hidden_state
         output = self.model.lm_head(output.last_hidden_state)
