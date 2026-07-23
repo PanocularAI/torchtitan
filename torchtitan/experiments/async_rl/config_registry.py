@@ -628,6 +628,7 @@ def rl_async_inference_worker_qwen3_0_6b(
     this worker and the trainer talk to) are both required.
     """
     base = base_rl_config(
+        hf_assets_path=hf_assets_path,
         model=model,
         flavor=flavor,
         generator_tensor_parallel_degree=generator_tensor_parallel_degree,
@@ -708,6 +709,7 @@ def rl_heloco_async_inference_worker_qwen3_0_6b(
     per-window token target in a few rounds.
     """
     base = base_rl_config(
+        hf_assets_path=hf_assets_path,
         model=model,
         flavor=flavor,
         generator_tensor_parallel_degree=generator_tensor_parallel_degree,

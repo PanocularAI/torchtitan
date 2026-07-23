@@ -3,35 +3,13 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-import dataclasses
 from dataclasses import dataclass
 
-from transformers import PretrainedConfig
-
 from torchtitan.protocols.model_spec import ModelSpec
+from .model import HFTransformerModel
 
-# transformers >= 5 turned PretrainedConfig into a dataclass with positional
-# fields; torchtitan's Configurable.__init_subclass__ rejects any inherited
-# non-kw-only field when HFTransformerModel.Config (which subclasses both
-# Configurable.Config and PretrainedConfig) is defined below.
-#
-# Field.kw_only is only consulted when @dataclass GENERATES an __init__ for a
-# class -- PretrainedConfig's own __init__ was already compiled by
-# transformers at its import time, so flipping the flag here can't change how
-# a bare PretrainedConfig(...) is constructed (directly, or via AutoConfig for
-# any HF architecture class). It only affects dataclasses that inherit these
-# fields and get *their* __init__ generated after this point -- exactly
-# HFTransformerModel.Config, imported next. So this flip is permanent and
-# global by construction, not a scoped patch: there is no window where it
-# needs to be, or safely can be, reverted.
-for _f in dataclasses.fields(PretrainedConfig):
-    _f.kw_only = True
-del _f
-
-from .model import HFTransformerModel  # noqa: E402
-
-from .parallelize import parallelize_hf_transformers  # noqa: E402
-from .pipeline import pipeline_hf_transformers  # noqa: E402
+from .parallelize import parallelize_hf_transformers
+from .pipeline import pipeline_hf_transformers
 
 __all__ = [
     "HFTransformerModel",

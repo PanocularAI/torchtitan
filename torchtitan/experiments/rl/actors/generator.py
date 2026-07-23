@@ -344,18 +344,18 @@ class VLLMGenerator(Actor, Configurable):
         the new weights. No effect under strict-drain (engine idle at pull time); async hot-swap only."""
 
         def __post_init__(self):
-            # VLLMGenerator supports TP plus MoE EP. vLLM handles its own
+            # VLLMGenerator supports TP x PP plus MoE EP. vLLM handles its own
             # process groups, and the wrapper applies the model parallelisms.
+            # PP: the degree is passed straight to vLLM (pipeline_parallel_size
+            # below); Monarch provisions tp*pp workers (_compute_world_size
+            # already multiplies pp in) and external_launcher builds the PP
+            # groups from that world. Single-host only until the launchers
+            # gang-schedule multi-node generator islands.
             p = self.parallelism
             if p.data_parallel_replicate_degree != 1:
                 raise ValueError(
                     f"Generator does not support data parallel replication, "
                     f"got dp_replicate={p.data_parallel_replicate_degree}"
-                )
-            if p.pipeline_parallel_degree > 1:
-                raise ValueError(
-                    f"Generator does not support pipeline parallelism, "
-                    f"got pp={p.pipeline_parallel_degree}"
                 )
             if p.context_parallel_degree > 1:
                 raise ValueError(
@@ -467,6 +467,7 @@ class VLLMGenerator(Actor, Configurable):
             config_format=TORCHTITAN_CONFIG_FORMAT,
             dtype=config.model_dtype,
             tensor_parallel_size=config.parallelism.tensor_parallel_degree,
+            pipeline_parallel_size=config.parallelism.pipeline_parallel_degree,
             # NOTE: Monarch launches the generator workers and sets the torch
             # elastic distributed env; with external_launcher, vLLM uses that
             # world to build its process groups. vLLM does not take an
