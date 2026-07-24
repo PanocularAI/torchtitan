@@ -1,5 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# Copyright (c) Panocular AI.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -170,18 +169,11 @@ class Configurable:
                         f"{cls.__name__}.Config must use "
                         "@dataclass(kw_only=True, slots=True)"
                     )
-                # The keyword-only rule polices the dataclass-GENERATED
-                # constructor. A Config that defines its own __init__ owns its
-                # constructor surface, and inherited positional fields never
-                # become positional parameters (e.g. transformers>=5 makes
-                # PretrainedConfig a dataclass with positional fields, which
-                # HFTransformerModel.Config mixes in behind a custom __init__).
-                if "__init__" not in config_cls.__dict__:
-                    for f in fields(config_cls):
-                        if f.init and not f.kw_only:
-                            raise TypeError(
-                                f"{cls.__name__}.Config field '{f.name}' "
-                                "must be keyword-only"
-                            )
+                for f in fields(config_cls):
+                    if f.init and not f.kw_only:
+                        raise TypeError(
+                            f"{cls.__name__}.Config field '{f.name}' "
+                            "must be keyword-only"
+                        )
                 # Auto-wire build() to construct this class
                 config_cls._owner = cls

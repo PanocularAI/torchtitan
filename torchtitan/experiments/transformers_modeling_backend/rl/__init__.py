@@ -27,6 +27,8 @@
 #      current backend's ``update_from_config`` requires a full runtime config
 #      (training/parallelism/debug), which isn't available at registry time.
 
+from dataclasses import dataclass
+
 from transformers import AutoConfig
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
@@ -39,6 +41,57 @@ from .. import (
     TitanModelConfig,
 )
 from ..state_dict_adapter import HFTransformerStateDictAdapter
+
+
+# The RL trainer and generator read
+# ``model_spec.model.layers[0].attention.{inner_attention,n_heads,n_kv_heads,
+# head_dim}`` off every model spec and retarget ``attention_cfg.rope``, but
+# the HF backend Config has no native layer tree. ``_titan_layers_view``
+# serves those reads: attention reports the backend's flex path, dims come
+# from the checkpoint's config.json (head_dim is not derivable from
+# hidden_size/num_heads for e.g. Qwen3), and the rope write is absorbed (the
+# HF model resolves its real rope from the checkpoint config at build).
+
+
+@dataclass
+class _RopeConfig:
+    max_seq_len: int
+
+
+@dataclass
+class _AttentionConfig:
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    inner_attention: object
+    rope: _RopeConfig
+
+
+@dataclass
+class _LayerConfig:
+    attention: _AttentionConfig
+    moe: None = None
+
+
+def _titan_layers_view(hf_cfg, max_seq_len: int) -> list[_LayerConfig]:
+    from torchtitan.models.common.attention import FlexAttention
+
+    n_heads = hf_cfg.num_attention_heads
+    n_kv_heads = getattr(hf_cfg, "num_key_value_heads", None) or n_heads
+    head_dim = getattr(hf_cfg, "head_dim", None) or hf_cfg.hidden_size // n_heads
+    # One instance per index (not [cfg] * n, which would alias every layer).
+    return [
+        _LayerConfig(
+            attention=_AttentionConfig(
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                head_dim=head_dim,
+                inner_attention=FlexAttention.Config(),
+                rope=_RopeConfig(max_seq_len=max_seq_len),
+            )
+        )
+        for _ in range(hf_cfg.num_hidden_layers)
+    ]
 
 
 def model_registry(
@@ -91,8 +144,14 @@ def model_registry(
     # FSDP cannot shard one weight into two groups; both RL roles host the same
     # untied model and the adapter aliases embeddings into lm_head at load, so
     # step-0 logprobs match the tied checkpoint.
+    cfg.tie_word_embeddings = False
     cfg._titan_injected_model_args["hf_model"] = hf_assets_path
     cfg._titan_injected_model_args["tie_word_embeddings"] = False
+    # Titan-shaped per-layer view: the RL trainer/generator read
+    # ``model.layers[0].attention.*`` off every spec (PretrainedConfig
+    # instances are attribute bags, so dynamic assignment matches ``hf_model``
+    # above; the backend Config's ``_replace``-based build preserves it).
+    cfg.layers = _titan_layers_view(hf_cfg, max_seq_len)
 
     return ModelSpec(
         name="hf_transformers_rl",

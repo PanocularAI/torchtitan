@@ -7,7 +7,7 @@
 # loop that proves zero local generation). The pure-learner consumer/buffer/
 # staleness machinery is inherited from PureLearnerReplica, and the shared
 # rollout queue (push/pop wire protocol, timeout robustness) lives in
-# async_inference.rollout_queue -- both covered by the async_inference tests.
+# the rollout_queue module -- both covered by test_async_inference.
 # CPU-only: no GPU, no vLLM, no Monarch actors -- everything above the wire
 # is faked.
 
@@ -19,17 +19,11 @@ import pytest
 import torch
 from aiohttp.test_utils import TestServer
 
-from torchtitan.experiments.async_rl.async_inference.relay import (
-    RelayClient,
-    RelayServer,
-)
 from torchtitan.experiments.async_rl.config_registry import base_rl_config, wrap_replica
-from torchtitan.experiments.async_rl.heloco_async_inference.server import (
-    _watch_and_publish,
-)
-from torchtitan.experiments.async_rl.heloco_async_inference.trainer import (
-    HeLoCoAsyncInferenceReplica,
-)
+
+from torchtitan.experiments.async_rl.relay import RelayClient, RelayServer
+from torchtitan.experiments.async_rl.server import _watch_and_publish
+from torchtitan.experiments.async_rl.trainers import HeLoCoAsyncInferenceReplica
 
 
 def _ep(fn):

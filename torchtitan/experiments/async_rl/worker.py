@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Copyright (c) Panocular AI.
 #
 # Standalone inference-worker process for the async-inference relay swarm.
@@ -13,10 +7,10 @@
 # TorchStore's storage volumes to the trainer mesh -- a coupling this role
 # deliberately doesn't have, so it can't reuse that setup path. This spawns
 # just a generator actor and binds TorchStore to ITS OWN mesh instead; weight
-# updates arrive exclusively through the relay tier (torchtitan.experiments.async_rl.async_inference.relay),
+# updates arrive exclusively through the relay tier (torchtitan.experiments.async_rl.relay),
 # never through a local trainer push.
 #
-# This worker fetches weights via the relay tier (torchtitan.experiments.async_rl.async_inference.relay)
+# This worker fetches weights via the relay tier (torchtitan.experiments.async_rl.relay)
 # and pushes its generated rollouts to the standalone rollout-queue process
 # (rollout_queue.py) via RolloutQueuePushClient -- workers are trusted here,
 # so this is a plain push/queue, not TOPLOC-style cryptographic verification.
@@ -24,7 +18,7 @@
 # Run as:
 #   ASYNC_INFERENCE_RELAY_ADDRS=http://localhost:8765,http://localhost:8766 \
 #   ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR=http://localhost:8767 ASYNC_INFERENCE_WORKER_ID=0 \
-#     python -m torchtitan.experiments.async_rl.async_inference.worker \
+#     python -m torchtitan.experiments.async_rl.worker \
 #       --module async_rl --config rl_async_inference_worker_qwen3_0_6b
 
 import asyncio
@@ -43,14 +37,12 @@ import torchstore as ts  # noqa: E402
 from monarch.actor import this_host  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
-from torchtitan.experiments.async_rl.async_inference.relay import (
-    RelayClient,
-)  # noqa: E402
-from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
-    RolloutQueuePushClient,
-)  # noqa: E402
+from torchtitan.experiments.async_rl.relay import RelayClient  # noqa: E402
 from torchtitan.experiments.async_rl.rl_trainer import (
     setup_mesh_elastic_env,
+)  # noqa: E402
+from torchtitan.experiments.async_rl.rollout_queue import (
+    RolloutQueuePushClient,
 )  # noqa: E402
 
 from torchtitan.experiments.async_rl.train import (
@@ -334,7 +326,7 @@ async def _main() -> None:
 
 
 def run_worker() -> None:
-    """Entrypoint body for `python -m torchtitan.experiments.async_rl.async_inference.worker`."""
+    """Entrypoint body for `python -m torchtitan.experiments.async_rl.worker`."""
     asyncio.run(_main())
 
 

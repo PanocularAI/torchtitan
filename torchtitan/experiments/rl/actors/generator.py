@@ -723,10 +723,9 @@ class VLLMGenerator(Actor, Configurable):
         Default True to avoid reusing stale-weight KV."""
 
         def __post_init__(self):
-            # The generator runs vLLM TP plus full expert parallelism: vLLM forms
-            # the EP group from all DP*TP ranks, so expert_parallel_degree must
-            # equal data_parallel_degree * tensor_parallel_degree (or 1 to
-            # disable EP).
+            # The generator runs vLLM full expert parallelism: vLLM forms the EP
+            # group from all DP*TP ranks, so expert_parallel_degree must equal
+            # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
             p = self.parallelism
             full_ep = p.data_parallel_degree * p.tensor_parallel_degree
             if p.expert_parallel_degree not in (1, full_ep):

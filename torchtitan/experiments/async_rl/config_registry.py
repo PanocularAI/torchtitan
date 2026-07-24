@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Copyright (c) Panocular AI.
 #
 # Config entry points for the async_rl coordination strategies, discoverable
@@ -46,23 +40,20 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.experiments import rl as _rl_pkg
-from torchtitan.experiments.async_rl.async_inference.trainer import (
-    AsyncInferenceReplica,
-)
-from torchtitan.experiments.async_rl.async_inference.worker import AsyncInferenceWorker
-
-from torchtitan.experiments.async_rl.diloco.trainer import DiLoCoRLReplica
-from torchtitan.experiments.async_rl.heloco.trainer import HeLoCoRLReplica
-from torchtitan.experiments.async_rl.heloco_async_inference.trainer import (
-    HeLoCoAsyncInferenceReplica,
-)
 from torchtitan.experiments.async_rl.rl_trainer import GRPOLoss, RLTrainer
+from torchtitan.experiments.async_rl.trainers import (
+    AsyncInferenceReplica,
+    DiLoCoRLReplica,
+    HeLoCoAsyncInferenceReplica,
+    HeLoCoRLReplica,
+)
+from torchtitan.experiments.async_rl.worker import AsyncInferenceWorker
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.controller import AsyncLoopConfig, ValidationConfig
 from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
+from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.routing import (
@@ -244,8 +235,30 @@ def wrap_replica(cls, base: RLTrainer.Config, **kwargs):
     (one of the coordinator Configs, each a strict superset of RLTrainer.Config),
     plus the coordinator-specific extras in ``kwargs`` (sync_every,
     num_replicas, should_quantize, ...). Avoids repeating the full field list
-    in every config function."""
-    base_fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
+    in every config function.
+
+    A coordinator Config may redeclare a base field with a different default
+    (PureLearnerReplica: ``num_generators = 0``). For a field the caller left
+    at the base default and did not pass in kwargs, the coordinator's
+    redeclared default wins -- blindly copying the base's untouched value
+    would silently defeat the redeclaration. A value the caller explicitly
+    set on ``base`` still copies through (and still trips the coordinator's
+    validation if incompatible)."""
+    base_fields = {}
+    base_defaults = {}
+    for f in dataclasses.fields(base):
+        base_fields[f.name] = getattr(base, f.name)
+        base_defaults[f.name] = f.default
+    for f in dataclasses.fields(cls.Config):
+        if (
+            f.name not in kwargs
+            and f.name in base_fields
+            and f.default is not dataclasses.MISSING
+            and base_defaults[f.name] is not dataclasses.MISSING
+            and f.default != base_defaults[f.name]
+            and base_fields[f.name] == base_defaults[f.name]
+        ):
+            base_fields[f.name] = f.default
     base_fields.update(kwargs)
     return cls.Config(**base_fields)
 
@@ -356,11 +369,11 @@ def rl_heloco_async_inference_qwen3_0_6b(
     Each trainer pops rollouts from that queue, trains, and pushes its
     pseudo-gradient to the HeLoCo parameter server (no barrier); any trainer
     may consume any worker's rollouts. The hub
-    (torchtitan.experiments.async_rl.heloco_async_inference.server)
+    (torchtitan.experiments.async_rl.server)
     publishes the CURRENT global theta (the consensus weights, not any one
     trainer's copy) to a relay process for the generator pool to pull. Start
-    the coordination plane first: async_inference.relay,
-    async_inference.rollout_queue, then heloco_async_inference.server.
+    the coordination plane first: the relay,
+    then the rollout_queue, then the server (with --relay_addr).
     rollout_queue_address is required (usually $ROLLOUT_QUEUE_ADDR, the same
     queue workers' rollout_queue_address points at). Loss is stock GRPO.
     """
@@ -549,8 +562,8 @@ def rl_async_inference_qwen3_0_6b(
     relay_addresses every publish_every windows (SHARDCAST-style) -- plus an
     initial publish at startup so the workers can bootstrap. Both addresses
     are required -- start the servers first:
-    ``python -m torchtitan.experiments.async_rl.async_inference.relay`` and
-    ``python -m torchtitan.experiments.async_rl.async_inference.rollout_queue``.
+    ``python -m torchtitan.experiments.async_rl.relay`` and
+    ``python -m torchtitan.experiments.async_rl.rollout_queue``.
     Workers push rollouts to the same queue
     ($ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
     ($ASYNC_INFERENCE_RELAY_ADDRS).

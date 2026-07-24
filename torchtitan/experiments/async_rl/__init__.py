@@ -1,26 +1,32 @@
 # Copyright (c) Panocular AI.
 #
-# async_rl: decentralized RL post-training on torchtitan's RL actors, one
-# subpackage per coordination strategy:
+# async_rl: decentralized RL post-training on torchtitan's RL actors. Flat
+# layout, one module per role; the four coordination strategies' replica
+# classes all live in ``trainers``:
 #
-#   - torchtitan.experiments.async_rl.heloco -- N workers sync
-#     pseudo-gradients through a standalone CPU parameter server with no
-#     barrier (HeLoCoRLReplica + HeLoCoRLClient; server: ``python -m
-#     torchtitan.experiments.async_rl.heloco.server``).
-#   - torchtitan.experiments.async_rl.diloco -- N workers sync through a
-#     torchft Manager/Lighthouse quorum, stock synchronous DiLoCo
-#     (DiLoCoRLReplica).
-#   - torchtitan.experiments.async_rl.async_inference -- one trainer replica
-#     (AsyncInferenceReplica: prime-rl-style decoupled generation, arXiv:2505.07291)
-#     broadcasts weights outward through a relay-server tier to independent
-#     AsyncInferenceWorker processes (SHARDCAST-style); workers push generated
-#     rollouts back into the trainer's embedded rollout queue.
+#   - DiLoCoRLReplica -- N workers sync through a torchft Manager/Lighthouse
+#     quorum, stock synchronous DiLoCo.
+#   - HeLoCoRLReplica -- N workers sync pseudo-gradients through a standalone
+#     CPU parameter server with no barrier (client: ``heloco_client``;
+#     server: ``python -m torchtitan.experiments.async_rl.server``).
+#   - AsyncInferenceReplica -- prime-rl-style decoupled generation
+#     (arXiv:2505.07291): one pure-learner trainer broadcasts weights outward
+#     through a relay-server tier (``relay``) to independent
+#     AsyncInferenceWorker processes (``worker``, SHARDCAST-style); workers
+#     push rollouts into a standalone queue process (``rollout_queue``).
+#   - HeLoCoAsyncInferenceReplica -- both combined: N pure-learner HeLoCo
+#     trainers share one rollout queue and coordinate through the parameter
+#     server (run with ``--relay_addr`` so it publishes global theta to the
+#     relay for the generator pool).
+#
+# The strategies' Monarch trainer actors (DiLoCoManagerTrainer,
+# HeLoCoPolicyTrainer, SnapshotPolicyTrainer) live in ``actors``.
 #
 # (A single-worker/no-coordination baseline lives only in
 # ___benchmark/local.py, as a benchmark comparison arm -- it's intentionally
 # not part of this package.)
 #
-# All coordinator classes share RLControllerMixin
+# The windowed coordinator classes share RLControllerMixin
 # (torchtitan.experiments.async_rl.controller) -- the outer train loop, the
 # sync_every-step window runner, and the optional LlamaRL-style
 # generation/training overlap -- plugging their coordination into its hooks.
@@ -30,6 +36,6 @@
 # (the --config picks it, mirroring torchtitan.experiments.rl.train).
 #
 # Deliberately no re-exports: importing a coordinator pulls torchtitan's RL
-# stack including vLLM (~10s), which the CPU-only processes (heloco parameter
-# server, async_inference relay server) must not pay just for importing their
+# stack including vLLM (~10s), which the CPU-only processes (parameter
+# server, relay server, rollout queue) must not pay just for importing their
 # parent package. Import classes from their defining submodule.

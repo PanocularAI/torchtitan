@@ -20,8 +20,8 @@ import torch
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-import torchtitan.experiments.async_rl.async_inference.worker as worker_mod
-from torchtitan.experiments.async_rl.async_inference.relay import (
+import torchtitan.experiments.async_rl.worker as worker_mod
+from torchtitan.experiments.async_rl.relay import (
     build_manifest,
     reassemble_state_dict,
     RelayClient,
@@ -30,15 +30,13 @@ from torchtitan.experiments.async_rl.async_inference.relay import (
     ShardIntegrityError,
     verify_shard,
 )
-from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
+from torchtitan.experiments.async_rl.rollout_queue import (
     RolloutQueuePopClient,
     RolloutQueuePushClient,
     RolloutQueueServer,
 )
-from torchtitan.experiments.async_rl.async_inference.trainer import (
-    AsyncInferenceReplica,
-)
-from torchtitan.experiments.async_rl.async_inference.worker import AsyncInferenceWorker
+from torchtitan.experiments.async_rl.trainers import AsyncInferenceReplica
+from torchtitan.experiments.async_rl.worker import AsyncInferenceWorker
 
 
 def _ep(fn):

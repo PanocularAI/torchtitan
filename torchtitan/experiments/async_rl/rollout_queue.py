@@ -13,11 +13,11 @@
 # groups)`` batches. Full -> push rejected (503; the worker drops the batch
 # -- the trainer's max_staleness bound is designed around lost rollouts).
 # Empty -> pop returns 204 (the trainer polls). Runs next to the relay
-# process (async_inference.relay) but separately from it, so multi-GB
+# process (relay.py) but separately from it, so multi-GB
 # checkpoint traffic and rollout traffic never queue behind each other.
 #
 # Run as:
-#   python -m torchtitan.experiments.async_rl.async_inference.rollout_queue \
+#   python -m torchtitan.experiments.async_rl.rollout_queue \
 #     --port 8767
 
 import argparse

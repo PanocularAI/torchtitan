@@ -26,9 +26,8 @@ from torchtitan.experiments.async_rl.config_registry import (
     wrap_replica,
 )
 from torchtitan.experiments.async_rl.controller import RLControllerMixin
-from torchtitan.experiments.async_rl.diloco.trainer import DiLoCoRLReplica
-from torchtitan.experiments.async_rl.heloco.trainer import HeLoCoRLReplica
 from torchtitan.experiments.async_rl.train import PerHostProvisioner
+from torchtitan.experiments.async_rl.trainers import DiLoCoRLReplica, HeLoCoRLReplica
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
@@ -75,10 +74,10 @@ def test_new_model_needs_only_registry_dict_entries():
     fails with a clear error rather than a silent bogus default."""
     from torchtitan.models.qwen3 import model_registry as qwen3_model_registry
 
-    _MODEL_REGISTRY_BY_MODEL["_fake_for_test"] = (
-        lambda flavor, *, attn_backend, hf_assets_path: qwen3_model_registry(
-            "0.6B", attn_backend=attn_backend
-        )
+    _MODEL_REGISTRY_BY_MODEL[
+        "_fake_for_test"
+    ] = lambda flavor, *, attn_backend, hf_assets_path: qwen3_model_registry(
+        "0.6B", attn_backend=attn_backend
     )
     _RENDERER_NAME_BY_MODEL["_fake_for_test"] = "auto"
     try:
@@ -178,10 +177,10 @@ class _WindowHost(RLControllerMixin):
         self.events.append(("collect_start", step))
         await asyncio.sleep(self._collect_s)
         self.events.append(("collect_end", step))
-        return [], [], [f"mb{step}"], 1
+        return [f"mb{step}"], []
 
-    async def _train_on(self, rollout_groups, episodes, microbatches, num_valid):
-        step = int(microbatches[0][2:])
+    async def _train_on(self, packed, rollout_groups):
+        step = int(packed[0][2:])
         self.events.append(("train_start", step))
         await asyncio.sleep(self._train_s)
         self.events.append(("train_end", step))
@@ -252,6 +251,12 @@ class _LoopHost(RLControllerMixin):
         self._window_s = window_s
         self._diverge_after = diverge_after
         self.windows_run = 0
+
+    def _build_sync_pipeline(self):
+        # Provided by RLTrainer on real hosts; the loop tests fake the window
+        # runner entirely, so the pipeline is never used. Not recorded in
+        # self.calls to keep the asserted hook sequences focused on the loop.
+        pass
 
     async def _run_window(self, sync_every, start_step):
         self.calls.append(("window", sync_every, start_step))
@@ -390,7 +395,11 @@ def test_package_import_stays_cpu_light():
     the __init__.py files re-export nothing)."""
     code = (
         "import sys; "
-        "import torchtitan.experiments.async_rl, torchtitan.experiments.async_rl.heloco; "
+        "import torchtitan.experiments.async_rl, "
+        "torchtitan.experiments.async_rl.server, "
+        "torchtitan.experiments.async_rl.relay, "
+        "torchtitan.experiments.async_rl.rollout_queue, "
+        "torchtitan.experiments.async_rl.heloco_client; "
         "heavy = [m for m in sys.modules if m == 'vllm' or m == 'monarch' "
         "or m.startswith('torchtitan.experiments.rl.actors')]; "
         "assert not heavy, heavy; print('light')"
@@ -410,13 +419,14 @@ def test_hf_backend_registry_resolution():
     contract: dims come from the checkpoint's config.json (not derived), the
     titan-shaped layers view satisfies the trainer/generator assertion
     expression, and the near-identity state-dict adapter is wired."""
-    from torchtitan.models.common.attention import VarlenAttention
+    from torchtitan.models.common.attention import FlexAttention
 
     cfg = base_rl_config(model="hf", flavor="Qwen3-0.6B")
     spec = cfg.model_spec
     # the exact expression asserted by rl/actors/trainer.py and generator.py
+    # (the HF backend routes attention through its flex path)
     inner = spec.model.layers[0].attention.inner_attention
-    assert isinstance(inner, VarlenAttention.Config)
+    assert isinstance(inner, FlexAttention.Config)
     attn = spec.model.layers[0].attention
     assert attn.head_dim == 128, "must come from config.json, not dim/n_heads"
     assert attn.n_kv_heads == 8

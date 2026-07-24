@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from torchtitan.experiments.async_rl.diloco.actors import DiLoCoManagerTrainer
-from torchtitan.experiments.async_rl.diloco.trainer import DiLoCoRLReplica
+from torchtitan.experiments.async_rl.actors import DiLoCoManagerTrainer
+from torchtitan.experiments.async_rl.trainers import DiLoCoRLReplica
 
 
 def _ep(fn):
