@@ -9,14 +9,18 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
-from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from typing import Any
 
 from torchtitan.config import Configurable
+from torchtitan.experiments.rl.routing.strategies import (
+    LeastLoadedRoutingStrategy,
+    RoutingStrategy,
+)
+from torchtitan.experiments.rl.routing.types import RoutingCandidate, RoutingContext
+from torchtitan.observability import structured_logger as sl
 
 
 class _GeneratorState(Enum):
@@ -27,11 +31,16 @@ class _GeneratorState(Enum):
 
 
 @dataclass(kw_only=True, slots=True)
-class _GeneratorHandle:
+class _GeneratorHandle(RoutingCandidate):
     """Controller-side metadata for one generator mesh."""
 
     actor: Any
-    """Monarch actor handle for the generator mesh."""
+    """Monarch actor handle for the full generator mesh. Used for fan-out calls
+    that every rank must run."""
+
+    rank0_actor: Any
+    """Cached rank-0 slice of ``actor``. Used for calls that only rank 0 needs
+    to run."""
 
     reserved_load: int = 0
     """Controller-side estimate of in-flight routed generation work."""
@@ -43,77 +52,12 @@ class _GeneratorHandle:
     """Set when this generator has no reserved routed calls."""
 
 
-@dataclass(frozen=True, kw_only=True, slots=True)
-class RoutingContext:
-    """Routing metadata for one generation request."""
-
-    estimated_cost: int = 1
-    """Estimated request cost used by load-aware routing strategies."""
-
-
-class RoutingStrategy(Configurable, ABC):
-    """Policy object that chooses one generator for a request.
-
-    Add a new strategy by subclassing this, defining a nested ``Config``, and
-    selecting it explicitly in config, e.g.
-    ``GeneratorRouter.Config(strategy=MyRoutingStrategy.Config())``.
-    """
-
-    def __init__(self, config: Configurable.Config):
-        # Stateless by default; stateful strategies override __init__.
-        del config
-
-    @abstractmethod
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Choose one generator from the (non-empty) serving candidates."""
-
-
-class RoundRobinRoutingStrategy(RoutingStrategy):
-    """Cycle over the serving generators in order, ignoring load."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        pass
-
-    def __init__(self, config: Config):
-        del config
-        self._counter = itertools.count()
-
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Return the next serving generator in round-robin order."""
-
-        del routing_ctx
-        return candidates[next(self._counter) % len(candidates)]
-
-
-class LeastLoadedRoutingStrategy(RoutingStrategy):
-    """Pick the serving generator with the least controller-reserved load."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        pass
-
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Return the serving generator with the lowest reserved load."""
-
-        del routing_ctx
-        return min(candidates, key=lambda h: h.reserved_load)
-
-
-class GeneratorRouter(Configurable):
+class InterGeneratorRouter(Configurable):
     """Routes generation calls across generator meshes and pulls model's state dict.
+
+    This is layer 1 of the two-layer routing design: it routes each call across
+    generator *meshes* (replicas). Within the chosen mesh, ``IntraGeneratorRouter``
+    then routes the request across that mesh's data-parallel ranks.
 
     Thread safety:
         This class is not thread-safe. Its mutable state and ``asyncio.Event``
@@ -130,7 +74,7 @@ class GeneratorRouter(Configurable):
         ``RoundRobinRoutingStrategy.Config()`` or
         ``LeastLoadedRoutingStrategy.Config()``."""
 
-        hot_swap: bool = False
+        hot_swap: bool = True
         """When True, pulls model's state dict concurrently with in-flight
         generation (no draining). When False, each generator is drained before
         its pull.
@@ -148,10 +92,14 @@ class GeneratorRouter(Configurable):
     ):
         self._config = config
         self._generators = [
-            _GeneratorHandle(actor=generator) for generator in generators
+            _GeneratorHandle(
+                actor=generator,
+                rank0_actor=generator.flatten("rank").slice(rank=0),
+            )
+            for generator in generators
         ]
         if not self._generators:
-            raise ValueError("GeneratorRouter requires at least one generator")
+            raise ValueError("InterGeneratorRouter requires at least one generator")
         for h in self._generators:
             h.idle.set()
 
@@ -204,15 +152,16 @@ class GeneratorRouter(Configurable):
         routing_ctx: RoutingContext,
         **kwargs,
     ) -> Any:
-        """Dispatch one call to a strategy-chosen serving generator; return its result."""
-
+        """Dispatch one call to a strategy-chosen serving generator's rank 0;
+        return its result.
+        """
         await self._serving.wait()
         candidates = self._candidates()
         assert candidates, "serving event was set with no serving generators"
         h = self._strategy.choose(routing_ctx, candidates)
         self._reserve(h, routing_ctx.estimated_cost)
         try:
-            return await getattr(h.actor, method).call(*args, **kwargs)
+            return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
             self._release(h, routing_ctx.estimated_cost)
 
@@ -255,18 +204,22 @@ class GeneratorRouter(Configurable):
                 # Hot swap: pull concurrently with in-flight generation, without
                 # draining. Whether the pull is genuinely concurrent and safe is
                 # up to the generator's implementation.
-                await h.actor.pull_model_state_dict.call(policy_version)
+                await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
             else:
                 # Drain: stop routing to this generator and wait for in-flight
                 # work to finish before pulling, then re-admit it.
                 self._set_state(h, _GeneratorState.SYNCING)
                 try:
-                    await h.idle.wait()
-                    await h.actor.pull_model_state_dict.call(policy_version)
+                    with sl.log_trace_span("router_drain_wait"):
+                        await h.idle.wait()
+                    await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
                 finally:
                     self._set_state(h, _GeneratorState.SERVING)
 
         # Start the pulls in parallel. Technically we could do rolling sync to
         # maintain availability during weight sync, but that's not a priority
         # for now.
+        # TODO(perf): stagger the per-generator fetches when num_generators is large so they don't
+        #   all read the trainer's CPU-staged weights at once -- bounds trainer host RAM. Matters for
+        #   big models / many generators, not at small scale.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])

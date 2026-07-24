@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # Config entry points for the async_rl coordination strategies, discoverable
@@ -50,25 +56,26 @@ from torchtitan.experiments.async_rl.heloco.trainer import HeLoCoRLReplica
 from torchtitan.experiments.async_rl.heloco_async_inference.trainer import (
     HeLoCoAsyncInferenceReplica,
 )
+from torchtitan.experiments.async_rl.rl_trainer import GRPOLoss, RLTrainer
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.batcher import BatchConfig, Batcher
+from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
+from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
+from torchtitan.experiments.rl.controller import AsyncLoopConfig, ValidationConfig
 from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
-from torchtitan.experiments.rl.generator_router import (
-    GeneratorRouter,
-    RoundRobinRoutingStrategy,
-)
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
-from torchtitan.experiments.rl.trainer import GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.routing import (
+    InterGeneratorRouter,
+    RoundRobinRoutingStrategy,
+)
 from torchtitan.models.llama3 import model_registry as _llama3_model_registry
 from torchtitan.models.qwen3 import model_registry as _qwen3_model_registry
 
+
 def _hf_model_registry(flavor, *, attn_backend, hf_assets_path):
     # Lazy: pulls transformers, only needed when the "hf" model is selected.
-    from torchtitan.experiments.transformers_modeling_backend.rl import (
-        model_registry,
-    )
+    from torchtitan.experiments.transformers_modeling_backend.rl import model_registry
 
     return model_registry(
         flavor, attn_backend=attn_backend, hf_assets_path=hf_assets_path
@@ -167,24 +174,30 @@ def base_rl_config(
             hf_assets_path=resolved_hf_assets_path,
         ),
         hf_assets_path=resolved_hf_assets_path,
-        num_steps=10,
-        num_groups_per_rollout_batch=5,
-        num_validation_samples=20,
+        async_loop=AsyncLoopConfig(
+            num_training_steps=10,
+            num_prompts_per_train_step=5,
+            num_samples_per_prompt=8,
+            # async_rl replicas drive a SYNCHRONOUS windowed loop
+            # (RLControllerMixin), so no off-policy buffering: each step trains
+            # on rollouts generated under the just-published policy.
+            max_offpolicy_steps=0,
+            batcher=Batcher.Config(
+                batch=BatchConfig(local_batch_size=2, seq_len=2048),
+            ),
+            validation=ValidationConfig(num_samples=20),
+        ),
         compile=CompileConfig(enable=True, backend="aot_eager"),
         rollouter=rollouter
         if rollouter is not None
         else AlphabetSortRollouter.Config(),
-        group_size=8,
         renderer=RendererConfig(
             name=_RENDERER_NAME_BY_MODEL[model], enable_thinking=False
         ),
-        generator_router=GeneratorRouter.Config(
+        generator_router=InterGeneratorRouter.Config(
             strategy=RoundRobinRoutingStrategy.Config()
         ),
         metrics=MetricsProcessor.Config(enable_wandb=False),
-        batcher=Batcher.Config(
-            batch=BatchConfig(local_batch_size=2, global_batch_size=8, seq_len=2048),
-        ),
         trainer=PolicyTrainer.Config(
             # Structured-logging JSONL traces are a debugging aid that costs
             # real disk (hundreds of MB/hour per actor); off by default here
@@ -199,7 +212,6 @@ def base_rl_config(
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
                 tensor_parallel_degree=trainer_tensor_parallel_degree,
-                disable_loss_parallel=True,
             ),
             checkpoint=CheckpointManager.Config(
                 enable=True,
@@ -213,12 +225,9 @@ def base_rl_config(
             debug=DebugConfig(enable_structured_logging=False),
             model_dtype="bfloat16",
             gpu_memory_limit=gpu_memory_limit,
-            parallelism=ParallelismConfig(
-                data_parallel_shard_degree=1,
+            parallelism=InferenceParallelismConfig(
+                data_parallel_degree=1,
                 tensor_parallel_degree=generator_tensor_parallel_degree,
-                data_parallel_replicate_degree=1,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
@@ -371,6 +380,9 @@ def rl_heloco_async_inference_qwen3_0_6b(
         should_quantize=should_quantize,
         max_staleness=max_staleness,
         rollout_queue_address=rollout_queue_address,
+        # Pure learner: no local vLLM (Controller.Config defaults to 1, but
+        # generation is fully decoupled onto the remote worker pool).
+        num_generators=0,
     )
 
 
@@ -561,6 +573,9 @@ def rl_async_inference_qwen3_0_6b(
         rollout_queue_address=rollout_queue_address,
         num_shards=num_shards,
         publish_every=publish_every,
+        # Pure learner: no local vLLM (Controller.Config defaults to 1, but
+        # generation is fully decoupled onto the remote worker pool).
+        num_generators=0,
     )
 
 

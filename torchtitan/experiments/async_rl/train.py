@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # Worker launch entrypoint for every async_rl coordination strategy (the
@@ -28,7 +34,8 @@ from monarch.actor import this_host  # noqa: E402
 
 from torchtitan.config import ConfigManager  # noqa: E402
 from torchtitan.experiments.rl.train import (  # noqa: E402
-    _compute_world_size,
+    _compute_generator_world_size,
+    _compute_trainer_world_size,
     PerHostProvisioner as _UpstreamProvisioner,
 )
 
@@ -127,8 +134,8 @@ async def main() -> None:
                 break
 
     replica = config.build()
-    trainer_ws = _compute_world_size(config.trainer.parallelism)
-    generator_ws = _compute_world_size(config.generator.parallelism)
+    trainer_ws = _compute_trainer_world_size(config.trainer.parallelism)
+    generator_ws = _compute_generator_world_size(config.generator.parallelism)
     # Spawn config.num_generators independent engines, each on its own GPU
     # slice of this replica's CUDA_VISIBLE_DEVICES pool; setup_async's
     # GeneratorRouter round-robins requests across them and fans weight

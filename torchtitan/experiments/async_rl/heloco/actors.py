@@ -6,14 +6,9 @@ import logging
 
 import torch
 from monarch.actor import endpoint
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    set_model_state_dict,
-    StateDictOptions,
-)
-
 from torch.distributed.tensor import distribute_tensor, DTensor
 
+from torchtitan.components.checkpoint_utils import canonical_fqn
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 
@@ -34,9 +29,6 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         generator.pull_model_state_dict(v)
     """
 
-    def _param_name_set(self) -> set[str]:
-        return {name for name, _ in self.model.named_parameters()}
-
     @endpoint
     async def get_full_state_dict_cpu(self) -> dict[str, torch.Tensor]:
         """Return full unsharded *parameters* as native-named fp32 CPU tensors.
@@ -46,16 +38,23 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         the GPU; fp32 because the pseudo-gradient subtraction and outer optimizer
         run in fp32 on the server.
         """
-        sd = get_model_state_dict(
-            self.model,
-            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-        )
-        param_names = self._param_name_set()
-        return {
-            k: v.detach().to(device="cpu", dtype=torch.float32)
-            for k, v in sd.items()
-            if k in param_names
-        }
+        # Iterate named_parameters() (the same source param_metadata keys the
+        # wire buffers on) and unshard each DTensor with full_tensor(). Do NOT
+        # use DCP get_model_state_dict: it triggers per-module state_dict hooks
+        # (e.g. FusedQKVLinear's wq/wk/wv split, now default) whose synthetic
+        # keys have no real submodule, so DCP's FQN resolution raises
+        # AttributeError. named_parameters() yields the real (fused) params, so
+        # names stay aligned with the server/client ordering.
+        # canonical_fqn strips compile/AC/FSDP wrapper segments (e.g. _orig_mod)
+        # so keys match the uncompiled meta-model names the server/client are
+        # built from (see param_metadata).
+        sd = {}
+        for name, param in self.model.named_parameters():
+            tensor = param.detach()
+            if isinstance(tensor, DTensor):
+                tensor = tensor.full_tensor()
+            sd[canonical_fqn(name)] = tensor.to(device="cpu", dtype=torch.float32)
+        return sd
 
     @endpoint
     async def load_full_state_dict_cpu(
@@ -78,24 +77,24 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         staleness tracking stays correct.
         """
         train_dtype = TORCH_DTYPE_MAP[self.config.training.dtype]
-        local_sd = get_model_state_dict(self.model)
-        sd = {}
-        for k, v in global_sd.items():
-            ref = local_sd.get(k)
-            if ref is None:
-                continue
-            v = v.to(dtype=train_dtype)
-            if isinstance(ref, DTensor):
-                v = distribute_tensor(
-                    v.to(device=ref.device), ref.device_mesh, ref.placements
-                )
-            sd[k] = v
-
-        set_model_state_dict(
-            self.model,
-            model_state_dict=sd,
-            options=StateDictOptions(strict=False),
-        )
+        # Copy the incoming global theta straight into named_parameters() (same
+        # keying as param_metadata / get_full_state_dict_cpu), redistributing
+        # each full CPU tensor onto its param's mesh/placement. Avoids DCP
+        # set_model_state_dict, which trips on FusedQKVLinear's hook-synthesized
+        # wq/wk/wv keys (no real submodule -> FQN AttributeError). Parameters
+        # only (buffers are not part of the DiLoCo exchange).
+        local_params = {
+            canonical_fqn(n): p for n, p in self.model.named_parameters()
+        }
+        with torch.no_grad():
+            for k, v in global_sd.items():
+                ref = local_params.get(k)
+                if ref is None:
+                    continue
+                v = v.to(dtype=train_dtype, device=ref.device)
+                if isinstance(ref, DTensor):
+                    v = distribute_tensor(v, ref.device_mesh, ref.placements)
+                ref.copy_(v)
 
         self.optimizers.zero_grad(set_to_none=True)
         for opt in self.optimizers:

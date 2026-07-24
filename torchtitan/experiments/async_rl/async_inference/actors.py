@@ -12,12 +12,6 @@ import logging
 
 import torch
 from monarch.actor import endpoint
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    set_model_state_dict,
-    StateDictOptions,
-)
-
 from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.config import TORCH_DTYPE_MAP
@@ -36,67 +30,55 @@ class SnapshotPolicyTrainer(PolicyTrainer):
         trainer.load_full_state_dict_cpu(theta)      # theta -> model
     """
 
-    def _param_name_set(self) -> set[str]:
-        return {name for name, _ in self.model.named_parameters()}
-
     @endpoint
     async def get_full_state_dict_cpu(self) -> dict[str, torch.Tensor]:
-        """Return full unsharded *parameters* as native-named fp32 CPU tensors.
+        """Return the full unsharded model state dict as fp32 CPU tensors.
 
-        Mirrors ``push_model_state_dict``'s unshard but returns to the controller
-        and filters out buffers. ``cpu_offload=True`` keeps gathered tensors off
-        the GPU; fp32 for a numerically stable exchange format.
-        """
-        sd = get_model_state_dict(
-            self.model,
-            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-        )
-        param_names = self._param_name_set()
-        return {
-            k: v.detach().to(device="cpu", dtype=torch.float32)
-            for k, v in sd.items()
-            if k in param_names
-        }
+        Uses ``self.model.state_dict()`` — the SAME source ``push_model_state_dict``
+        stages for the generators — so the relay-published weights carry the exact
+        keys the worker's vLLM engine consumes on pull. In particular FusedQKVLinear's
+        state_dict hooks split the fused ``wqkv`` back into ``wq``/``wk``/``wv``,
+        the layout the generator load path expects; a ``named_parameters()`` dump
+        would instead emit the fused key and the worker would load mismatched
+        attention weights. DCP ``get_model_state_dict`` can't be used here — it
+        trips on FusedQKVLinear's synthetic keys during FQN resolution — so unshard
+        each DTensor with ``full_tensor()`` directly (relay shards are torch.save'd,
+        so full CPU tensors are required)."""
+        sd = {}
+        for name, tensor in self.model.state_dict().items():
+            tensor = tensor.detach()
+            if isinstance(tensor, DTensor):
+                tensor = tensor.full_tensor()
+            sd[name] = tensor.to(device="cpu", dtype=torch.float32)
+        return sd
 
     @endpoint
     async def load_full_state_dict_cpu(
         self, global_sd: dict[str, torch.Tensor]
     ) -> None:
-        """Load full theta (native-named, fp32, CPU) back into the FSDP/TP model.
+        """Load a full state dict (state_dict()-keyed, fp32, CPU) back into the
+        FSDP/TP model — the inverse of ``get_full_state_dict_cpu``.
 
-        Every rank receives the full dict (the controller `.call()`s the whole
-        trainer mesh), so each param is distributed onto its own mesh/placement
-        here rather than via ``full_state_dict=True, broadcast_from_rank0=True``:
-        that path discovers shardings by walking ``named_children()``, which the
-        HF transformers backend overrides to the titan-alias view
-        (tok_embeddings/layers/...) whose FQNs never match these canonical
-        names — full CPU tensors would then reach DTensor params unconverted
-        and fail the copy. Keying off the model's own state dict is
-        backend-neutral. ``strict=False`` because we send parameters only
-        (buffers aren't part of the exchange). After the discontinuous theta
-        jump we clear the inner optimizer state (stale momentum would bias the
-        next window) but leave ``policy_version`` monotone so staleness
-        tracking stays correct.
+        Distributes each incoming full tensor onto the placement of the model's
+        current state_dict entry, then loads via the model's own
+        ``load_state_dict`` (whose FusedQKVLinear hooks re-fuse wq/wk/wv), which
+        is fused-QKV-safe unlike DCP ``set_model_state_dict``. ``strict=False``
+        tolerates any absent buffers. After the discontinuous theta jump we clear
+        the inner optimizer state (stale momentum would bias the next window) but
+        leave ``policy_version`` monotone so staleness tracking stays correct.
         """
         train_dtype = TORCH_DTYPE_MAP[self.config.training.dtype]
-        local_sd = get_model_state_dict(self.model)
-        sd = {}
+        ref_sd = self.model.state_dict()
+        to_load = {}
         for k, v in global_sd.items():
-            ref = local_sd.get(k)
+            ref = ref_sd.get(k)
             if ref is None:
                 continue
-            v = v.to(dtype=train_dtype)
+            v = v.to(dtype=train_dtype, device=ref.device)
             if isinstance(ref, DTensor):
-                v = distribute_tensor(
-                    v.to(device=ref.device), ref.device_mesh, ref.placements
-                )
-            sd[k] = v
-
-        set_model_state_dict(
-            self.model,
-            model_state_dict=sd,
-            options=StateDictOptions(strict=False),
-        )
+                v = distribute_tensor(v, ref.device_mesh, ref.placements)
+            to_load[k] = v
+        self.model.load_state_dict(to_load, strict=False)
 
         self.optimizers.zero_grad(set_to_none=True)
         for opt in self.optimizers:

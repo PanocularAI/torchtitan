@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # Controller for synchronous DiLoCo RL.
@@ -14,8 +20,8 @@ from dataclasses import dataclass
 from torchtitan.experiments.async_rl.controller import RLControllerMixin
 from torchtitan.experiments.async_rl.diloco.actors import DiLoCoManagerTrainer
 
-from torchtitan.experiments.rl import trainer as _rl_trainer_mod
-from torchtitan.experiments.rl.trainer import RLTrainer
+from torchtitan.experiments.async_rl.rl_trainer import RLTrainer
+from torchtitan.experiments.rl import controller as _rl_controller_mod
 
 logger = logging.getLogger(__name__)
 
@@ -83,14 +89,17 @@ class DiLoCoRLReplica(RLControllerMixin, RLTrainer):
                 "lighthouse_address is required (set $DILOCO_LIGHTHOUSE_ADDR)"
             )
 
-        orig = _rl_trainer_mod.PolicyTrainer
-        _rl_trainer_mod.PolicyTrainer = DiLoCoManagerTrainer
+        # The inherited Controller.setup_async resolves the trainer actor class
+        # from the rl.controller module globals at spawn time; scope-patch that
+        # symbol so the base spawns DiLoCoManagerTrainer.
+        orig = _rl_controller_mod.PolicyTrainer
+        _rl_controller_mod.PolicyTrainer = DiLoCoManagerTrainer
         try:
             await super().setup_async(
                 trainer_mesh=trainer_mesh, generator_meshes=generator_meshes
             )
         finally:
-            _rl_trainer_mod.PolicyTrainer = orig
+            _rl_controller_mod.PolicyTrainer = orig
 
         await self.trainer.setup_diloco.call(
             lighthouse_address=cfg.lighthouse_address,

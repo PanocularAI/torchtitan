@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # PureLearnerReplica: the shared base for the decoupled-generation strategies
@@ -30,8 +36,7 @@ import logging
 from dataclasses import dataclass
 
 from torchtitan.experiments.async_rl.controller import RLControllerMixin
-
-from torchtitan.experiments.rl.trainer import RLTrainer, setup_mesh_elastic_env
+from torchtitan.experiments.async_rl.rl_trainer import RLTrainer, setup_mesh_elastic_env
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +72,8 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         (prime-rl's async_level, enforced by dropping)."""
         buffer_groups: int = 0
         """Rollout-buffer capacity in groups; a full buffer back-pressures the
-        consumer. 0 = two steps' worth (2 * num_groups_per_rollout_batch)."""
+        consumer. 0 = two steps' worth
+        (2 * async_loop.num_prompts_per_train_step)."""
         queue_poll_interval_s: float = 0.5
         """Seconds to wait before re-polling the rollout source when it yields
         nothing (only relevant for a non-blocking source, e.g. a remote hub)."""
@@ -81,7 +87,22 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         checkpoint pull + first round, ~3-5 min). 0 disables the bound."""
 
         def __post_init__(self):
-            RLTrainer.Config.__post_init__(self)
+            # A pure learner runs no local generator, so the base Controller
+            # config's generator-centric validations (num_generators>=1,
+            # generator checkpoint/hot_swap/cudagraph/batch_invariant-generator)
+            # don't apply. Do the trainer-side essentials the base would
+            # otherwise do: the SP-divisibility check and mirroring the batcher
+            # width into trainer.training.seq_len for the model build.
+            if self.trainer.parallelism.enable_sequence_parallel:
+                sp_degree = self.trainer.parallelism.tensor_parallel_degree
+                seq_len = self.async_loop.batcher.batch.seq_len
+                if sp_degree > 1 and seq_len % sp_degree != 0:
+                    raise ValueError(
+                        f"RL batcher sequence length ({seq_len}) must be "
+                        f"divisible by sequence parallel degree ({sp_degree})."
+                    )
+            self.trainer.training.seq_len = self.async_loop.batcher.batch.seq_len
+
             if self.sync_every < 1:
                 raise ValueError(f"sync_every must be >= 1, got {self.sync_every}")
             if (self.num_outer_steps > 0) == (self.train_seconds > 0):
@@ -219,40 +240,45 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         staler than max_staleness (in the subclass's staleness-reference
         space). This overrides the mixin's generator-fanout collector, so
         _run_window's always-on pipeline overlaps this pop+build+batch with
-        training instead of driving local generation."""
+        training instead of driving local generation.
+
+        Uses the upstream pipeline (TrainingSampleBuilder -> Batcher) provided
+        by the RLTrainer base: each surviving remote group is built into a
+        training-sample group and fed to the packing batcher until it yields a
+        batch. Returns ``(packed_batch, rollout_groups)``."""
         await self.trainer.sync_log_step.call(step)
-        num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
         rollout_groups = []
-        collected_tokens = 0
-        while collected_tokens < num_tokens_target:
+        packed = None
+        while packed is None:
             group, version = await self._buffer_get_checked()
             if self._staleness_reference() - version > self.config.max_staleness:
                 self._num_dropped += 1
                 continue
             rollout_groups.append(group)
-            collected_tokens += sum(
-                len(r.turns[-1].prompt_token_ids)
-                + len(r.turns[-1].completion_token_ids)
-                - 1
-                for r in group.rollouts
-                if r.turns
+            training_sample_group = self._training_sample_builder.build_from_group(
+                rollout_group=group
             )
-        episodes, _ = self._build_episodes(rollout_groups)
-        microbatches, num_global_valid_tokens, _ = self.batcher.batch(
-            episodes, dp_degree=self.trainer_dp_degree
-        )
-        return rollout_groups, episodes, microbatches, num_global_valid_tokens
+            packed = self._batcher.add_training_samples(
+                training_sample_group=training_sample_group
+            )
+        return packed, rollout_groups
 
-    def _batch_staleness(self, pre_optim_policy_version: int, ep_versions) -> int:
-        """A pure learner's episodes are stamped with the relay/hub checkpoint
+    def _batch_staleness(
+        self, pre_optim_policy_version: int, min_policy_versions
+    ) -> int:
+        """A pure learner's samples are stamped with the relay/hub checkpoint
         version their remote generator loaded -- a SHARED counter that advances
         per publish, not per local optim step -- so the mixin's default
-        (local ``policy_version`` minus episode version) would subtract across
+        (local ``policy_version`` minus sample version) would subtract across
         two unrelated spaces and grow without bound. Measure against the same
         reference the ``max_staleness`` consume gate uses instead: the logged
         number is then directly comparable to ``config.max_staleness``."""
         del pre_optim_policy_version  # local optim-step space; not comparable
-        return self._staleness_reference() - min(ep_versions) if ep_versions else 0
+        return (
+            self._staleness_reference() - min(min_policy_versions)
+            if min_policy_versions
+            else 0
+        )
 
     async def _refresh_generators(self) -> None:
         """No-op: there is no local generator to refresh (the remote workers
@@ -278,7 +304,7 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
     async def _train_setup(self) -> None:
         cfg = self.config
         self._buffer = asyncio.Queue(
-            maxsize=cfg.buffer_groups or 2 * cfg.num_groups_per_rollout_batch
+            maxsize=cfg.buffer_groups or 2 * cfg.async_loop.num_prompts_per_train_step
         )
         self._num_dropped = 0
         self._remote_consumer_task = asyncio.create_task(

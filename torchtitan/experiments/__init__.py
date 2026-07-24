@@ -15,5 +15,10 @@ _supported_experiments = frozenset(
         "torchft.llama3",
         "rl",
         "async_rl",
+        # RL examples own a per-example config_registry under rl/examples/<name>;
+        # listed here so `--module <name>` resolves (see ConfigManager).
+        "alphabet_sort",
+        "dapo_math",
+        "search_r1",
     ]
 )

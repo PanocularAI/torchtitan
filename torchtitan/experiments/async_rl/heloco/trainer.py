@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # Controller for HeLoCo RL (asynchronous DiLoCo through a parameter server).
@@ -13,8 +19,8 @@ from torchtitan.experiments.async_rl.heloco.actors import HeLoCoPolicyTrainer
 from torchtitan.experiments.async_rl.heloco.client import HeLoCoRLClient
 from torchtitan.experiments.async_rl.heloco.server import param_metadata
 
-from torchtitan.experiments.rl import trainer as _rl_trainer_mod
-from torchtitan.experiments.rl.trainer import RLTrainer
+from torchtitan.experiments.async_rl.rl_trainer import RLTrainer
+from torchtitan.experiments.rl import controller as _rl_controller_mod
 
 logger = logging.getLogger(__name__)
 
@@ -92,15 +98,18 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
         if not cfg.server_address:
             raise ValueError("server_address is required (set $DILOCO_SERVER_ADDR)")
 
-        # Spawn HeLoCoPolicyTrainer instead of the base PolicyTrainer.
-        orig = _rl_trainer_mod.PolicyTrainer
-        _rl_trainer_mod.PolicyTrainer = HeLoCoPolicyTrainer
+        # Spawn HeLoCoPolicyTrainer instead of the base PolicyTrainer. The
+        # inherited Controller.setup_async resolves the trainer actor class from
+        # the rl.controller module globals at spawn time, so scope-patch that
+        # symbol for the duration of the base setup.
+        orig = _rl_controller_mod.PolicyTrainer
+        _rl_controller_mod.PolicyTrainer = HeLoCoPolicyTrainer
         try:
             await super().setup_async(
                 trainer_mesh=trainer_mesh, generator_meshes=generator_meshes
             )
         finally:
-            _rl_trainer_mod.PolicyTrainer = orig
+            _rl_controller_mod.PolicyTrainer = orig
 
         # Build the torchft client. Parameter names/shapes come from a throwaway
         # meta model built from the SAME model_spec as the server's global model,

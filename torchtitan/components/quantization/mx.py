@@ -9,8 +9,8 @@ from importlib.util import find_spec
 from typing import Literal
 
 from torchtitan.components.quantization import QuantizationConverter
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.models.common.nn_modules import Linear
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
@@ -76,7 +76,7 @@ class MXFP8LinearConverter(QuantizationConverter):
                 "of MXFP8 dynamic quantization."
             )
 
-    def convert(self, model_config) -> None:
+    def convert(self, model_config):
         assert MXFP8Linear is not None
         fqns = self.config.fqns
         for fqn, config, parent, attr in model_config.traverse(Linear.Config):
@@ -87,12 +87,15 @@ class MXFP8LinearConverter(QuantizationConverter):
                     bias=config.bias,
                     param_init=config.param_init,
                 )
-                if isinstance(parent, list):
+                if parent is None:
+                    model_config = new_config
+                elif isinstance(parent, list):
                     parent[attr] = new_config
                 else:
                     setattr(parent, attr, new_config)
 
         logger.info("Converted Linear layers to MXFP8Linear")
+        return model_config
 
 
 _mxfp8_experts_cache: dict[type, type] = {}
@@ -171,9 +174,10 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
                 "of MXFP8 dynamic quantization."
             )
 
-    def convert(self, model_config) -> None:
+    def convert(self, model_config):
         for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
-            swap_token_dispatcher(config, self.config.pad_multiple)
+            # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
+            swap_token_dispatcher(parent, self.config.pad_multiple)
             base_module_cls = type(config)._owner
             quantized_cls = _get_mxfp8_grouped_experts_cls(base_module_cls)
             config_cls = quantized_cls.Config  # type: ignore[attr-defined]
@@ -181,7 +185,9 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
             )
-            if isinstance(parent, list):
+            if parent is None:
+                model_config = new_config
+            elif isinstance(parent, list):
                 parent[attr] = new_config
             else:
                 setattr(parent, attr, new_config)
@@ -190,3 +196,4 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             f"Converted GroupedExperts to use dynamic {self.config.recipe_name} "
             "quantization for grouped_mm ops"
         )
+        return model_config

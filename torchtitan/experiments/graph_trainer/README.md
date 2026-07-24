@@ -60,6 +60,52 @@ NGPU=8 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh
 NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b ./run_train.sh --parallelism.data_parallel_shard_degree=4 --parallelism.tensor_parallel_degree=2 --parallelism.expert_parallel_degree=2
 ```
 
+### GraphPP Pipeline Parallelism
+
+GraphPP is the `aot_fx_trace` pipeline-parallel path for GraphTrainer models.
+It reuses TorchTitan's eager PP module splitting and PyTorch PP schedules, then
+traces one representative microbatch per local stage with GraphTrainer's
+`minimal_fx_tracer`. The resulting per-stage graph bundles are reused for later
+microbatches; `GraphPipelineRuntime` only executes the prebuilt callable for each PP
+schedule action.
+
+Design references:
+- GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3780
+- CUDAGraphable GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3820
+
+```bash
+NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./run_train.sh \
+  --compile.mode aot_fx_trace \
+  --parallelism.pipeline_parallel_degree 2 \
+  --parallelism.pipeline_parallel_schedule Interleaved1F1B \
+  --parallelism.data_parallel_shard_degree 4 \
+  --parallelism.expert_parallel_degree 2
+```
+
+Supported runtime schedules include `Interleaved1F1B`, `ZBVZeroBubble`, and
+`DualPipeV`. GraphPP builds stage-local forward/backward graphs, optional FSDP
+`UNSHARD` / `REDUCE_GRAD` graphs, optional dI/dW graphs for split backward
+schedules, and multiplexed graphs for `OVERLAP_F_B` actions. Regional and full
+Inductor compilation reuse the existing GraphTrainer compilation passes on the
+extracted GraphPP callables; GraphPP-specific handling stays in the GraphPP
+stack before those passes are invoked. Multiplexed graphs keep the forward graph
+as the destination module and ShapeEnv, insert backward placeholders/compute
+before it, and transfer backward metadata into that ShapeEnv. This preserves
+forward collective-size provenance for full Inductor without changing the shared
+compiler passes.
+
+GraphPP follows the same subclass boundary as the non-PP GraphTrainer tracer.
+Extracted graphs run on flat plain tensor leaves. Values exposed to the PP
+runtime are rewrapped from tracer metadata: stage forward outputs, input
+gradients sent to previous stages, and parameter gradients before assignment to
+live `param.grad`. Internal values remain flat because they never leave GraphPP
+graph execution: saved-for-backward tensors, unsharded FSDP params, raw grad
+leaves, reduce-grad inputs, and multiplexed intermediate outputs.
+
+Current limitations: GraphPP does not load precompile artifacts yet, CUDA graph
+capture should target the `GraphPipelineRuntime` steady-state path in a future change,
+and EP-overlap annotations will be composed with GraphPP in a later PR.
+
 ### Compiler Optimizations
 
 The `aot_fx_trace` mode has a built-in pass pipeline controlled by dedicated flags.
@@ -84,6 +130,49 @@ MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --comp
 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.no-enable_passes
 ```
 
+### Expert Parallel Overlap
+
+EP overlap is an experimental graph-trainer optimization for MoE models with
+real expert-parallel collectives. Enable it only with `aot_fx_trace` and
+`expert_parallel_degree > 1`:
+
+```bash
+NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel \
+    ./run_train.sh \
+    --compile.mode aot_fx_trace \
+    --compile.ep_overlap.enabled \
+    --compile.ep_overlap.strategy graph \
+    --compile.ep_overlap.chunk_dim batch \
+    --compile.ep_overlap.module_fqn layers.* \
+    --parallelism.data_parallel_shard_degree 4 \
+    --parallelism.expert_parallel_degree 2
+```
+
+Supported graph-chunking selections are:
+
+- `--compile.ep_overlap.chunk_dim batch --compile.ep_overlap.module_fqn layers.*`
+  for transformer-block chunking.
+- `--compile.ep_overlap.chunk_dim batch --compile.ep_overlap.module_fqn layers.*.moe`
+  for MoE-only batch chunking.
+- `--compile.ep_overlap.chunk_dim seq --compile.ep_overlap.module_fqn layers.*.moe`
+  for MoE-only sequence chunking.
+
+Graph chunking intentionally couples the tracer and EP-overlap passes through
+the `ep_overlap` trace-input preparer: before `minimal_fx_tracer` fakeifies
+inputs, the preparer marks token-grid dimensions with Dynamo symbolic-shape
+metadata. The chunk pass later consumes those symbols as the source of truth for
+which live-ins and live-outs must be split. Keep this contract in sync when
+changing trace inputs, symbolic-shape handling, or EP-overlap pass behavior.
+
+Current limitations:
+
+- EP overlap is only meaningful when `expert_parallel_degree > 1`.
+- Sequence chunking is restricted to `layers.*.moe`; chunking attention over
+  sequence is not supported.
+- Graph chunking is validated against the tested DP/EP configurations in the
+  graph-trainer numerics and integration suites. Composability with additional
+  overlap or sharding modes should be validated with loss comparison before use.
+
 ### Experimental AutoParallel Sharding
 
 GraphTrainer can use AutoParallel to solve SPMD placement for supported models,
@@ -104,12 +193,11 @@ MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_debugmodel ./run_train.s
 DeepSeek V3 debug model:
 
 ```bash
-MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel_ep ./run_train.sh \
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./run_train.sh \
   --compile.mode aot_fx_trace \
   --compile.enable_autoparallel \
   --parallelism.data_parallel_shard_degree 4 \
-  --parallelism.expert_parallel_degree 2 \
-  --parallelism.disable_loss_parallel
+  --parallelism.expert_parallel_degree 2
 ```
 
 AutoParallel is only responsible for producing the placed model. After that,

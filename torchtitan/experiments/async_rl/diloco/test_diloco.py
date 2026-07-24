@@ -34,7 +34,7 @@ def test_window_sync_reports_manager_step_info():
 def test_close_swallows_diloco_teardown_errors(monkeypatch):
     """A failed torchft Manager shutdown must not prevent the base RLTrainer
     cleanup (actor/mesh teardown) from running."""
-    from torchtitan.experiments.rl.trainer import RLTrainer
+    from torchtitan.experiments.async_rl.rl_trainer import RLTrainer
 
     base_close_called = []
 

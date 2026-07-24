@@ -154,7 +154,7 @@ def make_replica():
         queue_poll_interval_s=0,
         rollout_stall_timeout_s=0,
         max_staleness=4,
-        num_groups_per_rollout_batch=2,
+        async_loop=SimpleNamespace(num_prompts_per_train_step=2),
     )
     r._buffer = asyncio.Queue()
     r._num_dropped = 0
@@ -308,7 +308,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
             sync_every=2,
             num_outer_steps=2,
             train_seconds=0.0,
-            num_groups_per_rollout_batch=2,
+            async_loop=SimpleNamespace(num_prompts_per_train_step=2),
             buffer_groups=0,
             max_staleness=4,
             queue_poll_interval_s=0,
@@ -341,13 +341,21 @@ def test_train_end_to_end_pure_learner_on_fakes():
         )
         r._get_rank_0_value = lambda x: x
         r.trainer_dp_degree = 1
-        r.batcher = SimpleNamespace(
-            num_tokens_target=lambda dp: 4,
-            batch=lambda eps, dp_degree: ([["mb"]], 4, None),
+        # The current pipeline builds the training-sample builder + batcher from
+        # config in _build_sync_pipeline; this fake replica has no real config to
+        # build from, so no-op it and wire passthrough fakes: the builder passes
+        # each RolloutGroup through and the batcher returns one packed batch per
+        # group (one microbatch, valid-token count, generator policy versions).
+        r._build_sync_pipeline = lambda: None
+        r._training_sample_builder = SimpleNamespace(
+            build_from_group=lambda *, rollout_group: rollout_group
         )
-        r._build_episodes = lambda groups: (
-            [SimpleNamespace(policy_version=r._policy_version)],
-            None,
+        r._batcher = SimpleNamespace(
+            add_training_samples=lambda *, training_sample_group: SimpleNamespace(
+                microbatches=["mb"],
+                num_global_valid_tokens=4,
+                min_policy_versions=[0],
+            )
         )
 
         class _FakeClient:

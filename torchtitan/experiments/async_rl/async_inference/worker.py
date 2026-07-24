@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # Standalone inference-worker process for the async-inference relay swarm.
@@ -43,6 +49,9 @@ from torchtitan.experiments.async_rl.async_inference.relay import (
 from torchtitan.experiments.async_rl.async_inference.rollout_queue import (
     RolloutQueuePushClient,
 )  # noqa: E402
+from torchtitan.experiments.async_rl.rl_trainer import (
+    setup_mesh_elastic_env,
+)  # noqa: E402
 
 from torchtitan.experiments.async_rl.train import (
     _ensure_cuda_toolchain,
@@ -53,8 +62,9 @@ from torchtitan.experiments.rl.examples.alphabet_sort import (
     AlphabetSortRollouter,
 )  # noqa: E402
 from torchtitan.experiments.rl.renderer import RendererConfig  # noqa: E402
-from torchtitan.experiments.rl.train import _compute_world_size  # noqa: E402
-from torchtitan.experiments.rl.trainer import setup_mesh_elastic_env  # noqa: E402
+from torchtitan.experiments.rl.train import (
+    _compute_generator_world_size as _compute_world_size,
+)  # noqa: E402
 from torchtitan.protocols.model_spec import ModelSpec  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -174,6 +184,11 @@ class AsyncInferenceWorker:
             cfg.generator.sampling,
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
         )
+        # Start the vLLM engine loop before any pull_model_state_dict: the
+        # generator now guards weight pulls on a running engine loop (the
+        # controller starts it via generator_router.fanout("start_engine_loop");
+        # this worker has a single generator actor and must do the same).
+        await self.generator.start_engine_loop.call()
 
     async def _load_checkpoint(self, version: int, state_dict: dict) -> None:
         """Push the relay-fetched state dict into TorchStore under the same
@@ -196,10 +211,19 @@ class AsyncInferenceWorker:
         plumbing this role has no use for -- the trainer assembles training
         batches from these groups itself once they land in its buffer."""
 
-        async def generate_fn(prompt_token_ids, *, request_id, sampling_config=None):
+        async def generate_fn(
+            prompt_token_ids,
+            *,
+            request_id,
+            routing_session_id=None,
+            sampling_config=None,
+        ):
             result = await self.generator.generate.call(
                 prompt_token_ids,
                 request_id=request_id,
+                # VLLMGenerator.generate requires this for its intra-mesh DP
+                # routing (the rollouter now passes it through GenerateFn).
+                routing_session_id=routing_session_id,
                 sampling_config=sampling_config,
                 metrics_prefix="generator",
             )

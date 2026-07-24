@@ -14,7 +14,7 @@ from tests.integration_tests import OverrideDefinitions
 def _is_pp_only(variant: tuple[str, ...], ngpu: int) -> bool:
     """True when the variant has PP > 1 and no other SPMD parallelism > 1.
 
-    full_dtensor requires at least one SPMD axis > 1; PP-only runs collapse
+    SPMD backends require at least one SPMD axis > 1; PP-only runs collapse
     every dense SPMD axis to size 1 and trip DTensor's reshape / flatten
     rejection of Shard-on-degenerate-axis. Detected by parsing the explicit
     ``--parallelism.*_degree`` flags and back-computing ``dp_shard`` (default
@@ -49,22 +49,73 @@ def _is_pp_only(variant: tuple[str, ...], ngpu: int) -> bool:
     )
 
 
-def _enable_full_dtensor(t: OverrideDefinitions) -> OverrideDefinitions:
-    """Inject ``--parallelism.spmd_backend full_dtensor`` into every variant.
+def _supports_spmd_typechecking(test_name: str, variant: tuple[str, ...]) -> bool:
+    """List of tests/variants to test spmd_types backend, but without typechecking."""
+    unsupported_tests = [
+        # Compile is not compatible with SPMD typechecking yet.
+        "1d_compile_spmd_types",
+        "1d_compile_sac_op_spmd_types",
+        "2d_compile_spmd_types",
+        "2d_asynctp_compile_spmd_types",
+        "3d_compile_spmd_types",
+        "torchcomms_3d_dp+cp+pp+compile_spmd_types",
+        "torchcomms_3d_dp+tp+pp+compile_spmd_types",
+        # PP is not compatible with SPMD typechecking yet.
+        "pp_dp_1f1b_spmd_types",
+        "pp_tp_gpipe_spmd_types",
+        "pp_dp_tp_spmd_types",
+        "validation_tp_cp_pp_spmd_types",
+        "float8_emulate_lora_spmd_types",
+        # non-chunked CE loss isn't happy yet.
+        (
+            "2d_eager_spmd_types",
+            [
+                "--module llama3 --config llama3_debugmodel_ce_loss",
+                "--parallelism.tensor_parallel_degree 2",
+            ],
+        ),
+    ]
+    return (
+        test_name not in unsupported_tests
+        and (test_name, variant) not in unsupported_tests
+    )
 
-    All features.py tests run under full_dtensor except PP-only variants
-    (see ``_is_pp_only``) and CP + compile variants (upstream symint
-    limitation); legacy non-full_dtensor coverage lives in models.py.
+
+def _enable_spmd_backend(t: OverrideDefinitions, backend: str) -> OverrideDefinitions:
+    """Inject ``--parallelism.spmd_backend {backend}`` into every variant and
+    suffix the test name with ``backend``.
+
+    PP-only variants (see ``_is_pp_only``) and CP + compile variants (upstream
+    symint limitation) skip the backend override. For ``spmd_types``,
+    ``--debug.spmd_typechecking`` is enabled where supported. Plain (no-backend)
+    coverage lives in models.py.
     """
+    test_name = f"{t.test_name}_{backend}"
     new_args = []
     for variant in t.override_args:
         prefix: list[str] = []
+        suffix: list[str] = []
         has_cp = any("context_parallel_degree" in arg for arg in variant)
         has_compile = any("compile.enable" in arg for arg in variant)
+        has_ac_mode = any("activation-checkpoint:" in arg for arg in variant)
         if not _is_pp_only(variant, t.ngpu) and not (has_cp and has_compile):
-            prefix.append("--parallelism.spmd_backend full_dtensor")
-        new_args.append(tuple(prefix) + tuple(variant))
-    return dataclasses.replace(t, override_args=tuple(new_args))
+            prefix.append(f"--parallelism.spmd_backend {backend}")
+            if (
+                backend == "spmd_types"
+                and not has_ac_mode
+                and _supports_spmd_typechecking(test_name, variant)
+            ):
+                prefix.append("--debug.spmd_typechecking")
+                suffix.append("activation-checkpoint:none")
+        variant = tuple(
+            arg.replace(f"{t.test_name}/", f"{test_name}/") for arg in variant
+        )
+        new_args.append(tuple(prefix) + tuple(variant) + tuple(suffix))
+    return dataclasses.replace(
+        t,
+        override_args=tuple(new_args),
+        test_name=test_name,
+    )
 
 
 # Use RUNNER_TEMP if defined (GitHub Actions variable), else fallback to old path
@@ -110,7 +161,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             [
                 [
                     "--compile.enable",
-                    "--activation_checkpoint.mode selective",
+                    "activation-checkpoint:selective",
                 ],
             ],
             "1D compile with selective op AC",
@@ -126,7 +177,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.tensor_parallel_degree 2",
                 ],
             ],
-            "2D eager (ChunkedCELoss + standard CE loss with TP+loss_parallel)",
+            "2D eager (ChunkedLossWrapper + standard CE loss with TP+loss_parallel)",
             "2d_eager",
         ),
         OverrideDefinitions(
@@ -310,7 +361,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                 [
                     "--parallelism.pipeline_parallel_degree 4",
                     "--parallelism.pipeline_parallel_schedule InterleavedZeroBubble",
-                    "--activation_checkpoint.mode full",
+                    "activation-checkpoint:full",
                 ],
             ],
             "PP looped zero bubble test",
@@ -323,7 +374,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                 [
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule ZBVZeroBubble",
-                    "--activation_checkpoint.mode full",
+                    "activation-checkpoint:full",
                 ],
             ],
             "PP zero bubble test (v shaped)",
@@ -341,7 +392,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule PipelineScheduleMulti",
                     "--parallelism.pipeline_parallel_schedule_csv ./tests/assets/custom_schedule.csv",
-                    "--activation_checkpoint.mode full",
+                    "activation-checkpoint:full",
                 ],
             ],
             "PP with custom pipeline schedule loaded from CSV file",
@@ -511,12 +562,27 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
-                    "--override.imports torchtitan.overrides.fused_swiglu",
+                    "--override.imports torchtitan.overrides.fused_swiglu.fused_swiglu",
                     "--parallelism.tensor_parallel_degree 2",
                 ],
             ],
             "Override: swap FeedForward with fused SwiGLU (FSDP2 + TP2)",
             "override_fused_swiglu",
+            ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module deepseek_v3 --config deepseek_v3_debugmodel",
+                    "--override.imports torchtitan.overrides.fused_swiglu.fused_swiglu,"
+                    "torchtitan.overrides.fused_swiglu.fused_grouped_experts",
+                    "--parallelism.tensor_parallel_degree 2",
+                    "--parallelism.expert_parallel_degree 4",
+                ],
+            ],
+            "Override: fuse grouped experts + FFNs on deepseek_v3 "
+            "(FSDP2 + TP2 dense, EP4 sparse)",
+            "override_fused_grouped_experts",
             ngpu=4,
         ),
         # NOTE: below are tests which require config change that cannot be done
@@ -526,7 +592,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module llama3 --config llama3_debugmodel_varlen_attn",
                     "--parallelism.data_parallel_shard_degree=4",
-                    "--activation_checkpoint.mode=selective",
+                    "activation-checkpoint:selective",
                 ]
             ],
             "FSDP+VARLEN_ATTN + per op SAC",
@@ -606,4 +672,6 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         ),
     ]
 
-    return [_enable_full_dtensor(t) for t in integration_tests_flavors]
+    return [
+        *[_enable_spmd_backend(t, "spmd_types") for t in integration_tests_flavors],
+    ]

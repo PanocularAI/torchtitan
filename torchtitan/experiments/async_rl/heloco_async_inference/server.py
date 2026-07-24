@@ -64,10 +64,17 @@ async def _consistent_snapshot(
         # behavior policy (their engines run bf16) and never train on or push
         # back these weights, so the cast can't compound; the server's own
         # fp32 global model is untouched.
+        # Snapshot via state_dict(), NOT named_parameters(): the relay-published
+        # weights are loaded by the worker pool's vLLM generators, which expect
+        # the same layout the trainer's push_model_state_dict stages -- i.e.
+        # FusedQKVLinear's state_dict hooks split the fused wqkv back into
+        # wq/wk/wv. A named_parameters() dump would emit the fused key and every
+        # worker would load mismatched attention weights (non-terminating
+        # generation). param_names (named_parameters order) is unused here for
+        # that reason; the generator load consumes the full state_dict keys.
         state_dict = {
-            name: p.detach().to(device="cpu", dtype=torch.bfloat16).clone()
-            for name, p in model.named_parameters()
-            if name in param_names
+            name: t.detach().to(device="cpu", dtype=torch.bfloat16).clone()
+            for name, t in model.state_dict().items()
         }
         new_revision = get_revision()
         if new_revision == revision:

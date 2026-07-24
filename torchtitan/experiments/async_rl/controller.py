@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
 # Shared controller machinery for the async_rl coordination strategies.
@@ -48,59 +54,25 @@ class RLControllerMixin:
     # ------------------------------------------------------------------ #
 
     async def _collect_and_build(self, step: int):
-        """Rollout collection + episode building (generator-mesh + CPU work
-        only; no trainer-mesh calls). Launched one step ahead of the previous
-        step's trainer-mesh work by _run_window's pipeline."""
+        """Rollout collection + training-batch packing (generator-mesh + CPU
+        work only; no trainer-mesh fwd/bwd). Launched one step ahead of the
+        previous step's trainer-mesh work by _run_window's pipeline.
+
+        Uses the upstream rollout→sample→batch pipeline (RolloutGroup ->
+        TrainingSampleBuilder -> Batcher.add_training_samples) provided by the
+        RLTrainer base as ``_collect_training_batch``. Returns
+        ``(packed_batch, rollout_groups)``; the groups are kept for the reward
+        metric in the per-window log line."""
         await self.trainer.sync_log_step.call(step)
         await self.generator_router.fanout("sync_log_step", step)
+        return await self._collect_training_batch(step)
 
-        num_groups = self.config.num_groups_per_rollout_batch
-        num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
-        rollout_groups = []
-        collected_tokens = 0
-        group_offset = 0
-        while collected_tokens < num_tokens_target:
-            groups, _ = await self._collect_rollouts(
-                is_validation=False,
-                num_groups=num_groups,
-                group_size=self.config.group_size,
-                sampling=self._sampling,
-                step=step,
-                group_offset=group_offset,
-            )
-            rollout_groups.extend(groups)
-            collected_tokens += sum(
-                len(r.turns[-1].prompt_token_ids)
-                + len(r.turns[-1].completion_token_ids)
-                - 1
-                for g in groups
-                for r in g.rollouts
-                if r.turns
-            )
-            group_offset += num_groups
-
-        episodes, _ = self._build_episodes(rollout_groups)
-        microbatches, num_global_valid_tokens, _ = self.batcher.batch(
-            episodes, dp_degree=self.trainer_dp_degree
-        )
-        return rollout_groups, episodes, microbatches, num_global_valid_tokens
-
-    async def _train_on(
-        self, rollout_groups, episodes, microbatches, num_global_valid_tokens
-    ) -> dict:
+    async def _train_on(self, packed, rollout_groups) -> dict:
         """forward_backward loop + optim_step + generator weight refresh
         (trainer-mesh work)."""
         pre_optim_policy_version = self._policy_version
 
-        last_loss = 0.0
-        for microbatch in microbatches:
-            mb = self._get_rank_0_value(
-                await self.trainer.forward_backward.call(
-                    microbatch, num_global_valid_tokens
-                )
-            )
-            last_loss = mb.get("loss/mean", mb.get("loss", last_loss))
-        optim_output = self._get_rank_0_value(await self.trainer.optim_step.call())
+        optim_output, last_loss = await self._apply_training_batch(packed)
         self._policy_version = optim_output.policy_version
         await self._refresh_generators()
 
@@ -108,8 +80,9 @@ class RLControllerMixin:
             r.reward for g in rollout_groups for r in g.rollouts if r.reward is not None
         ]
         reward_mean = sum(rewards) / len(rewards) if rewards else float("nan")
-        ep_versions = [ep.policy_version for ep in episodes]
-        staleness = self._batch_staleness(pre_optim_policy_version, ep_versions)
+        staleness = self._batch_staleness(
+            pre_optim_policy_version, packed.min_policy_versions
+        )
         return {
             "loss": last_loss,
             "reward_mean": reward_mean,
@@ -118,19 +91,24 @@ class RLControllerMixin:
             "staleness": staleness,
         }
 
-    def _batch_staleness(self, pre_optim_policy_version: int, ep_versions) -> int:
+    def _batch_staleness(
+        self, pre_optim_policy_version: int, min_policy_versions
+    ) -> int:
         """The staleness (in versions) of the just-consumed batch, for the
-        per-window log line. Episodes are stamped with the version their
-        GENERATOR held (``completion.policy_version``), so the two operands
-        must be in the same version space. Here (local generation) they are:
-        generators pull per optim step tagged with the trainer's
-        ``policy_version``, so the gap to the pre-optim policy_version is the
-        steps of lag the IS-corrected loss absorbed. Always >= 0; grows if
-        generation lags training (expected under the always-on one-step
-        pipeline). Pure learners override this: their episodes carry
-        relay/hub checkpoint versions, which a local optim-step counter is
-        not comparable to."""
-        return pre_optim_policy_version - min(ep_versions) if ep_versions else 0
+        per-window log line. The packed batch carries ``min_policy_versions``
+        (the versions its samples' GENERATORS held), so the two operands are in
+        the same version space: generators pull per optim step tagged with the
+        trainer's ``policy_version``, so the gap to the pre-optim policy_version
+        is the steps of lag the IS-corrected loss absorbed. Always >= 0; grows
+        if generation lags training (expected under the always-on one-step
+        pipeline). Pure learners override this: their samples carry relay/hub
+        checkpoint versions, which a local optim-step counter is not comparable
+        to."""
+        return (
+            pre_optim_policy_version - min(min_policy_versions)
+            if min_policy_versions
+            else 0
+        )
 
     async def _refresh_generators(self) -> None:
         """Bring this replica's generators up to the just-updated local policy:
@@ -166,14 +144,12 @@ class RLControllerMixin:
         try:
             for _h in range(sync_every):
                 iter_t0 = time.perf_counter()
-                rollout_groups, episodes, microbatches, num_valid = await pending
+                packed, rollout_groups = await pending
                 pending = None
                 if _h != sync_every - 1:
                     global_step += 1
                     pending = asyncio.create_task(self._collect_and_build(global_step))
-                last = await self._train_on(
-                    rollout_groups, episodes, microbatches, num_valid
-                )
+                last = await self._train_on(packed, rollout_groups)
                 window_rewards.append(last["reward_mean"])
                 # "step: N" is the progress contract an external supervisor greps
                 # for (same line pretrain emits) -- the step trained in iteration
@@ -265,6 +241,10 @@ class RLControllerMixin:
         cfg = self.config
         rid = cfg.replica_id
         self._sync_every = cfg.sync_every
+
+        # Build the synchronous rollout->sample->batch pipeline now that
+        # setup_async has run (it needs self.trainer_dp_degree).
+        self._build_sync_pipeline()
 
         logger.info("[replica %d] pre-training validation", rid)
         pre_acc = self._aggregate_validation(await self._validate_fixed(0))

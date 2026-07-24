@@ -426,6 +426,31 @@ def _group(num_tokens=4, reward=0.5):
     return SimpleNamespace(rollouts=[SimpleNamespace(turns=[turn], reward=reward)])
 
 
+def _packed(min_policy_versions):
+    """A fake TrainingBatch as the packing Batcher would return it under the
+    current pipeline: one microbatch, a valid-token count, and the per-sample
+    generator policy versions the staleness panel reads."""
+    return SimpleNamespace(
+        microbatches=["mb"],
+        num_global_valid_tokens=4,
+        min_policy_versions=list(min_policy_versions),
+    )
+
+
+def _passthrough_pipeline(r, *, min_policy_versions=(0,)):
+    """Wire the current rollout->sample->batch pipeline onto a fake replica:
+    the training-sample builder passes each RolloutGroup through unchanged, and
+    the batcher returns one packed batch per group it's given."""
+    r._training_sample_builder = SimpleNamespace(
+        build_from_group=lambda *, rollout_group: rollout_group
+    )
+    r._batcher = SimpleNamespace(
+        add_training_samples=lambda *, training_sample_group: _packed(
+            min_policy_versions
+        )
+    )
+
+
 async def _noop(*a, **k):
     return None
 
@@ -443,7 +468,7 @@ def make_replica(*, max_staleness=4, checkpoint_version=10):
         sync_every=2,
         num_outer_steps=1,
         train_seconds=0.0,
-        num_groups_per_rollout_batch=2,
+        async_loop=SimpleNamespace(num_prompts_per_train_step=2),
         buffer_groups=8,
         max_staleness=max_staleness,
         queue_poll_interval_s=0,
@@ -511,17 +536,11 @@ def test_collect_and_build_drops_groups_stale_against_checkpoint_version():
         r = make_replica(max_staleness=4, checkpoint_version=10)
         r.trainer = SimpleNamespace(sync_log_step=_ep(lambda step: _noop()))
         r.trainer_dp_degree = 1
-        r.batcher = SimpleNamespace(
-            num_tokens_target=lambda dp: 4,
-            batch=lambda eps, dp_degree: ([["mb"]], 4, None),
-        )
-        r._build_episodes = lambda groups: ([SimpleNamespace(policy_version=10)], None)
+        _passthrough_pipeline(r, min_policy_versions=[8])
         r._remote_consumer_task = asyncio.create_task(asyncio.sleep(30))
         await r._buffer.put((_group(num_tokens=5), 3))  # 10-3=7 > 4 -> dropped
         await r._buffer.put((_group(num_tokens=5), 8))  # 10-8=2 <= 4 -> kept
-        rollout_groups, episodes, mbs, nvt = await asyncio.wait_for(
-            r._collect_and_build(1), 1
-        )
+        packed, rollout_groups = await asyncio.wait_for(r._collect_and_build(1), 1)
         assert r._num_dropped == 1
         assert len(rollout_groups) == 1
         r._remote_consumer_task.cancel()
@@ -561,7 +580,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
             sync_every=2,
             num_outer_steps=2,
             train_seconds=0.0,
-            num_groups_per_rollout_batch=2,
+            async_loop=SimpleNamespace(num_prompts_per_train_step=2),
             buffer_groups=0,
             max_staleness=4,
             queue_poll_interval_s=0,
@@ -592,14 +611,11 @@ def test_train_end_to_end_pure_learner_on_fakes():
         )
         r._get_rank_0_value = lambda x: x
         r.trainer_dp_degree = 1
-        r.batcher = SimpleNamespace(
-            num_tokens_target=lambda dp: 4,
-            batch=lambda eps, dp_degree: ([["mb"]], 4, None),
-        )
-        r._build_episodes = lambda groups: (
-            [SimpleNamespace(policy_version=r._policy_version)],
-            None,
-        )
+        # The current pipeline builds the training-sample builder + batcher from
+        # config in _build_sync_pipeline; on this fake replica there is no real
+        # config to build from, so no-op it and wire passthrough fakes instead.
+        r._build_sync_pipeline = lambda: None
+        _passthrough_pipeline(r, min_policy_versions=[r._policy_version])
         r._aggregate_validation = lambda metrics: {}
 
         await asyncio.wait_for(r.train(), 15)
