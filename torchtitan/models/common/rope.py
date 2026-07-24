@@ -8,8 +8,10 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+import spmd_types as spmd
 import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 from torchtitan.protocols.module import Module
 
@@ -20,6 +22,7 @@ __all__ = [
 ]
 
 
+@spmd.no_typecheck()
 def _maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None:
     """Async bounds check: verify all position values <= max_valid_pos.
 
@@ -34,6 +37,49 @@ def _maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None
         torch.all(pos_local <= max_valid_pos),
         f"position_ids exceed {max_valid_pos=}",
     )
+
+
+def _yarn_inv_freq(
+    dim: int,
+    base: float,
+    rope_factor: float,
+    beta_fast: float,
+    beta_slow: float,
+    original_seq_len: int,
+    truncate: bool,
+) -> torch.Tensor:
+    """Shared YaRN ("NTK-by-parts") inverse-frequency computation.
+
+    Single source of truth for both ``ComplexRoPE`` and ``CosSinRoPE`` so the
+    two cache formats are guaranteed to agree. Follows the YaRN paper / HF
+    convention: ``low <- beta_fast`` (extrapolation boundary), ``high <-
+    beta_slow`` (interpolation boundary). ``truncate`` floors/ceils the cutoffs
+    (DeepSeek style); ``truncate=False`` keeps fractional cutoffs (gpt-oss
+    style). The range is always clamped to ``[0, dim/2 - 1]``. The YaRN
+    attention "mscale" is intentionally NOT applied here -- the rope stays a
+    pure rotation and the model folds mscale into its softmax scale.
+    """
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+
+    def find_correction_dim(num_rotations: float) -> float:
+        return (dim * math.log(original_seq_len / (num_rotations * 2 * math.pi))) / (
+            2 * math.log(base)
+        )
+
+    low = find_correction_dim(beta_fast)
+    high = find_correction_dim(beta_slow)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    assert (
+        0 < low < high < dim - 1
+    ), f"Invalid YaRN params: 0 < {low} < {high} < {dim - 1}"
+
+    ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)).clamp(
+        0, 1
+    )
+    return inv_freq / rope_factor * ramp + inv_freq * (1 - ramp)
 
 
 class RoPE(Module):
@@ -60,7 +106,7 @@ class RoPE(Module):
         beta_fast: float = 32.0
         beta_slow: float = 1.0
         original_seq_len: int = 4096
-        mscale: float = 0.0
+        truncate: bool = True
 
     def __init__(self, config: Config):
         super().__init__()
@@ -172,47 +218,15 @@ class ComplexRoPE(RoPE):
             freqs = torch.where(is_medium_freqs, smoothed_freqs, freqs)
         elif cfg.scaling == "yarn" and end > cfg.original_seq_len:
             # YaRN (DeepSeek V3 style)
-            beta_fast = cfg.beta_fast
-            beta_slow = cfg.beta_slow
-            base = theta
-            original_seq_len = cfg.original_seq_len
-            factor = cfg.rope_factor
-
-            def find_correction_dim(
-                num_rotations: float, dim: int, base: float, max_seq_len: int
-            ) -> float:
-                return (
-                    dim
-                    * math.log(max_seq_len / (num_rotations * 2 * math.pi))
-                    / (2 * math.log(base))
-                )
-
-            def find_correction_range(
-                low_rot: float,
-                high_rot: float,
-                dim: int,
-                base: float,
-                max_seq_len: int,
-            ) -> tuple[int, int]:
-                low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
-                high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
-                return max(low, 0), min(high, dim - 1)
-
-            def linear_ramp_factor(
-                min_val: float, max_val: float, dim: int
-            ) -> torch.Tensor:
-                if min_val == max_val:
-                    max_val += 0.001
-                linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (
-                    max_val - min_val
-                )
-                return torch.clamp(linear_func, 0, 1)
-
-            low, high = find_correction_range(
-                beta_fast, beta_slow, dim, base, original_seq_len
+            freqs = _yarn_inv_freq(
+                dim,
+                theta,
+                cfg.rope_factor,
+                cfg.beta_fast,
+                cfg.beta_slow,
+                cfg.original_seq_len,
+                cfg.truncate,
             )
-            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
-            freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
         t = torch.arange(end, device=freqs.device)
         freqs = torch.outer(t, freqs).float()
@@ -267,48 +281,30 @@ class CosSinRoPE(RoPE):
         max_seq_len = cfg.max_seq_len
         base = cfg.theta
 
-        freq = base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
-        mscale = 1.0
-
         if cfg.scaling == "llama":
             raise NotImplementedError("Cos/sin RoPE does not support Llama scaling.")
 
         if cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
-            rope_factor = cfg.rope_factor
-            # YaRN mscale for attention magnitude preservation
-            mscale = 0.1 * math.log(rope_factor) + 1.0
-
-            # Compute correction range (NTK by parts)
-            d_half = dim / 2
-            low = (
-                d_half
-                * math.log(cfg.original_seq_len / (cfg.beta_slow * 2 * math.pi))
-                / math.log(base)
+            inv_freq = _yarn_inv_freq(
+                dim,
+                base,
+                cfg.rope_factor,
+                cfg.beta_fast,
+                cfg.beta_slow,
+                cfg.original_seq_len,
+                cfg.truncate,
             )
-            high = (
-                d_half
-                * math.log(cfg.original_seq_len / (cfg.beta_fast * 2 * math.pi))
-                / math.log(base)
-            )
-            assert (
-                0 < low < high < d_half - 1
-            ), f"Invalid YaRN params: 0 < {low} < {high} < {d_half - 1}"
-
-            ramp = (torch.arange(d_half, dtype=torch.float32) - low) / (high - low)
-            mask = 1 - ramp.clamp(0, 1)
-
-            interpolation = 1.0 / (rope_factor * freq)
-            extrapolation = 1.0 / freq
-            inv_freq = interpolation * (1 - mask) + extrapolation * mask
         else:
-            inv_freq = 1.0 / freq
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
+            )
 
         t = torch.arange(max_seq_len, dtype=inv_freq.dtype, device=inv_freq.device)
         freqs = torch.outer(t, inv_freq).float()
         theta = torch.cat([freqs, freqs], dim=-1)
 
-        cos = theta.cos() * mscale
-        sin = theta.sin() * mscale
+        cos = theta.cos()
+        sin = theta.sin()
         return torch.cat([cos, sin], dim=-1)
 
     def _reshape_cache(
@@ -334,8 +330,8 @@ class CosSinRoPE(RoPE):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply cos/sin RoPE using the rotate-half convention."""
         head_dim = query.shape[-1]
-        cos = rope_cache[..., :head_dim].to(device=query.device)
-        sin = rope_cache[..., head_dim:].to(device=query.device)
+        cos = rope_cache[..., :head_dim]
+        sin = rope_cache[..., head_dim:]
         query_f = query.float()
         key_f = key.float()
         xq_out = (query_f * cos) + (CosSinRoPE._rotate_half(query_f) * sin)
@@ -349,6 +345,7 @@ class CosSinRoPE(RoPE):
         return torch.cat((-x2, x1), dim=-1)
 
 
+@spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
 def _reshape_for_broadcast(
     rope_cache: torch.Tensor,
     query_shape: torch.Size | tuple[int, ...],
@@ -361,24 +358,33 @@ def _reshape_for_broadcast(
     # cache_width is `head_dim * 2` for CosSinRoPE, and `head_dim // 2` for ComplexRoPE
     cache_width = rope_cache.shape[-1]
     if positions is None:
+        # No explicit positions: use the prefix cache and broadcast it over batch.
         rope_cache = rope_cache[0:seqlen]
-        assert rope_cache.shape == (seqlen, cache_width)
+        # assert rope_cache.shape == (seqlen, cache_width)
         shape = [
             d if i == 1 else cache_width if i == ndim - 1 else 1
             for i, d in enumerate(query_shape)
         ]
         return rope_cache.view(*shape)
-    elif positions.size(0) == 1:
-        assert positions.shape == (1, seqlen)
+
+    # TODO(pianpwk): Remove this vLLM inference compatibility branch once
+    # singleton positions can use the general gather path; see PR #3750.
+    # Concrete/provable singleton positions can use the cheaper prefix-shaped
+    # view path. If singleton-ness is symbolic, fall through to gather below.
+    if guard_or_false(positions.size(0) == 1):
+        # assert positions.shape == (1, seqlen)
         rope_cache = rope_cache[positions.squeeze(0)]
-        assert rope_cache.shape == (seqlen, cache_width)
+        # assert rope_cache.shape == (seqlen, cache_width)
         shape = [
             d if i == 1 else cache_width if i == ndim - 1 else 1
             for i, d in enumerate(query_shape)
         ]
         return rope_cache.view(*shape)
     else:
-        assert positions.shape == (bsz, seqlen)
+        # Per-batch positions, plus singleton positions whose first dimension was
+        # not statically provable above, use the general gather path.
+        # assert positions.shape == (bsz, seqlen)
+        positions = positions.expand(bsz, -1)
         rope_cache_expanded = rope_cache[None, :, None, :].expand(bsz, -1, -1, -1)
         rope_cache = torch.gather(
             rope_cache_expanded,

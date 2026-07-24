@@ -15,7 +15,6 @@ Adds TorchFT fault tolerance support on top of the base CheckpointManager:
 from __future__ import annotations
 
 import functools
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, cast
@@ -45,6 +44,7 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.experiments.torchft.manager import TorchFTManager
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
+from torchtitan.tools import filesystem
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
@@ -268,7 +268,7 @@ class TorchFTCheckpointManager(CheckpointManager):
         return True
 
     def _ft_folder(self) -> str:
-        return os.path.join(self.folder, f"ft-replica-{self.ft_replica_id}")
+        return filesystem.join(self.folder, f"ft-replica-{self.ft_replica_id}")
 
     def _ft_save(self, step: int) -> None:
         begin = time.monotonic()

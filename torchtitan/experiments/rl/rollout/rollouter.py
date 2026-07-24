@@ -15,6 +15,7 @@ from renderers import Renderer
 
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.environment import MessageEnv, TokenEnv
+from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.experiments.rl.rollout.types import (
     GenerateFn,
     Rollout,
@@ -23,6 +24,7 @@ from torchtitan.experiments.rl.rollout.types import (
     RolloutTurn,
 )
 from torchtitan.experiments.rl.rubrics import Rubric, RubricOutput
+from torchtitan.experiments.rl.types import RolloutTurnID
 
 if TYPE_CHECKING:
     # Type-only: importing the generator module here would pull in vLLM at import time.
@@ -48,7 +50,8 @@ class Rollouter(Configurable):
 
         sample = rollouter.get_training_sample()        # one sample from the dataset
         group = await rollouter.run_group_rollouts(     # build envs, drive turns, score
-            generate_fn=generate_fn, sample=sample, group_id="step=3/group=0",
+            generate_fn=generate_fn, sample=sample,
+            group_id=group_index,  # assigned by the data input loop (a monotonic int)
             group_size=N, sampling=sampling, renderer=renderer)
 
     `MessageEnv` works in messages; `TokenEnv` (what `make_env_group` returns)
@@ -80,12 +83,19 @@ class Rollouter(Configurable):
         """The env to build per sample; `make_env_group` calls `build(env_input=sample)`."""
 
         token_env: TokenEnv.Config = field(default_factory=TokenEnv.Config)
-        """`TokenEnv` limits (e.g. `max_rollout_tokens`) passed to `make_env_group`."""
+        """`TokenEnv` wraps the `MessageEnv` in `make_env_group`."""
+
+        advantage: Configurable.Config = field(
+            default_factory=AdvantageEstimator.Config
+        )
+        """Post-scoring advantage estimator. Default = Dr.GRPO (mean-baseline only);
+        set `AdvantageEstimator.Config(should_std_normalize=True)` for standard GRPO."""
 
     def __init__(self, config: Config) -> None:
         self._train_dataset = config.train_dataset.build()
         self._validation_dataset = config.validation_dataset.build()
         self.rubric: Rubric = config.rubric.build()
+        self.advantage_estimator = config.advantage.build()
         self._message_env_config = config.message_env
         self._token_env_config = config.token_env
 
@@ -150,7 +160,7 @@ class Rollouter(Configurable):
         *,
         generate_fn: GenerateFn,
         sample: object,
-        group_id: str,
+        group_id: int,
         group_size: int,
         sampling: SamplingConfig,
         renderer: Renderer,
@@ -179,6 +189,8 @@ class Rollouter(Configurable):
             sample=sample, group_size=group_size, renderer=renderer
         )
 
+        # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
+        # reuse across the group_size rollouts (truest spot is the rollouter's first-turn render).
         try:
             # produce the rollouts
             rollouts = await asyncio.gather(
@@ -194,7 +206,7 @@ class Rollouter(Configurable):
                             else replace(sampling, seed=sampling.seed + sample_idx)
                         ),
                         group_id=group_id,
-                        rollout_id=f"{group_id}/sample={sample_idx}",
+                        rollout_id=sample_idx,
                     )
                     for sample_idx, env in enumerate(envs)
                 )
@@ -209,9 +221,12 @@ class Rollouter(Configurable):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
 
-        # TODO: move advantage calculation to here
-
-        return RolloutGroup(group_id=group_id, rollouts=rollouts)
+        # Post-scoring: turn group rewards into per-rollout advantages.
+        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
+        advantages = self.advantage_estimator(group)
+        for rollout, advantage in zip(group.rollouts, advantages, strict=True):
+            rollout.advantage = advantage
+        return group
 
     async def _run_single_rollout(
         self,
@@ -219,8 +234,8 @@ class Rollouter(Configurable):
         generate_fn: GenerateFn,
         env: TokenEnv,
         sampling: SamplingConfig,
-        group_id: str,
-        rollout_id: str,
+        group_id: int,
+        rollout_id: int,
     ) -> Rollout:
         """Produce a single rollout, alternating between env and generator calls,
         until the env is terminal (env `done`, truncation, errors).
@@ -234,8 +249,8 @@ class Rollouter(Configurable):
             env: The env for this rollout; `run_group_rollouts` closes it.
             sampling: Sampling config for every generate call.
             group_id: The GRPO group id.
-            rollout_id: Stable id for this rollout, unique within the group; the per-turn
-                `request_id` prefix, and stored as `Rollout.sample_id`.
+            rollout_id: Sibling index within the group; combined with the turn index into the
+                per-turn `RolloutTurnID`, and stored as `Rollout.rollout_id`.
 
         Returns:
             One unscored `Rollout` (reward filled later by the controller).
@@ -243,41 +258,49 @@ class Rollouter(Configurable):
         turns: list[RolloutTurn] = []
         status = RolloutStatus.ERROR
         try:
-            step = await env.init()
-            while not step.status.is_terminal():
+            env_step = await env.init()
+            while not env_step.status.is_terminal():
+                turn_rollout_id = RolloutTurnID(
+                    group_id=group_id, rollout_id=rollout_id, turn_id=len(turns)
+                )
 
                 # generator call
                 completion = await generate_fn(
-                    prompt_token_ids=step.next_prompt_token_ids,
-                    request_id=f"{rollout_id}/turn={len(turns)}",
+                    prompt_token_ids=env_step.next_prompt_token_ids,
+                    request_id=turn_rollout_id.to_string(),
+                    # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
+                    routing_session_id=turn_rollout_id.to_string(include_turn=False),
                     sampling_config=sampling,
                 )
 
                 # env call
-                next_step = await env.step(completion)
+                next_env_step = await env.step(completion)
 
                 # full snapshot of this turn from a token and message perspective
                 turns.append(
                     RolloutTurn(
-                        prompt_token_ids=step.next_prompt_token_ids or [],
-                        prompt_messages=step.next_prompt_messages or [],
+                        rollout_id=turn_rollout_id,
+                        prompt_token_ids=env_step.next_prompt_token_ids or [],
+                        prompt_messages=env_step.next_prompt_messages or [],
                         completion_token_ids=completion.token_ids,
                         completion_logprobs=completion.token_logprobs,
-                        completion_message=next_step.completion_message,
-                        env_messages=next_step.env_messages,
-                        env_rewards=next_step.env_rewards,
-                        policy_version=completion.policy_version,
+                        completion_message=next_env_step.completion_message,
+                        env_messages=next_env_step.env_messages,
+                        env_rewards=next_env_step.env_rewards,
+                        min_policy_version=completion.min_policy_version,
+                        max_policy_version=completion.max_policy_version,
                         metrics=completion.metrics,
                     )
                 )
 
                 # holds the input for next generation call
-                step = next_step
+                env_step = next_env_step
 
-            status = step.status
+            status = env_step.status
         except Exception:
             logger.exception(
-                "rollout %s failed after %d turn(s); marking ERROR",
+                "rollout %s/rollout=%d failed after %d turn(s); marking ERROR",
+                group_id,
                 rollout_id,
                 len(turns),
             )
@@ -285,7 +308,7 @@ class Rollouter(Configurable):
 
         return Rollout(
             group_id=group_id,
-            sample_id=rollout_id,
+            rollout_id=rollout_id,
             status=status,
             turns=turns,
         )

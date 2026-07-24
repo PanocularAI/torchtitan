@@ -9,10 +9,12 @@ import pickle
 import tempfile
 import unittest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from torchtitan.experiments.graph_trainer.configs import EpOverlapConfig
 from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
 
 
@@ -81,6 +83,7 @@ class _StubCompileConfig:
     mode: str = "aot_fx_trace"
     backend: str = "aot_eager"
     passes: list = field(default_factory=list)
+    ep_overlap: EpOverlapConfig = field(default_factory=EpOverlapConfig)
 
 
 @dataclass
@@ -171,6 +174,22 @@ class TestConfigFingerprint(unittest.TestCase):
         fp_b = compute_config_fingerprint(_make_stub_model(), cfg_b, dims)
         self.assertNotEqual(fp_a, fp_b)
 
+        cfg_graph_batch = _StubCompileConfig(ep_overlap=EpOverlapConfig(enabled=True))
+        cfg_graph_seq = _StubCompileConfig(
+            ep_overlap=EpOverlapConfig(
+                enabled=True,
+                chunk_dim="seq",
+                module_fqn="layers.*.moe",
+            ),
+        )
+        fp_graph_batch = compute_config_fingerprint(
+            _make_stub_model(), cfg_graph_batch, dims
+        )
+        fp_graph_seq = compute_config_fingerprint(
+            _make_stub_model(), cfg_graph_seq, dims
+        )
+        self.assertNotEqual(fp_graph_batch, fp_graph_seq)
+
     def test_pass_order_sensitive(self):
         from torchtitan.experiments.graph_trainer.precompile import (
             compute_config_fingerprint,
@@ -183,6 +202,25 @@ class TestConfigFingerprint(unittest.TestCase):
         fp_ab = compute_config_fingerprint(_make_stub_model(), cfg_ab, dims)
         fp_ba = compute_config_fingerprint(_make_stub_model(), cfg_ba, dims)
         self.assertNotEqual(fp_ab, fp_ba)
+
+
+class TestPrecompileLossSetup(unittest.TestCase):
+    def test_chunked_loss_setup_matches_trainer_boundary(self):
+        from torchtitan.experiments.graph_trainer.chunked_loss import (
+            ChunkedLossWrapperWithParamGrads,
+        )
+        from torchtitan.experiments.graph_trainer.precompile_main import (
+            _prepare_loss_for_precompile,
+        )
+
+        lm_head = torch.nn.Linear(2, 3)
+        model = SimpleNamespace(lm_head=lm_head, _skip_lm_head=False)
+        loss_fn = ChunkedLossWrapperWithParamGrads.Config().build()
+
+        _prepare_loss_for_precompile(model, loss_fn)
+
+        self.assertIs(loss_fn.lm_head, lm_head)
+        self.assertTrue(model._skip_lm_head)
 
 
 class TestPrecompiledFxTraceArtifact(unittest.TestCase):
