@@ -24,9 +24,11 @@ def round_up(value: int, multiple: int) -> int:
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
-        major,
-        minor,
+    # torch.version.hip is None excludes ROCm (capability is a tuple on AMD too).
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability() >= (major, minor)
     )
 
 
@@ -182,6 +184,27 @@ def get_peak_flops(device_name: str) -> float:
                 f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3"
             )
             return 79e12 * 2
+
+    elif device_name.startswith("TPU"):
+        # Google Cloud TPU: dense BF16 matrix-engine (MXU) peak, per device.
+        # Source: https://cloud.google.com/tpu/docs/system-architecture-tpu-vm
+        if "v4" in device_name:
+            return 275e12
+        elif "v5e" in device_name:
+            return 197e12
+        elif "v5p" in device_name:
+            return 459e12
+        elif "v6e" in device_name:
+            return 918e12
+        elif "v7" in device_name:
+            # 2307 TFLOPS is the published per-chip figure; v7 exposes each of
+            # its two TensorCores as a separate device, so halve for per-device.
+            return 2307e12 / 2
+        else:
+            logger.warning(
+                f"Peak flops undefined for TPU: {device_name}, fallback to A100"
+            )
+            return 312e12
 
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")

@@ -32,9 +32,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.distributed.utils import set_batch_invariance
-from torchtitan.experiments.rl import config_registry
+from torchtitan.experiments.rl.examples.alphabet_sort import config_registry
 from torchtitan.experiments.rl.models.vllm_registry import (
-    registry_to_vllm,
+    register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
 )
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
@@ -81,13 +81,22 @@ def generate() -> None:
         raise ValueError(f"Unknown RL config {args.config!r}")
     config = config_factory()
     gen_config = config.generator
+    model_spec = config.model_spec
     model_path = config.hf_assets_path
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
 
+    # FULL_AND_PIECEWISE reads VLLM_USE_BREAKABLE_CUDAGRAPH at import time (the
+    # @eager_break_during_capture decorator in rl/models/attention.py).
+    if (
+        gen_config.cudagraph.enable
+        and gen_config.cudagraph.mode == "FULL_AND_PIECEWISE"
+    ):
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
     # Register TorchTitan model with vLLM before engine creation
-    registry_to_vllm(
-        config.model_spec,
+    register_to_vllm(
+        model_spec,
         parallelism=gen_config.parallelism,
         compile_config=config.compile,
         checkpoint_config=CheckpointManager.Config(
@@ -95,23 +104,24 @@ def generate() -> None:
             initial_load_in_hf=True,
             initial_load_path=model_path,
         ),
+        override=config.generator.override,
     )
     logger.info("Registered TorchTitan model with vLLM")
 
-    inner_attn = config.model_spec.model.layers[0].attention.inner_attention
+    inner_attn = model_spec.model.layers[0].attention.inner_attention
     if not isinstance(inner_attn, (VarlenAttention.Config, FlexAttention.Config)):
         raise ValueError("Only varlen and flex attention backends are supported.")
 
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     set_batch_invariance(gen_config.debug.batch_invariant)
     if gen_config.debug.batch_invariant:
         # batch_invariant_ops doesn't cover bmm; the MoE router gate is a bmm in
         # the vLLM inference graph, so override it generator-side (not in core).
-        from torchtitan.experiments.rl.actors.generator import (
-            _patch_bmm_for_batch_invariance,
+        from torchtitan.experiments.rl.batch_invariance import (
+            patch_bmm_for_batch_invariance,
         )
 
-        _patch_bmm_for_batch_invariance()
+        patch_bmm_for_batch_invariance()
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
 
     logger.debug("Initializing vLLM LLMEngine with TorchTitan model")
@@ -130,6 +140,7 @@ def generate() -> None:
         dtype=gen_config.model_dtype,
         # Parallelism configuration
         tensor_parallel_size=gen_config.parallelism.tensor_parallel_degree,
+        data_parallel_size=gen_config.parallelism.data_parallel_degree,
         enable_expert_parallel=enable_ep,
         # Use external_launcher only when launched via torchrun (multi-GPU);
         # for single-GPU, let vLLM pick the default executor.
@@ -146,12 +157,15 @@ def generate() -> None:
         ),
         disable_log_stats=False,
     )
-    engine_kwargs["max_model_len"] = config.model_spec.model.max_seq_len
+    engine_kwargs["max_model_len"] = model_spec.model.max_seq_len
     engine_kwargs["max_num_seqs"] = max_num_seqs
+    if gen_config.max_num_batched_tokens is not None:
+        engine_kwargs["max_num_batched_tokens"] = gen_config.max_num_batched_tokens
     if not has_cuda_capability(9, 0):
         engine_kwargs["block_size"] = 256
     vllm_compilation_config = gen_config.cudagraph.get_vllm_compilation_config(
         max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=gen_config.max_num_batched_tokens,
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config

@@ -5,10 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch.nn.attention.flex_attention import and_masks
+from torch.nn.attention.flex_attention import _mask_mod_signature, and_masks, BlockMask
 
 from torchtitan.distributed.minimal_async_ep.api import (
     maybe_update_minimal_async_ep_config,
@@ -27,8 +28,9 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
-from torchtitan.models.common.nn_modules import Linear, RMSNorm
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
@@ -142,6 +144,17 @@ class Decoder(BaseModel):
                     "Weight tying is not supported with Pipeline Parallel."
                 )
 
+            if parallelism.pipeline_parallel_degree > 1 and any(
+                layer.attention is not None
+                and isinstance(layer.attention.inner_attention, VarlenAttention.Config)
+                for layer in self.layers
+            ):
+                raise ValueError(
+                    "Pipeline Parallel is not compatible with VarlenAttention. "
+                    "Use a FlexAttention backend (attn_backend='flex' or "
+                    "'flex_flash') for pipelined models."
+                )
+
             tp = parallelism.tensor_parallel_degree
             attention = self.first_attention
             if tp > 1 and attention is not None:
@@ -165,7 +178,7 @@ class Decoder(BaseModel):
                         HybridEPTokenDispatcher,
                     )
 
-                    token_dispatcher_cfg = layer_cfg.moe.experts.token_dispatcher
+                    token_dispatcher_cfg = layer_cfg.moe.routed_experts.token_dispatcher
                     if (
                         isinstance(
                             token_dispatcher_cfg,
@@ -209,7 +222,7 @@ class Decoder(BaseModel):
                             debug.moe_force_load_balance
                         )
 
-    # Set by the trainer when ChunkedCELoss is used, so lm_head is applied
+    # Set by the trainer when ChunkedLossWrapper is used, so lm_head is applied
     # per-chunk inside the loss function instead of in forward().
     # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor
     # inputs (bool kwargs cause 'has no attribute requires_grad' errors).
@@ -272,18 +285,17 @@ class Decoder(BaseModel):
         output = self.lm_head(h) if self.lm_head is not None else h
         return output
 
-    def _create_flex_attention_mask_for_document(
+    def _create_flex_attention_mask(
         self,
         positions: torch.Tensor,
         attn_config: BaseAttention.Config,
-    ) -> AttentionMasksType:
-        mask_mods = [
-            get_causal_mask_mod(),
-            get_efficient_causal_mask_mod_for_packed_document(positions),
-        ]
+        mask_mods: Sequence[_mask_mod_signature],
+    ) -> BlockMask:
+        """Build a flex-attention BlockMask from mask_mods (ANDed together),
+        respecting the config's block_size and batch-invariant mode."""
+        assert isinstance(attn_config.inner_attention, FlexAttention.Config)
         B = positions.shape[0]
         seq_len = positions.shape[1]
-        assert isinstance(attn_config.inner_attention, FlexAttention.Config)
         return create_attention_mask(
             and_masks(*mask_mods),
             B,
@@ -298,6 +310,21 @@ class Decoder(BaseModel):
             # on the particular batch
             # for batch invariance, we disable this optimization
             separate_full_blocks=not is_in_batch_invariant_mode(),
+        )
+
+    def _create_flex_attention_mask_for_document(
+        self,
+        positions: torch.Tensor,
+        attn_config: BaseAttention.Config,
+    ) -> BlockMask:
+        """Build the standard causal + packed-document flex-attention mask."""
+        return self._create_flex_attention_mask(
+            positions,
+            attn_config,
+            [
+                get_causal_mask_mod(),
+                get_efficient_causal_mask_mod_for_packed_document(positions),
+            ],
         )
 
     def get_attention_masks(

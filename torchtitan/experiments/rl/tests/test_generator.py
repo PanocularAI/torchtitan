@@ -19,14 +19,22 @@ from types import SimpleNamespace
 import pytest
 from vllm.sampling_params import RequestOutputKind
 
-from torchtitan.config import DebugConfig, ParallelismConfig
+from torchtitan.config import DebugConfig
 from torchtitan.experiments.rl.actors.generator import (
+    _extract_request_metrics_inputs,
     _prepare_generation_request_metrics,
     GenerationFuture,
+    RequestDispatcher,
     SamplingConfig,
+    VLLMCudagraphConfig,
     VLLMGenerator,
 )
+from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.routing.intra_generator_router import (
+    IntraGeneratorRouter,
+)
+from torchtitan.experiments.rl.routing.strategies import LeastLoadedRoutingStrategy
 
 
 class _FakeRenderer:
@@ -77,12 +85,12 @@ def _request_output(*, request_id="r0", outputs=None, num_generation_tokens=4):
 
 
 def _generator():
-    """A bare generator (no __init__ / engine build) with just the CB state set."""
+    """A bare generator (no __init__ / engine build) with just the state the
+    per-request helpers (`_build_sampling_params`) read."""
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine()
     generator._rank = 0
     generator.policy_version = 7
-    generator._generation_futures = {}
     generator.config = SimpleNamespace(
         sampling=SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4),
         debug=SimpleNamespace(seed=None),
@@ -90,23 +98,51 @@ def _generator():
     return generator
 
 
+def _dispatcher(*, rank=0, dp_degree=1, tp_degree=1, dp_routing_strategy=None):
+    """A bare RequestDispatcher; broadcast_group is unused unless ``setup`` runs.
+
+    Passes a vLLM parallel config that matches the layout so the construction-time
+    assert holds.
+    """
+    parallelism = SimpleNamespace(
+        data_parallel_degree=dp_degree, tensor_parallel_degree=tp_degree
+    )
+    vllm_parallel_config = SimpleNamespace(
+        tensor_parallel_size=tp_degree,
+        data_parallel_size=dp_degree,
+        data_parallel_rank=rank // tp_degree,
+    )
+    return RequestDispatcher(
+        rank=rank,
+        parallelism=parallelism,
+        broadcast_group=None,
+        vllm_parallel_config=vllm_parallel_config,
+        intra_generator_router=IntraGeneratorRouter.Config(
+            strategy=dp_routing_strategy or LeastLoadedRoutingStrategy.Config()
+        ),
+    )
+
+
 # --- completion (token-out) ---
 
 
 def test_process_finished_requests_resolves_future_with_completion():
     async def main():
-        generator = _generator()
+        # DP=1: rank 0 is the single replica's leader, so it builds and resolves locally.
+        dispatcher = _dispatcher()
         future = asyncio.get_running_loop().create_future()
-        generator._generation_futures = {
-            "r0": GenerationFuture(future=future, metrics_prefix="generator")
-        }
+        # Admitted (sampled) under v7 (the min); a weight pull then advanced the live version to 8 (the max).
+        generation_future = GenerationFuture(future=future, metrics_prefix="generator")
+        generation_future.min_policy_version = 7
+        dispatcher._rank0_generation_futures = {"r0": generation_future}
 
-        generator._process_finished_requests(
+        dispatcher.process_finished_requests(
             [
                 _request_output(
                     outputs=[_sample(token_ids=(10, 11), finish_reason="length")]
                 )
-            ]
+            ],
+            policy_version=8,
         )
 
         completion = await future
@@ -114,10 +150,11 @@ def test_process_finished_requests_resolves_future_with_completion():
         assert completion.token_ids == [10, 11]
         assert completion.token_logprobs == [-0.1, -0.1]
         assert completion.finish_reason == "length"
-        assert completion.policy_version == 7
+        assert completion.min_policy_version == 7  # min = version it was admitted under
+        assert completion.max_policy_version == 8  # max = live version at finish
         # The request is popped from the in-flight map.
-        assert generator._generation_futures == {}
-        # The per-generation metrics ride on the completion.
+        assert dispatcher._rank0_generation_futures == {}
+        # The per-generation metrics ride on the completion (built on rank 0).
         assert (
             m.MetricsProcessor._aggregate_metrics(completion.metrics)[
                 "generator/inflight_requests_at_completion/max"
@@ -128,12 +165,39 @@ def test_process_finished_requests_resolves_future_with_completion():
     asyncio.run(main())
 
 
-def test_process_finished_requests_noop_on_followers():
-    # Followers hold no futures, so completion is a no-op (it returns before touching outputs).
-    generator = _generator()
-    generator._rank = 1
-    generator._process_finished_requests([_request_output(request_id="r0")])
-    assert generator._generation_futures == {}
+def test_process_finished_requests_noop_on_nonzero_tp_rank():
+    # tp_rank != 0 hold no finished outputs, so processing returns before building or sending.
+    dispatcher = _dispatcher(rank=1, dp_degree=1, tp_degree=2)
+    assert dispatcher._tp_rank != 0
+    dispatcher.process_finished_requests(
+        [_request_output(request_id="r0")], policy_version=7
+    )
+    assert dispatcher._rank0_generation_futures == {}
+
+
+def test_process_finished_requests_releases_dp_router_load():
+    async def main():
+        dispatcher = _dispatcher(dp_degree=2)
+        assert dispatcher._rank0_dp_router is not None
+        future = asyncio.get_running_loop().create_future()
+        generation_future = GenerationFuture(future=future, metrics_prefix="generator")
+        generation_future.min_policy_version = 7
+        dispatcher._rank0_generation_futures = {"r0": generation_future}
+        dispatcher._rank0_dp_router.reserve("r0", routing_session_id=None)
+        # The reservation is recorded (least-loaded picks DP rank 0) and loads it.
+        assert dispatcher._rank0_dp_router._reservations == {"r0": 0}
+        assert [h.reserved_load for h in dispatcher._rank0_dp_router._handles] == [1, 0]
+
+        dispatcher.process_finished_requests(
+            [_request_output(request_id="r0")], policy_version=7
+        )
+
+        await future
+        # Resolving the completion releases the reservation and its load.
+        assert dispatcher._rank0_dp_router._reservations == {}
+        assert [h.reserved_load for h in dispatcher._rank0_dp_router._handles] == [0, 0]
+
+    asyncio.run(main())
 
 
 # --- SamplingParams contract (must match the batched path exactly) ---
@@ -175,7 +239,8 @@ def test_build_sampling_params_seed_and_stop_default_to_none():
 
 def test_metric_timing_math_and_prefix_override():
     metrics = _prepare_generation_request_metrics(
-        _request_output(), prefix="validation_generator"
+        _extract_request_metrics_inputs(_request_output()),
+        prefix="validation_generator",
     )
     aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
     assert all(key.startswith("validation_generator/") for key in aggregate)
@@ -190,7 +255,8 @@ def test_metric_timing_math_and_prefix_override():
 
 def test_decode_metrics_absent_for_single_generated_token():
     metrics = _prepare_generation_request_metrics(
-        _request_output(num_generation_tokens=1), prefix="generator"
+        _extract_request_metrics_inputs(_request_output(num_generation_tokens=1)),
+        prefix="generator",
     )
     keys = {metric.key for metric in metrics}
     assert "generator/prefill_time_ms" in keys
@@ -200,14 +266,14 @@ def test_decode_metrics_absent_for_single_generated_token():
 
 # --- config guards (weight-sync invariants) ---
 
-# Parallelism the generator accepts (TP-only); the weight-sync guards run after these checks.
-_TP_ONLY = ParallelismConfig(enable_sequence_parallel=False, disable_loss_parallel=True)
+# A valid inference parallelism; the weight-sync guards run after it is accepted.
+_PARALLELISM = InferenceParallelismConfig()
 
 
 def test_batch_invariant_requires_prefix_cache_reset():
     with pytest.raises(ValueError, match="reset_prefix_cache_on_weight_sync"):
         VLLMGenerator.Config(
-            parallelism=_TP_ONLY,
+            parallelism=_PARALLELISM,
             debug=DebugConfig(batch_invariant=True),
             reset_prefix_cache_on_weight_sync=False,
         )
@@ -216,7 +282,7 @@ def test_batch_invariant_requires_prefix_cache_reset():
 def test_reset_running_requests_requires_prefix_cache_reset():
     with pytest.raises(ValueError, match="reset_prefix_cache_on_weight_sync"):
         VLLMGenerator.Config(
-            parallelism=_TP_ONLY,
+            parallelism=_PARALLELISM,
             reset_running_requests_on_weight_sync=True,
             reset_prefix_cache_on_weight_sync=False,
         )
@@ -226,16 +292,68 @@ def test_trainer_requires_prefix_cache_reset_when_hotswap_off():
     # Strict drain (hot_swap=False) needs the prefix cache reset so post-pull requests don't reuse old-weight KV.
     import dataclasses
 
-    from torchtitan.experiments.rl.config_registry import rl_grpo_qwen3_0_6b_varlen
+    from torchtitan.experiments.rl.examples.alphabet_sort.config_registry import (
+        rl_grpo_qwen3_0_6b_varlen,
+    )
 
     config = rl_grpo_qwen3_0_6b_varlen()
-    assert (
-        not config.generator_router.hot_swap
-    )  # default; guard fires only when both are off
+    # hot_swap defaults True; the guard fires only in drain mode (hot_swap=False) with reset also off.
     with pytest.raises(ValueError, match="reset_prefix_cache_on_weight_sync"):
         dataclasses.replace(
             config,
+            generator_router=dataclasses.replace(
+                config.generator_router, hot_swap=False
+            ),
             generator=dataclasses.replace(
                 config.generator, reset_prefix_cache_on_weight_sync=False
             ),
         )
+
+
+# --- CUDA graph config (VLLMCudagraphConfig.get_vllm_compilation_config) ---
+
+
+def test_cudagraph_disabled_returns_none():
+    assert (
+        VLLMCudagraphConfig(enable=False).get_vllm_compilation_config(max_num_seqs=256)
+        is None
+    )
+
+
+def test_cudagraph_default_mode_is_full_decode_only():
+    # Default mode; decode-only graphs avoid the mixed-batch corruption (#3668),
+    # with no inductor compile (CompilationMode.NONE == 0).
+    cfg = VLLMCudagraphConfig(enable=True).get_vllm_compilation_config(max_num_seqs=256)
+    assert cfg.cudagraph_mode.name == "FULL_DECODE_ONLY"
+    assert int(cfg.mode) == 0
+
+
+def test_cudagraph_full_mode_no_compile():
+    # FULL captures the whole forward (incl. attention) with no inductor compile.
+    cfg = VLLMCudagraphConfig(enable=True, mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=256
+    )
+    assert cfg.cudagraph_mode.name == "FULL"
+    assert int(cfg.mode) == 0
+
+
+def test_cudagraph_decode_only_capture_sizes_cover_max_num_seqs():
+    # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs (plus
+    # max_num_seqs itself when not a power of 2).
+    cfg = VLLMCudagraphConfig(enable=True).get_vllm_compilation_config(max_num_seqs=500)
+    assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
+
+
+def test_cudagraph_full_mode_extends_capture_sizes_to_chunk():
+    # FULL also graphs prefill, so sizes extend to the chunked-prefill chunk
+    # (max_num_batched_tokens, 2048) on top of max_num_seqs.
+    cfg = VLLMCudagraphConfig(enable=True, mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=500
+    )
+    assert cfg.cudagraph_capture_sizes[-1] == 2048
+    assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
+
+
+def test_cudagraph_rejects_nonpositive_max_num_seqs():
+    with pytest.raises(ValueError, match="max_num_seqs must be positive"):
+        VLLMCudagraphConfig(enable=True).get_vllm_compilation_config(max_num_seqs=0)

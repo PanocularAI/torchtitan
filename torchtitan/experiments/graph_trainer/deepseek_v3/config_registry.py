@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.loss import CrossEntropyLoss
+from dataclasses import replace
+
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     to_graph_trainer_config,
@@ -17,18 +19,11 @@ from torchtitan.models.deepseek_v3.config_registry import (
     deepseek_v3_debugmodel,
     deepseek_v3_debugmodel_minimal_async_ep,
 )
-from torchtitan.trainer import Trainer
 
 from . import model_registry
 
 
 def graph_trainer_deepseek_v3_debugmodel() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(deepseek_v3_debugmodel(), model_registry)
-    config.compile = GraphTrainerCompileConfig(enable=True)
-    return config
-
-
-def graph_trainer_deepseek_v3_debugmodel_ep() -> GraphTrainer.Config:
     config = to_graph_trainer_config(deepseek_v3_debugmodel(), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
     return config
@@ -54,12 +49,16 @@ def graph_trainer_deepseek_v3_debugmodel_minimal_async_ep() -> GraphTrainer.Conf
     return config
 
 
-def graph_trainer_deepseek_v3_debugmodel_flex_attn() -> GraphTrainer.Config:
-    return graph_trainer_deepseek_v3_debugmodel()
-
-
-def graph_trainer_deepseek_v3_debugmodel_flex_attn_ep() -> GraphTrainer.Config:
-    return graph_trainer_deepseek_v3_debugmodel_ep()
+def graph_trainer_deepseek_v3_debugmodel_eager_pp() -> GraphTrainer.Config:
+    """Test-only FlexAttention baseline that runs through eager pipeline parallelism."""
+    config = graph_trainer_deepseek_v3_debugmodel()
+    config.compile = GraphTrainerCompileConfig(
+        enable=True,
+        components=["loss"],
+        mode=None,
+    )
+    config.model_spec = replace(config.model_spec, pipelining_fn=pipeline_llm)
+    return config
 
 
 def graph_trainer_deepseek_v3_16b() -> GraphTrainer.Config:
@@ -86,21 +85,4 @@ def graph_trainer_deepseek_v3_16b_sdpa() -> GraphTrainer.Config:
 def graph_trainer_deepseek_v3_671b() -> GraphTrainer.Config:
     config = to_graph_trainer_config(deepseek_v3_671b(), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
-    return config
-
-
-# CrossEntropyLoss baseline for graph_trainer numerics tests. graph_trainer
-# doesn't yet support ChunkedCELoss, so to_graph_trainer_config swaps it for
-# CrossEntropyLoss; this wrapper applies the same swap to the eager baseline
-# so loss_compare runs apples-to-apples.
-# TODO: Remove once graph_trainer supports ChunkedCELoss.
-def deepseek_v3_debugmodel_ce_loss() -> Trainer.Config:
-    config = deepseek_v3_debugmodel()
-    config.loss = CrossEntropyLoss.Config()
-    return config
-
-
-def deepseek_v3_debugmodel_minimal_async_ep_ce_loss() -> Trainer.Config:
-    config = deepseek_v3_debugmodel_minimal_async_ep()
-    config.loss = CrossEntropyLoss.Config()
     return config
