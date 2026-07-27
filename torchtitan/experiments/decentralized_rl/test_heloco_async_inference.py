@@ -22,8 +22,8 @@ from aiohttp.test_utils import TestServer
 from torchtitan.experiments.decentralized_rl.config_registry import base_rl_config, wrap_replica
 
 from torchtitan.experiments.decentralized_rl.relay import RelayClient, RelayServer
-from torchtitan.experiments.decentralized_rl.server import _watch_and_publish
-from torchtitan.experiments.decentralized_rl.trainers import HeLoCoAsyncInferenceReplica
+from torchtitan.experiments.decentralized_rl.parameter_server import _watch_and_publish
+from torchtitan.experiments.decentralized_rl.replicas import HeLoCoAsyncInferenceReplica
 
 
 def _ep(fn):
@@ -40,7 +40,7 @@ async def _start_relay(retain_last=5):
 
 
 # --------------------------------------------------------------------- #
-# _consistent_snapshot / _watch_and_publish (server.py's publish loop).
+# _consistent_snapshot / _watch_and_publish (parameter_server.py's publish loop).
 # --------------------------------------------------------------------- #
 
 
@@ -200,7 +200,7 @@ def test_window_sync_pushes_pseudograd_and_updates_revision_without_touching_gen
         # Pushed the local theta and adopted the returned global theta.
         assert pushed and pushed[0][0] is theta_local
         assert loaded == [new_global]
-        # Revision reference shifted by +1 (see server.py's version-shift note);
+        # Revision reference shifted by +1 (see parameter_server.py's version-shift note);
         # no generator_router call anywhere in the pure-learner window sync.
         assert r._last_known_revision == 43
         assert "dropped=3" in stats

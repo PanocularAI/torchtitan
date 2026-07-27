@@ -8,9 +8,9 @@ import pytest
 import torch
 from torch import nn
 
-import torchtitan.experiments.decentralized_rl.server as server_mod
-from torchtitan.experiments.decentralized_rl.heloco_client import HeLoCoRLClient
-from torchtitan.experiments.decentralized_rl.server import build_server, param_metadata
+import torchtitan.experiments.decentralized_rl.parameter_server as server_mod
+from torchtitan.experiments.decentralized_rl.parameter_server import HeLoCoRLClient
+from torchtitan.experiments.decentralized_rl.parameter_server import build_server, param_metadata
 
 
 @pytest.mark.parametrize("should_quantize", [False, True])

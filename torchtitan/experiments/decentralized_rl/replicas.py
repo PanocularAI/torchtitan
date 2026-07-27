@@ -1,24 +1,23 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) Panocular AI.
 #
-# The four decentralized_rl coordination strategies' replica controllers, one class
-# per strategy:
+# The four coordination strategies' replica classes, one per strategy, built
+# on the shared bases in controller.py (RLTrainer + RLControllerMixin for the
+# windowed strategies; PureLearnerReplica for the decoupled-generation ones):
 #
-#   - DiLoCoRLReplica: synchronous DiLoCo -- flat per-step RL loop; the sync
-#     happens automatically inside optim_step via torchft local_sgd.DiLoCo,
-#     synchronized across replicas through the Manager/Lighthouse quorum.
-#   - HeLoCoRLReplica: asynchronous DiLoCo through a parameter server -- H
-#     local RL steps per window, then push/pull against the torchft server.
-#   - AsyncInferenceReplica: prime-rl (arXiv:2505.07291) -- one PURE-LEARNER
-#     trainer (no local generation); rollouts come from remote generator
-#     workers via a standalone rollout-queue process, weights publish to a
-#     relay tier.
-#   - HeLoCoAsyncInferenceReplica: prime-rl-style decoupled generation scaled
-#     to MULTIPLE pure-learner trainers coordinating through the HeLoCo
-#     parameter server; the server (run with --relay_addr) publishes global
-#     theta to the relay for the generator pool.
-#
-# The windowed strategies (DiLoCo/HeLoCo) extend RLTrainer via
-# RLControllerMixin; the pure learners extend PureLearnerReplica.
+#   DiLoCoRLReplica              -- synchronous DiLoCo via torchft
+#                                   Manager/Lighthouse quorum.
+#   HeLoCoRLReplica              -- asynchronous DiLoCo through the parameter
+#                                   server (parameter_server.py).
+#   AsyncInferenceReplica        -- one pure learner + remote workers;
+#                                   publishes weights to the relay tier.
+#   HeLoCoAsyncInferenceReplica  -- N pure learners sharing one rollout queue,
+#                                   coordinating through the parameter server.
 
 import asyncio
 import logging
@@ -32,17 +31,23 @@ from torchtitan.experiments.decentralized_rl.actors import (
     HeLoCoPolicyTrainer,
     SnapshotPolicyTrainer,
 )
-from torchtitan.experiments.decentralized_rl.controller import RLControllerMixin
-from torchtitan.experiments.decentralized_rl.heloco_client import HeLoCoRLClient
-from torchtitan.experiments.decentralized_rl.pure_learner import PureLearnerReplica
+from torchtitan.experiments.decentralized_rl.controller import (
+    PureLearnerReplica,
+    RLControllerMixin,
+    RLTrainer,
+)
+from torchtitan.experiments.decentralized_rl.parameter_server import (
+    HeLoCoRLClient,
+    param_metadata,
+)
 from torchtitan.experiments.decentralized_rl.relay import (
     build_manifest,
     RelayClient,
     shard_state_dict,
 )
-from torchtitan.experiments.decentralized_rl.rl_trainer import RLTrainer
-from torchtitan.experiments.decentralized_rl.rollout_queue import RolloutQueuePopClient
-from torchtitan.experiments.decentralized_rl.server import param_metadata
+from torchtitan.experiments.decentralized_rl.rollout_queue import (
+    RolloutQueuePopClient,
+)
 from torchtitan.experiments.rl import controller as _rl_controller_mod
 
 logger = logging.getLogger(__name__)
@@ -495,7 +500,7 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
     pure-learner HeLoCo trainer replicas (1 GPU each, no local generation)
     draw ALL training rollouts from one shared rollout-queue process
     (rollout_queue) fed by a pool of remote generator workers, and coordinate
-    no-barrier through the HeLoCo parameter server (server.py run with
+    no-barrier through the HeLoCo parameter server (parameter_server.py run with
     --relay_addr), which publishes the CURRENT global theta to a relay
     process (relay) for the generator pool.
 
@@ -582,7 +587,7 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
         await self.trainer.load_full_state_dict_cpu.call(global_sd)
         self._queue_client = RolloutQueuePopClient(cfg.rollout_queue_address)
         # +1: the hub publishes checkpoint versions as server revision + 1
-        # (see server.py::_watch_and_publish for why), so this reference must
+        # (see parameter_server.py::_watch_and_publish for why), so this reference must
         # be shifted the same way to stay comparable to the revision workers
         # stamp on their rollout batches.
         self._last_known_revision = self.client.revision + 1

@@ -40,8 +40,8 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.experiments import rl as _rl_pkg
-from torchtitan.experiments.decentralized_rl.rl_trainer import GRPOLoss, RLTrainer
-from torchtitan.experiments.decentralized_rl.trainers import (
+from torchtitan.experiments.decentralized_rl.controller import GRPOLoss, RLTrainer
+from torchtitan.experiments.decentralized_rl.replicas import (
     AsyncInferenceReplica,
     DiLoCoRLReplica,
     HeLoCoAsyncInferenceReplica,
@@ -369,7 +369,7 @@ def rl_heloco_async_inference_qwen3_0_6b(
     Each trainer pops rollouts from that queue, trains, and pushes its
     pseudo-gradient to the HeLoCo parameter server (no barrier); any trainer
     may consume any worker's rollouts. The hub
-    (torchtitan.experiments.decentralized_rl.server)
+    (torchtitan.experiments.decentralized_rl.parameter_server)
     publishes the CURRENT global theta (the consensus weights, not any one
     trainer's copy) to a relay process for the generator pool to pull. Start
     the coordination plane first: the relay,

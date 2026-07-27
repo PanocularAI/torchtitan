@@ -1,14 +1,16 @@
 # Copyright (c) Panocular AI.
 #
 # decentralized_rl: decentralized RL post-training on torchtitan's RL actors. Flat
-# layout, one module per role; the four coordination strategies' replica
-# classes all live in ``trainers``:
+# layout, one module per role, mirroring torchtitan.experiments.rl's naming
+# (controller = orchestration, actors = the spawned GPU trainer actors). The
+# shared controller-side bases live in ``controller``; the four strategies'
+# replica classes live in ``replicas``:
 #
 #   - DiLoCoRLReplica -- N workers sync through a torchft Manager/Lighthouse
 #     quorum, stock synchronous DiLoCo.
 #   - HeLoCoRLReplica -- N workers sync pseudo-gradients through a standalone
-#     CPU parameter server with no barrier (client: ``heloco_client``;
-#     server: ``python -m torchtitan.experiments.decentralized_rl.server``).
+#     CPU parameter server with no barrier (client: ``HeLoCoRLClient``;
+#     server: ``python -m torchtitan.experiments.decentralized_rl.parameter_server``).
 #   - AsyncInferenceReplica -- prime-rl-style decoupled generation
 #     (arXiv:2505.07291): one pure-learner trainer broadcasts weights outward
 #     through a relay-server tier (``relay``) to independent

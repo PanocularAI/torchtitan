@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from torchtitan.experiments.decentralized_rl.actors import DiLoCoManagerTrainer
-from torchtitan.experiments.decentralized_rl.trainers import DiLoCoRLReplica
+from torchtitan.experiments.decentralized_rl.replicas import DiLoCoRLReplica
 
 
 def _ep(fn):
@@ -34,7 +34,7 @@ def test_window_sync_reports_manager_step_info():
 def test_close_swallows_diloco_teardown_errors(monkeypatch):
     """A failed torchft Manager shutdown must not prevent the base RLTrainer
     cleanup (actor/mesh teardown) from running."""
-    from torchtitan.experiments.decentralized_rl.rl_trainer import RLTrainer
+    from torchtitan.experiments.decentralized_rl.controller import RLTrainer
 
     base_close_called = []
 

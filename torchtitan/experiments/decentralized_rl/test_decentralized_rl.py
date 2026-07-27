@@ -26,8 +26,11 @@ from torchtitan.experiments.decentralized_rl.config_registry import (
     wrap_replica,
 )
 from torchtitan.experiments.decentralized_rl.controller import RLControllerMixin
+from torchtitan.experiments.decentralized_rl.replicas import (
+    DiLoCoRLReplica,
+    HeLoCoRLReplica,
+)
 from torchtitan.experiments.decentralized_rl.train import PerHostProvisioner
-from torchtitan.experiments.decentralized_rl.trainers import DiLoCoRLReplica, HeLoCoRLReplica
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
@@ -396,10 +399,9 @@ def test_package_import_stays_cpu_light():
     code = (
         "import sys; "
         "import torchtitan.experiments.decentralized_rl, "
-        "torchtitan.experiments.decentralized_rl.server, "
+        "torchtitan.experiments.decentralized_rl.parameter_server, "
         "torchtitan.experiments.decentralized_rl.relay, "
-        "torchtitan.experiments.decentralized_rl.rollout_queue, "
-        "torchtitan.experiments.decentralized_rl.heloco_client; "
+        "torchtitan.experiments.decentralized_rl.rollout_queue; "
         "heavy = [m for m in sys.modules if m == 'vllm' or m == 'monarch' "
         "or m.startswith('torchtitan.experiments.rl.actors')]; "
         "assert not heavy, heavy; print('light')"

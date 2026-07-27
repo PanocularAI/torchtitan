@@ -33,9 +33,6 @@ from monarch.actor import this_host  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
 from torchtitan.experiments.decentralized_rl.relay import RelayClient  # noqa: E402
-from torchtitan.experiments.decentralized_rl.rl_trainer import (
-    setup_mesh_elastic_env,
-)  # noqa: E402
 from torchtitan.experiments.decentralized_rl.rollout_queue import (
     RolloutQueuePushClient,
 )  # noqa: E402
@@ -43,6 +40,7 @@ from torchtitan.experiments.decentralized_rl.rollout_queue import (
 from torchtitan.experiments.decentralized_rl.train import (
     _ensure_cuda_toolchain,
     PerHostProvisioner,
+    setup_mesh_elastic_env,
 )  # noqa: E402
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator  # noqa: E402
 from torchtitan.experiments.rl.examples.alphabet_sort import (

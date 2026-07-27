@@ -28,9 +28,12 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import asyncio  # noqa: E402
+import itertools  # noqa: E402
 import logging  # noqa: E402
+import socket  # noqa: E402
 
-from monarch.actor import this_host  # noqa: E402
+from monarch.actor import ProcMesh, this_host  # noqa: E402
+from monarch.spmd import setup_torch_elastic_env_async  # noqa: E402
 
 from torchtitan.config import ConfigManager  # noqa: E402
 from torchtitan.experiments.rl.train import (  # noqa: E402
@@ -53,6 +56,37 @@ _ENV_OVERRIDES = {
     "replica_id": (("DILOCO_REPLICA_ID", "ASYNC_INFERENCE_REPLICA_ID"), int),
     "rollout_queue_address": (("ROLLOUT_QUEUE_ADDR",), str),
 }
+
+
+# Below the OS ephemeral range (32768+), so dynamic allocations by unrelated
+# processes can never take these; distinct from the launchers' 29500+ rdzv
+# ports and the coordinator servers' 295xx/87xx defaults.
+_ELASTIC_PORT_BASE = 29800
+_mesh_counter = itertools.count()
+
+
+async def setup_mesh_elastic_env(mesh: ProcMesh) -> None:
+    """``setup_torch_elastic_env_async`` with a deterministic, host-unique port.
+
+    Monarch's default probes for a free MASTER_PORT (bind-0 then close; rank
+    0's TCPStore binds it for real later) — a check-then-use race: sibling
+    replicas on one host probing concurrently can be handed the SAME port,
+    and the loser dies with EADDRINUSE deep in vLLM/torch.distributed init.
+
+    Launchers partition a host's replicas by disjoint, contiguous
+    CUDA_VISIBLE_DEVICES ranges, and a replica spawns at most one mesh per
+    GPU it owns, so (first visible device + this process's mesh counter) is
+    unique across every mesh on the host. Without CUDA_VISIBLE_DEVICES there
+    is no partition (sole tenant / remote host meshes) — keep Monarch's pick.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        await setup_torch_elastic_env_async(mesh)
+        return
+    port = _ELASTIC_PORT_BASE + int(visible.split(",")[0]) + next(_mesh_counter)
+    await setup_torch_elastic_env_async(
+        mesh, master_addr=socket.gethostname(), master_port=port
+    )
 
 
 class PerHostProvisioner(_UpstreamProvisioner):

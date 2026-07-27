@@ -244,7 +244,7 @@ class SnapshotPolicyTrainer(PolicyTrainer):
     """PolicyTrainer + full-parameter snapshot/restore endpoints.
 
     Used by AsyncInferenceReplica to read the whole model out for relay
-    publishing (see trainers.py's setup_async). The base
+    publishing (see replicas.py's AsyncInferenceReplica.setup_async). The base
     forward_backward/optim_step are reused unchanged (stock token-level
     GRPO loss); only the full-state-dict exchange endpoints are added::
 

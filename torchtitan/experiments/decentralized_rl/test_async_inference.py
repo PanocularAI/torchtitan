@@ -35,7 +35,7 @@ from torchtitan.experiments.decentralized_rl.rollout_queue import (
     RolloutQueuePushClient,
     RolloutQueueServer,
 )
-from torchtitan.experiments.decentralized_rl.trainers import AsyncInferenceReplica
+from torchtitan.experiments.decentralized_rl.replicas import AsyncInferenceReplica
 from torchtitan.experiments.decentralized_rl.worker import AsyncInferenceWorker
 
 
