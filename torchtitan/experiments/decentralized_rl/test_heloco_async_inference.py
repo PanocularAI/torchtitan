@@ -19,11 +19,11 @@ import pytest
 import torch
 from aiohttp.test_utils import TestServer
 
-from torchtitan.experiments.async_rl.config_registry import base_rl_config, wrap_replica
+from torchtitan.experiments.decentralized_rl.config_registry import base_rl_config, wrap_replica
 
-from torchtitan.experiments.async_rl.relay import RelayClient, RelayServer
-from torchtitan.experiments.async_rl.server import _watch_and_publish
-from torchtitan.experiments.async_rl.trainers import HeLoCoAsyncInferenceReplica
+from torchtitan.experiments.decentralized_rl.relay import RelayClient, RelayServer
+from torchtitan.experiments.decentralized_rl.server import _watch_and_publish
+from torchtitan.experiments.decentralized_rl.trainers import HeLoCoAsyncInferenceReplica
 
 
 def _ep(fn):

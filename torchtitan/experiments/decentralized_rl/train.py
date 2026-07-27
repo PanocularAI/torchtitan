@@ -6,14 +6,14 @@
 
 # Copyright (c) Panocular AI.
 #
-# Worker launch entrypoint for every async_rl coordination strategy (the
+# Worker launch entrypoint for every decentralized_rl coordination strategy (the
 # --config picks the strategy; mirrors torchtitan.experiments.rl.train):
 #
-#   python -m torchtitan.experiments.async_rl.train \
-#       --module async_rl --config rl_heloco_qwen3_0_6b
+#   python -m torchtitan.experiments.decentralized_rl.train \
+#       --module decentralized_rl --config rl_heloco_qwen3_0_6b
 #
 # and likewise for rl_diloco_* / rl_async_inference_* configs, or a
-# benchmark config via --module torchtitan.experiments.async_rl.___benchmark
+# benchmark config via --module torchtitan.experiments.decentralized_rl.___benchmark
 # --config bench_local_qwen3_0_6b. Launch plumbing (server/lighthouse/relay
 # addresses, replica ids) comes from the environment -- exported by the
 # ___benchmark/launch_*.sh scripts -- rather than CLI flags, so one launch

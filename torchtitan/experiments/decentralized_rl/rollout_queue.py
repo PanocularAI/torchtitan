@@ -17,7 +17,7 @@
 # checkpoint traffic and rollout traffic never queue behind each other.
 #
 # Run as:
-#   python -m torchtitan.experiments.async_rl.rollout_queue \
+#   python -m torchtitan.experiments.decentralized_rl.rollout_queue \
 #     --port 8767
 
 import argparse

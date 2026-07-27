@@ -6,12 +6,12 @@
 
 # Copyright (c) Panocular AI.
 #
-# async_rl's synchronous RL orchestration base.
+# decentralized_rl's synchronous RL orchestration base.
 #
 # Re-homed from the (now removed) ``torchtitan/experiments/rl/trainer.py`` and
 # re-based onto the current ``rl/`` framework. Upstream replaced that
 # synchronous ``RLTrainer`` with the async off-policy ``Controller``
-# (``rl/controller.py``); async_rl's coordination strategies (HeLoCo, DiLoCo,
+# (``rl/controller.py``); decentralized_rl's coordination strategies (HeLoCo, DiLoCo,
 # pure-learner) instead need a SYNCHRONOUS, windowed outer loop for their
 # federated / local-SGD weight averaging, so this module keeps that
 # orchestration model while consuming the new ``rl/`` components.
@@ -41,7 +41,7 @@ from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.experiments.rl.controller import Controller
 from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
 
-# Re-exported so async_rl's config_registry keeps a single import site for the
+# Re-exported so decentralized_rl's config_registry keeps a single import site for the
 # loss it used to get from ``rl.trainer``. The synchronous framework's GRPO
 # loss now lives in the shared ``rl/losses`` package.
 from torchtitan.experiments.rl.losses import GRPOLoss  # noqa: F401
@@ -81,18 +81,18 @@ async def setup_mesh_elastic_env(mesh: ProcMesh) -> None:
 
 
 class RLTrainer(Controller):
-    """Synchronous RL orchestration base for the async_rl coordinators.
+    """Synchronous RL orchestration base for the decentralized_rl coordinators.
 
     Reuses ``Controller.__init__`` (metrics/renderer/sampling/rollouter/recorder),
     ``Controller.setup_async`` (actor spawn + initial weight sync),
     ``Controller.validate``, and ``Controller.close``. Adds synchronous
     single-step primitives the windowed ``RLControllerMixin`` loop drives; the
-    async ``Controller.run`` is intentionally unused by async_rl.
+    async ``Controller.run`` is intentionally unused by decentralized_rl.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Controller.Config):
-        """async_rl replicas subclass this; it adds no fields of its own."""
+        """decentralized_rl replicas subclass this; it adds no fields of its own."""
 
     def _build_sync_pipeline(self) -> None:
         """Build the rollout→sample→batch pipeline components used by the

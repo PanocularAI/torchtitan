@@ -1,6 +1,6 @@
 # Copyright (c) Panocular AI.
 #
-# On-GPU trainer actors for the async_rl coordination strategies. Each class
+# On-GPU trainer actors for the decentralized_rl coordination strategies. Each class
 # extends torchtitan.experiments.rl's PolicyTrainer (the base
 # forward_backward/optim_step -- stock token-level GRPO loss -- is reused
 # unchanged) with only its strategy's weight-exchange endpoints:

@@ -1,6 +1,6 @@
 # Copyright (c) Panocular AI.
 #
-# Tests for the shared async_rl infrastructure: config_registry.py (model/
+# Tests for the shared decentralized_rl infrastructure: config_registry.py (model/
 # flavor/task/GPU-count resolution and Config validation), controller.py
 # (the window runner and the template train() loop), train.py
 # (PerHostProvisioner), and the package's CPU-light import guarantee.
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from torchtitan.experiments.async_rl.config_registry import (
+from torchtitan.experiments.decentralized_rl.config_registry import (
     _DEFAULT_HF_ASSETS_PATH,
     _MODEL_REGISTRY_BY_MODEL,
     _RENDERER_NAME_BY_MODEL,
@@ -25,9 +25,9 @@ from torchtitan.experiments.async_rl.config_registry import (
     rl_heloco_qwen3_1_7b,
     wrap_replica,
 )
-from torchtitan.experiments.async_rl.controller import RLControllerMixin
-from torchtitan.experiments.async_rl.train import PerHostProvisioner
-from torchtitan.experiments.async_rl.trainers import DiLoCoRLReplica, HeLoCoRLReplica
+from torchtitan.experiments.decentralized_rl.controller import RLControllerMixin
+from torchtitan.experiments.decentralized_rl.train import PerHostProvisioner
+from torchtitan.experiments.decentralized_rl.trainers import DiLoCoRLReplica, HeLoCoRLReplica
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
@@ -70,7 +70,7 @@ def test_new_model_needs_only_registry_dict_entries():
     """The extension contract in practice: register a fake model purely at
     runtime (no filesystem changes) by adding entries to the three module-
     level dicts, and confirm base_rl_config resolves it with no other
-    async_rl code touched. Without the hf_assets_path entry, resolution
+    decentralized_rl code touched. Without the hf_assets_path entry, resolution
     fails with a clear error rather than a silent bogus default."""
     from torchtitan.models.qwen3 import model_registry as qwen3_model_registry
 
@@ -99,7 +99,7 @@ def test_new_model_needs_only_registry_dict_entries():
 def test_tensor_parallel_degree_is_a_real_gpu_count_knob():
     """trainer/generator tensor_parallel_degree must not be hardcoded -- the
     number of GPUs a role needs is a function of these, so a model too big
-    for one GPU per role must be expressible without editing async_rl: as a
+    for one GPU per role must be expressible without editing decentralized_rl: as a
     Python kwarg AND as a CLI overlay on a named --config preset (the real
     ConfigManager path)."""
     from torchtitan.config import ConfigManager
@@ -117,7 +117,7 @@ def test_tensor_parallel_degree_is_a_real_gpu_count_knob():
     cfg = ConfigManager().parse_args(
         [
             "--module",
-            "async_rl",
+            "decentralized_rl",
             "--config",
             "rl_heloco_qwen3_0_6b",
             "--trainer.parallelism.tensor_parallel_degree",
@@ -395,11 +395,11 @@ def test_package_import_stays_cpu_light():
     the __init__.py files re-export nothing)."""
     code = (
         "import sys; "
-        "import torchtitan.experiments.async_rl, "
-        "torchtitan.experiments.async_rl.server, "
-        "torchtitan.experiments.async_rl.relay, "
-        "torchtitan.experiments.async_rl.rollout_queue, "
-        "torchtitan.experiments.async_rl.heloco_client; "
+        "import torchtitan.experiments.decentralized_rl, "
+        "torchtitan.experiments.decentralized_rl.server, "
+        "torchtitan.experiments.decentralized_rl.relay, "
+        "torchtitan.experiments.decentralized_rl.rollout_queue, "
+        "torchtitan.experiments.decentralized_rl.heloco_client; "
         "heavy = [m for m in sys.modules if m == 'vllm' or m == 'monarch' "
         "or m.startswith('torchtitan.experiments.rl.actors')]; "
         "assert not heavy, heavy; print('light')"
@@ -443,7 +443,7 @@ def test_hf_backend_covers_every_strategy():
     the strategies themselves are model-agnostic, so the redirect plus the
     registry tables is the whole integration surface. Resolve each preset and
     check the HF markers that distinguish it from a native config."""
-    from torchtitan.experiments.async_rl.config_registry import (
+    from torchtitan.experiments.decentralized_rl.config_registry import (
         rl_async_inference_hf_qwen3_0_6b,
         rl_async_inference_worker_hf_qwen3_0_6b,
         rl_diloco_hf_qwen3_0_6b,

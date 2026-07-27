@@ -39,7 +39,7 @@ from torch import nn
 from torchft.async_diloco import AsyncDiLoCoServer, DelayedNesterovOptimizer
 from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
 
-from torchtitan.experiments.async_rl.relay import (
+from torchtitan.experiments.decentralized_rl.relay import (
     build_manifest,
     RelayClient,
     shard_state_dict,
@@ -329,11 +329,11 @@ def main() -> None:
     )
     parser.add_argument("--publish_poll_interval_s", type=float, default=1.0)
     # Config selects the model_spec / hf_assets_path (same registry the
-    # replicas use), e.g. --module async_rl --config rl_heloco_qwen3_0_6b.
+    # replicas use), e.g. --module decentralized_rl --config rl_heloco_qwen3_0_6b.
     # --hf_assets_path overrides the preset's default checkpoint dir so the
     # global model loads the exact checkpoint the trainers load (launchers
     # that fetch a HF repo point every role at the fetched dir).
-    parser.add_argument("--module", type=str, default="async_rl")
+    parser.add_argument("--module", type=str, default="decentralized_rl")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--hf_assets_path", type=str, default=None)
     args = parser.parse_args()

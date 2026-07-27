@@ -1,6 +1,6 @@
 # Copyright (c) Panocular AI.
 #
-# The four async_rl coordination strategies' replica controllers, one class
+# The four decentralized_rl coordination strategies' replica controllers, one class
 # per strategy:
 #
 #   - DiLoCoRLReplica: synchronous DiLoCo -- flat per-step RL loop; the sync
@@ -27,22 +27,22 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan.experiments.async_rl.actors import (
+from torchtitan.experiments.decentralized_rl.actors import (
     DiLoCoManagerTrainer,
     HeLoCoPolicyTrainer,
     SnapshotPolicyTrainer,
 )
-from torchtitan.experiments.async_rl.controller import RLControllerMixin
-from torchtitan.experiments.async_rl.heloco_client import HeLoCoRLClient
-from torchtitan.experiments.async_rl.pure_learner import PureLearnerReplica
-from torchtitan.experiments.async_rl.relay import (
+from torchtitan.experiments.decentralized_rl.controller import RLControllerMixin
+from torchtitan.experiments.decentralized_rl.heloco_client import HeLoCoRLClient
+from torchtitan.experiments.decentralized_rl.pure_learner import PureLearnerReplica
+from torchtitan.experiments.decentralized_rl.relay import (
     build_manifest,
     RelayClient,
     shard_state_dict,
 )
-from torchtitan.experiments.async_rl.rl_trainer import RLTrainer
-from torchtitan.experiments.async_rl.rollout_queue import RolloutQueuePopClient
-from torchtitan.experiments.async_rl.server import param_metadata
+from torchtitan.experiments.decentralized_rl.rl_trainer import RLTrainer
+from torchtitan.experiments.decentralized_rl.rollout_queue import RolloutQueuePopClient
+from torchtitan.experiments.decentralized_rl.server import param_metadata
 from torchtitan.experiments.rl import controller as _rl_controller_mod
 
 logger = logging.getLogger(__name__)

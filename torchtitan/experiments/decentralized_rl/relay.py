@@ -24,7 +24,7 @@
 # Needs torch (state-dict tensors) but never the torchtitan training stack or
 # vLLM, so the standalone relay-server process stays CPU-only, like heloco's
 # parameter server (heloco/server.py). Run one relay node per box with:
-#   python -m torchtitan.experiments.async_rl.relay --port 8765
+#   python -m torchtitan.experiments.decentralized_rl.relay --port 8765
 
 import argparse
 import asyncio

@@ -1,9 +1,9 @@
 # Copyright (c) Panocular AI.
 #
-# Config entry points for the async_rl coordination strategies, discoverable
-# by torchtitan's ConfigManager via ``--module async_rl --config
+# Config entry points for the decentralized_rl coordination strategies, discoverable
+# by torchtitan's ConfigManager via ``--module decentralized_rl --config
 # <function_name>`` (or the fully-qualified ``--module
-# torchtitan.experiments.async_rl``).
+# torchtitan.experiments.decentralized_rl``).
 #
 # ``base_rl_config`` + ``wrap_replica`` are the shared building blocks: a plain
 # RLTrainer.Config with the common loss/data choices, and a helper that
@@ -40,14 +40,14 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.experiments import rl as _rl_pkg
-from torchtitan.experiments.async_rl.rl_trainer import GRPOLoss, RLTrainer
-from torchtitan.experiments.async_rl.trainers import (
+from torchtitan.experiments.decentralized_rl.rl_trainer import GRPOLoss, RLTrainer
+from torchtitan.experiments.decentralized_rl.trainers import (
     AsyncInferenceReplica,
     DiLoCoRLReplica,
     HeLoCoAsyncInferenceReplica,
     HeLoCoRLReplica,
 )
-from torchtitan.experiments.async_rl.worker import AsyncInferenceWorker
+from torchtitan.experiments.decentralized_rl.worker import AsyncInferenceWorker
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
@@ -135,7 +135,7 @@ def base_rl_config(
     coexist without vLLM grabbing ~90% of each GPU for KV cache.
     trainer/generator tensor_parallel_degree default to 1; raise either for a
     model too large to fit one GPU per role -- the GPU mesh spawned by
-    torchtitan.experiments.async_rl.train (and therefore the GPU count a
+    torchtitan.experiments.decentralized_rl.train (and therefore the GPU count a
     launch script needs to provision) scales with these automatically.
     ``rollouter`` is the task bundle (dataset + reward rubric + environment, a
     ``Rollouter.Config`` subclass instance); it defaults to the alphabet-sort
@@ -169,7 +169,7 @@ def base_rl_config(
             num_training_steps=10,
             num_prompts_per_train_step=5,
             num_samples_per_prompt=8,
-            # async_rl replicas drive a SYNCHRONOUS windowed loop
+            # decentralized_rl replicas drive a SYNCHRONOUS windowed loop
             # (RLControllerMixin), so no off-policy buffering: each step trains
             # on rollouts generated under the just-published policy.
             max_offpolicy_steps=0,
@@ -192,7 +192,7 @@ def base_rl_config(
         trainer=PolicyTrainer.Config(
             # Structured-logging JSONL traces are a debugging aid that costs
             # real disk (hundreds of MB/hour per actor); off by default here
-            # since async_rl runs are typically many-hour, many-actor swarms.
+            # since decentralized_rl runs are typically many-hour, many-actor swarms.
             debug=DebugConfig(enable_structured_logging=False),
             optimizer=default_adamw(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(
@@ -369,7 +369,7 @@ def rl_heloco_async_inference_qwen3_0_6b(
     Each trainer pops rollouts from that queue, trains, and pushes its
     pseudo-gradient to the HeLoCo parameter server (no barrier); any trainer
     may consume any worker's rollouts. The hub
-    (torchtitan.experiments.async_rl.server)
+    (torchtitan.experiments.decentralized_rl.server)
     publishes the CURRENT global theta (the consensus weights, not any one
     trainer's copy) to a relay process for the generator pool to pull. Start
     the coordination plane first: the relay,
@@ -562,8 +562,8 @@ def rl_async_inference_qwen3_0_6b(
     relay_addresses every publish_every windows (SHARDCAST-style) -- plus an
     initial publish at startup so the workers can bootstrap. Both addresses
     are required -- start the servers first:
-    ``python -m torchtitan.experiments.async_rl.relay`` and
-    ``python -m torchtitan.experiments.async_rl.rollout_queue``.
+    ``python -m torchtitan.experiments.decentralized_rl.relay`` and
+    ``python -m torchtitan.experiments.decentralized_rl.rollout_queue``.
     Workers push rollouts to the same queue
     ($ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
     ($ASYNC_INFERENCE_RELAY_ADDRS).

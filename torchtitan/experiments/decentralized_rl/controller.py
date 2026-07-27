@@ -6,7 +6,7 @@
 
 # Copyright (c) Panocular AI.
 #
-# Shared controller machinery for the async_rl coordination strategies.
+# Shared controller machinery for the decentralized_rl coordination strategies.
 #
 # RLControllerMixin is everything the coordinators (heloco / diloco /
 # async_inference) have in common, in three layers:

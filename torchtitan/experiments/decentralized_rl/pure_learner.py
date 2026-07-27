@@ -35,8 +35,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from torchtitan.experiments.async_rl.controller import RLControllerMixin
-from torchtitan.experiments.async_rl.rl_trainer import RLTrainer, setup_mesh_elastic_env
+from torchtitan.experiments.decentralized_rl.controller import RLControllerMixin
+from torchtitan.experiments.decentralized_rl.rl_trainer import RLTrainer, setup_mesh_elastic_env
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         num_generators: int = 0
         """Always 0: a pure learner runs no local vLLM (generation is fully
         decoupled onto the remote worker pool). Kept as an explicit field so
-        ``async_rl/train.py`` provisions only the trainer GPU and spawns no
+        ``decentralized_rl/train.py`` provisions only the trainer GPU and spawns no
         generator meshes."""
         max_staleness: int = 4
         """Maximum version lag (in the subclass's staleness-reference space) of
