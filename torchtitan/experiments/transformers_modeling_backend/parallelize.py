@@ -85,6 +85,7 @@ def parallelize_hf_transformers(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
 
@@ -204,27 +205,32 @@ def parallelize_hf_transformers(
     if model_compile_enabled:
         apply_compile(model, compile_config)
 
-    dp_mesh_dim_names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
+    # skip_dp: inference hosts (the RL vLLM wrapper) parallelize without FSDP,
+    # mirroring parallelize_qwen3's kwarg of the same name.
+    if not skip_dp:
+        dp_mesh_dim_names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+        )
 
-    edp_mesh_names = (
-        ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
-    )
-    edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+        edp_mesh_names = (
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
+        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
-    apply_fsdp(
-        model,
-        parallel_dims.get_mesh(dp_mesh_dim_names),
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
-        ep_degree=parallel_dims.ep,
-        dp_mod_ep_mesh=edp_mesh,
-    )
+        apply_fsdp(
+            model,
+            parallel_dims.get_mesh(dp_mesh_dim_names),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+            ep_degree=parallel_dims.ep,
+            dp_mod_ep_mesh=edp_mesh,
+        )
 
     if training.enable_cpu_offload:
         logger.info("Applied CPU Offloading to the model")
