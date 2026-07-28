@@ -150,6 +150,16 @@ def _patch_vllm_all_reduce() -> None:
     )
 
 
+def _is_hf_model_config(model_config) -> bool:
+    """True when the ModelSpec carries the HF transformers backend's config
+    (a PretrainedConfig bridge) instead of a native torchtitan config tree."""
+    try:
+        from transformers.configuration_utils import PretrainedConfig
+    except ImportError:
+        return False
+    return isinstance(model_config, PretrainedConfig)
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -194,7 +204,12 @@ class VLLMModelWrapper(Module):
         self.state_dict_adapter = model_spec.state_dict_adapter
         self.parallelize_fn = model_spec.parallelize_fn
 
-        # Replace inner_attention with VLLMAttentionWrapper in config
+        # HF transformers backend spec: the model config IS a PretrainedConfig
+        # (already resolved by its RL registry). No native layer tree to
+        # rewrite — attention routes through vLLM paged attention via the
+        # transformers AttentionInterface instead (see _init_hf_attention).
+        self._is_hf_backend = _is_hf_model_config(model_spec.model)
+
         model_config = model_spec.model
         attn_config = model_config.layers[0].attention
         n_heads = attn_config.n_heads
@@ -204,27 +219,43 @@ class VLLMModelWrapper(Module):
             if attn_config.head_dim is not None
             else model_config.dim // n_heads
         )
-        new_layers = []
-        for layer_cfg in model_config.layers:
-            vllm_backend = VLLMAttentionWrapper.Config(
-                hidden_size=model_config.dim,
-                num_heads=n_heads,
-                num_kv_heads=n_kv_heads,
+        if self._is_hf_backend:
+            if parallelism.tensor_parallel_degree != 1:
+                raise NotImplementedError(
+                    "HF-backend generator TP>1 is not validated yet; "
+                    "use generator_tensor_parallel_degree=1"
+                )
+            self.config = model_config
+            self._init_hf_attention(
+                vllm_config,
+                n_layers=model_config.num_hidden_layers,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
                 head_dim=head_dim,
-                sliding_window_size=getattr(
-                    layer_cfg.attention, "sliding_window_size", None
-                ),
             )
-            new_layers.append(
-                dataclasses.replace(
-                    layer_cfg,
-                    attention=dataclasses.replace(
-                        layer_cfg.attention, inner_attention=vllm_backend
+        else:
+            # Replace inner_attention with VLLMAttentionWrapper in config
+            new_layers = []
+            for layer_cfg in model_config.layers:
+                vllm_backend = VLLMAttentionWrapper.Config(
+                    hidden_size=model_config.dim,
+                    num_heads=n_heads,
+                    num_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                    sliding_window_size=getattr(
+                        layer_cfg.attention, "sliding_window_size", None
                     ),
                 )
-            )
-        self.config = dataclasses.replace(model_config, layers=new_layers)
-        logger.debug(f"Creating model with config: {self.config.to_dict()}")
+                new_layers.append(
+                    dataclasses.replace(
+                        layer_cfg,
+                        attention=dataclasses.replace(
+                            layer_cfg.attention, inner_attention=vllm_backend
+                        ),
+                    )
+                )
+            self.config = dataclasses.replace(model_config, layers=new_layers)
+            logger.debug(f"Creating model with config: {self.config.to_dict()}")
 
         # Translate the inference parallelism into torchtitan's full
         # ParallelismConfig that ParallelDims / parallelize_fn consume.
@@ -255,34 +286,61 @@ class VLLMModelWrapper(Module):
         # module replacement.
         # Provides the generic config shape (has .parallelism) so
         # update_from_config can extract parallelism uniformly.
-        @dataclass(kw_only=True, slots=True)
-        class _InferenceConfig:
-            parallelism: ParallelismConfig
-            # TODO: Replace this synthetic TrainingConfig with an inference-specific
-            # capacity input once update_from_config accepts the runtime token bound.
-            training: TrainingConfig
+        # HF-backend configs arrive fully resolved from their RL registry —
+        # re-resolving here would just re-read the checkpoint's config.json.
+        if not self._is_hf_backend:
 
-        self.config.update_from_config(
-            config=_InferenceConfig(
-                parallelism=training_parallelism,
-                training=TrainingConfig(
-                    local_batch_size=1,
-                    # Use the scheduler bound as a synthetic sequence length solely
-                    # to derive the per-rank EP buffer capacity.
-                    seq_len=vllm_config.scheduler_config.max_num_batched_tokens,
-                ),
+            @dataclass(kw_only=True, slots=True)
+            class _InferenceConfig:
+                parallelism: ParallelismConfig
+                # TODO: Replace this synthetic TrainingConfig with an inference-specific
+                # capacity input once update_from_config accepts the runtime token bound.
+                training: TrainingConfig
+
+            self.config.update_from_config(
+                config=_InferenceConfig(
+                    parallelism=training_parallelism,
+                    training=TrainingConfig(
+                        local_batch_size=1,
+                        # Use the scheduler bound as a synthetic sequence length solely
+                        # to derive the per-rank EP buffer capacity.
+                        seq_len=vllm_config.scheduler_config.max_num_batched_tokens,
+                    ),
+                )
             )
-        )
 
-        # Apply config overrides (e.g. the fused gate+up SwiGLU) after
-        # update_from_config (which fills the sharding the override factories
-        # read) and before build
-        if override.imports:
-            apply_overrides(override, self.config)
+            # Apply config overrides (e.g. the fused gate+up SwiGLU) after
+            # update_from_config (which fills the sharding the override factories
+            # read) and before build
+            if override.imports:
+                apply_overrides(override, self.config)
 
         # Build model on meta device to avoid allocating full model on every GPU
         with torch.device("meta"):
             self.model = self.config.build()
+
+        # Per-layer torch.compile (fullgraph) is incompatible with the HF
+        # transformers AttentionInterface dispatch: every decoder layer shares
+        # one forward code object but selects its own vllm.Attention via
+        # attention_instances[module.layer_idx] and reshapes hidden_states to
+        # concrete sizes, so dynamo specializes per (layer_idx x shape) and
+        # blows past any fullgraph recompile budget (native models avoid this —
+        # their attention is one opaque submodule call with symbolic shapes).
+        # CUDA-graph capture (generator-side, vLLM-owned) is unaffected and
+        # provides the generator speedup; per-layer compile still applies on
+        # the trainer side, whose varlen attention is a singleton (no per-layer
+        # dict dispatch). So force generator compile off for the HF backend.
+        if self._is_hf_backend and compile_config.enable:
+            compile_config = dataclasses.replace(compile_config, enable=False)
+
+        # With TP, collectives may return AsyncCollectiveTensor (overlap
+        # path) or plain Tensor (sync path) depending on timing.  Dynamo
+        # specializes on tensor type, so each switch triggers a
+        # recompile.  Because of this, the default recompile_limit (8) is
+        # too low; exceeding it fails under
+        # fullgraph=True so set to 10 for now
+        if compile_config.enable:
+            torch._dynamo.config.recompile_limit = 10
 
         self.model = self.parallelize_fn(
             model=self.model,
@@ -388,16 +446,30 @@ class VLLMModelWrapper(Module):
             # vLLM: [total_tokens] -> TorchTitan: [batch_size, seq_len]
             tokens_2d = input_ids.unsqueeze(0)
 
-            # Get embeddings
-            h = self.model.tok_embeddings(tokens_2d)
-
             positions = positions.unsqueeze(0)
 
-            # Pass through transformer layers
-            for layer in self.model.layers.values():
-                h = layer(h, attention_masks=None, positions=positions)
+            if self._is_hf_backend:
+                # HF base model (<X>Model) with paged attention injected via
+                # **kwargs — HF rotary derives cos/sin from position_ids per
+                # token, correct for vLLM's flat varlen positions. Includes the
+                # final norm.
+                base_model = self.model.model.model
+                out = base_model(
+                    input_ids=tokens_2d,
+                    position_ids=positions,
+                    use_cache=False,
+                    attention_instances=self._attention_instances,
+                )
+                h = out.last_hidden_state
+            else:
+                # Get embeddings
+                h = self.model.tok_embeddings(tokens_2d)
 
-            h = self.model.norm(h)
+                # Pass through transformer layers
+                for layer in self.model.layers.values():
+                    h = layer(h, attention_masks=None, positions=positions)
+
+                h = self.model.norm(h)
         # Inference disables sequence parallelism, so final hidden states should
         # already be replicated before returning to vLLM.
         if isinstance(h, DTensor):
@@ -459,6 +531,38 @@ class VLLMModelWrapper(Module):
                     logits = logits.redistribute(placements=placements).to_local()
 
         return logits
+
+    def _init_hf_attention(
+        self, vllm_config, *, n_layers: int, n_heads: int, n_kv_heads: int, head_dim: int
+    ) -> None:
+        """HF backend: per-layer vllm.Attention instances (paged KV cache),
+        delivered to every HF attention module through forward **kwargs — the
+        same mechanism vLLM's own transformers backend uses. Kept in a plain
+        dict so state_dict stays identical to the trainer's (weight sync)."""
+        from torchtitan.experiments.rl.models.attention import (
+            HF_PAGED_IMPL,
+            register_hf_paged_attention,
+        )
+        from vllm.model_executor.layers.attention import Attention
+
+        register_hf_paged_attention()
+        # Both spellings: transformers reads _attn_implementation; the backend's
+        # Config code reads attn_implementation.
+        self.config._attn_implementation = HF_PAGED_IMPL
+        self.config.attn_implementation = HF_PAGED_IMPL
+        self.config._titan_injected_model_args["attn_implementation"] = HF_PAGED_IMPL
+        cache_config = getattr(vllm_config, "cache_config", None)
+        self._attention_instances = {
+            i: Attention(
+                num_heads=n_heads,
+                head_size=head_dim,
+                scale=head_dim**-0.5,
+                num_kv_heads=n_kv_heads,
+                cache_config=cache_config,
+                prefix=f"model.layers.{i}.self_attn.attn",
+            )
+            for i in range(n_layers)
+        }
 
     def _maybe_initial_load_weights(self) -> None:
         """Load initial HF weights via CheckpointManager.

@@ -378,3 +378,47 @@ class VLLMAttentionWrapper(Module):
         out_BLNH = out_TD.view(batch_size, seq_len, -1, head_dim)
 
         return out_BLNH
+
+
+# --------------------------------------------------------------------------- #
+# HF transformers backend: route HF attention modules through vLLM paged
+# attention. Mirrors vLLM's own transformers-backend mechanism: a transformers
+# AttentionInterface entry that receives per-layer ``vllm.Attention`` instances
+# via forward **kwargs (``attention_instances``). The name stays out of
+# transformers' mask registry so create_causal_mask returns None — the paged
+# backend owns causality and the KV cache.
+# --------------------------------------------------------------------------- #
+HF_PAGED_IMPL = "vllm_paged_torchtitan"
+
+
+def hf_paged_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    scaling=None,
+    attention_instances=None,
+    **kwargs,
+):
+    attn = attention_instances[module.layer_idx]
+    if scaling is not None and attn.impl.scale != float(scaling):
+        attn.impl.scale = float(scaling)
+    # HF hands [B(=1), H, S, D]; the varlen impl consumes tensors AS GIVEN, so
+    # match VLLMAttentionWrapper's layout exactly: [num_tokens, heads, head_dim].
+    num_tokens = query.shape[-2]
+    head_dim = query.shape[-1]
+    q = query.transpose(1, 2).reshape(num_tokens, -1, head_dim)
+    k = key.transpose(1, 2).reshape(num_tokens, -1, head_dim)
+    v = value.transpose(1, 2).reshape(num_tokens, -1, head_dim)
+    out = attn(q, k, v)
+    out = out.narrow(0, 0, num_tokens)  # trim vLLM's even-token padding
+    # Callers reshape(*input_shape, -1): [num_tokens, ...] flattens to [1, S, H*D].
+    return out, None
+
+
+def register_hf_paged_attention() -> None:
+    """Idempotently register HF_PAGED_IMPL with transformers."""
+    from transformers.modeling_utils import AttentionInterface
+
+    AttentionInterface._global_mapping[HF_PAGED_IMPL] = hf_paged_attention_forward

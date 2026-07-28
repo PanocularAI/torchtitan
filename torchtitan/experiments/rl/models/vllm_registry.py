@@ -129,6 +129,25 @@ def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
          class, no KV transfer, no MFU metrics, no multimodal).
     """
     cfg = spec.model
+    # HF transformers backend: read the checkpoint's own config.json (the
+    # backend Config's resolved values live as instance attributes that
+    # transformers-5's dataclass to_dict() does NOT serialize — a dict built
+    # from it is all Nones, and vLLM would size sampler buffers with
+    # vocab_size=None). Only override identity + the titan-owned fields.
+    from torchtitan.experiments.rl.models.vllm_wrapper import _is_hf_model_config
+
+    if _is_hf_model_config(cfg):
+        from transformers import AutoConfig
+
+        hf_dict = AutoConfig.from_pretrained(cfg.hf_model).to_dict()
+        hf_dict["architectures"] = [VLLM_MODEL_NAME]
+        hf_dict["model_type"] = "torchtitan"
+        # titan semantics: max_seq_len bounds the engine (max_model_len reads it)
+        hf_dict["max_position_embeddings"] = cfg.max_seq_len
+        # both RL roles host the untied model (see the backend's RL registry)
+        hf_dict["tie_word_embeddings"] = False
+        return hf_dict
+
     if not cfg.layers:
         raise ValueError(f"ModelSpec {spec.name!r} has no layers")
     # Some models mix dense and MoE layers (e.g. deepseek_v3 has dense
