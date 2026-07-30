@@ -38,6 +38,7 @@ import socket
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import aiohttp
 import torch
@@ -87,6 +88,7 @@ def build_server(
     momentum: float = 0.9,
     nesterov_period: int = 2,
     port: int = 0,
+    rho: float | None = None,
     dylu_H: int = 0,
     grace_period: float = 0.0,
     heartbeat_timeout: float = 15.0,
@@ -96,17 +98,24 @@ def build_server(
 
     Both outer optimizers share the same wire protocol, so workers are identical
     regardless of choice:
-      - ``heloco``: HeLoCo — direction-aware, heterogeneity-aware staleness
-        correction of each pseudo-gradient.
+      - ``heloco``: HeLoCo -- direction-aware, heterogeneity-aware staleness
+        correction of each pseudo-gradient. ``rho`` is its arrival weight
+        (None: torchft's default of 1.0; the paper recommends
+        1/sqrt(num_workers)).
       - ``diloco``: plain async DiLoCo with Delayed-Nesterov momentum
         (``nesterov_period`` controls how often the momentum correction applies;
         set >= number of workers).
     """
     model = model.to(device="cpu", dtype=torch.float32)
+    extra_kwargs = {}
     if outer_method == "heloco":
         outer = HeLoCoOptimizer(model.parameters(), lr=lr, momentum=momentum)
         server_cls = HeLoCoServer
+        if rho is not None:
+            extra_kwargs["rho"] = rho
     elif outer_method == "diloco":
+        if rho is not None:
+            raise ValueError("rho is HeLoCo's arrival weight; diloco has none")
         outer = DelayedNesterovOptimizer(
             model.parameters(),
             lr=lr,
@@ -125,7 +134,22 @@ def build_server(
         grace_period=grace_period,
         heartbeat_timeout=heartbeat_timeout,
         should_quantize=should_quantize,
+        **extra_kwargs,
     )
+
+
+# Files that mean "this directory holds model weights" (HF safetensors, a
+# sharded index, or a torch.distributed.checkpoint dir).
+_WEIGHT_GLOBS = ("*.safetensors", "*.safetensors.index.json", ".metadata")
+
+
+def _has_weights(assets_path: str | None) -> bool:
+    if not assets_path:
+        return False
+    d = Path(assets_path)
+    if not d.is_dir():
+        return False
+    return any(next(d.glob(g), None) is not None for g in _WEIGHT_GLOBS)
 
 
 def build_global_model(model_spec, hf_assets_path: str) -> nn.Module:
@@ -152,12 +176,20 @@ def build_global_model(model_spec, hf_assets_path: str) -> nn.Module:
         model.init_weights(buffer_device=None)
 
     if model_spec.state_dict_adapter is not None:
-        import os
-
         import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.api import CheckpointException
 
-        adapter = model_spec.state_dict_adapter(model_spec.model, hf_assets_path)
-        if os.path.isdir(hf_assets_path):
+        # Load only when the dir actually HOLDS weights: native presets point
+        # hf_assets_path at a tokenizer-only assets dir, and attempting a
+        # checkpoint load there raises CheckpointException ("Missing key in
+        # checkpoint state_dict: ...") -- which derives from BaseException, so
+        # it must also be caught explicitly below. init_weights is the correct
+        # start for from-scratch pretraining; a fine-tune must NOT silently
+        # start from random init, hence the distinct log lines.
+        if _has_weights(hf_assets_path):
+            adapter = model_spec.state_dict_adapter(
+                model_spec.model, hf_assets_path
+            )
             try:
                 storage_reader = adapter.get_hf_storage_reader(hf_assets_path)
                 hf_sd = adapter.to_hf(model.state_dict())
@@ -169,16 +201,25 @@ def build_global_model(model_spec, hf_assets_path: str) -> nn.Module:
                 logger.info(
                     "global model: loaded HF checkpoint from %s", hf_assets_path
                 )
-            except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
+            except (
+                FileNotFoundError,
+                KeyError,
+                ValueError,
+                RuntimeError,
+                CheckpointException,
+            ) as exc:
                 logger.warning(
-                    "global model: no usable HF checkpoint at %s (%s); "
-                    "using init_weights (fine for debug)",
+                    "global model: no usable HF checkpoint at %s (%s: %s); "
+                    "using init_weights -- correct for from-scratch pretraining, "
+                    "WRONG if you meant to fine-tune from those weights",
                     hf_assets_path,
+                    type(exc).__name__,
                     exc,
                 )
         else:
-            logger.warning(
-                "global model: hf_assets_path %s not a dir; using init_weights",
+            logger.info(
+                "global model: no weights at hf_assets_path=%r; using "
+                "init_weights (correct for from-scratch pretraining)",
                 hf_assets_path,
             )
 
@@ -510,6 +551,13 @@ def main() -> None:
         help="diloco only: pushes between momentum corrections (>= #workers)",
     )
     parser.add_argument("--port", type=int, default=29520, help="HeLoCo /sync port")
+    parser.add_argument(
+        "--rho",
+        type=float,
+        default=None,
+        help="heloco arrival weight (default: torchft's 1.0; the paper "
+        "recommends 1/sqrt(num_workers))",
+    )
     parser.add_argument("--dylu_H", type=int, default=0)
     parser.add_argument("--grace_period", type=float, default=0.0)
     parser.add_argument(
@@ -571,6 +619,7 @@ def main() -> None:
         momentum=args.momentum,
         nesterov_period=args.nesterov_period,
         port=args.port,
+        rho=args.rho,
         dylu_H=args.dylu_H,
         grace_period=args.grace_period,
         heartbeat_timeout=args.heartbeat_timeout,
