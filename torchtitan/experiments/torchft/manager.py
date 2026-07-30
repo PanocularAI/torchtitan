@@ -269,8 +269,91 @@ def maybe_semi_sync_training(
                 optimizer=optimizer,
                 sync_every=extend_ft_config.sync_steps,
             )
+        elif semi_sync_method.lower() == "heloco":
+            # The parameter-server member of the family: each worker POSTs
+            # its pseudo-gradient to torchft's HeLoCoServer over HTTP (the
+            # decentralized_rl parameter_server process) and pulls back the
+            # look-ahead global params -- no cross-worker collective. The FT
+            # manager (and its lighthouse) stays required regardless: the
+            # trainer derives its dataloader shard from it. The server's
+            # URLs are runtime addresses launchers export from the PS
+            # coordinator's stdout, hence env rather than config fields.
+            import os
+
+            from torchft.async_diloco import AsyncDiLoCo
+
+            server_address = os.environ.get("DILOCO_SERVER_ADDR", "").strip()
+            if not server_address:
+                raise RuntimeError(
+                    "semi_sync_method='heloco' needs the parameter server's "
+                    "/sync URL in $DILOCO_SERVER_ADDR (launchers export it "
+                    "from the run's PS coordinator); got an empty value. Use "
+                    "semi_sync_method='diloco' for lighthouse-coordinated "
+                    "training with no parameter server."
+                )
+            heartbeat = os.environ.get("DILOCO_HB_ADDR", "").strip() or None
+            logger.info(
+                f"heloco worker: syncing to {server_address} every "
+                f"{extend_ft_config.sync_steps} steps "
+                f"(heartbeat: {heartbeat or 'disabled'})"
+            )
+            return AsyncDiLoCo(
+                server_address=server_address,
+                # torchtitan builds models through FSDP2 (DTensor params even
+                # at world size 1); torchft is DTensor-agnostic, so hand it
+                # the plain-tensor view of this model (see _PlainParamsView).
+                model=_PlainParamsView(model),
+                inner_optimizer=optimizer,
+                sync_every=extend_ft_config.sync_steps,
+                fragment_update_alpha=extend_ft_config.fragment_update_alpha,
+                heartbeat_address=heartbeat,
+                should_quantize=extend_ft_config.should_quantize,
+            )
         else:
             raise ValueError(
-                f"Unknown training method: {semi_sync_method}, only 'diloco' and 'local_sgd' are supported."
+                f"Unknown training method: {semi_sync_method}, only 'diloco', 'local_sgd' and 'heloco' are supported."
             )
     return nullcontext()
+
+
+class _PlainParamsView:
+    """FSDP2 -> torchft adapter: a model's parameters as PLAIN tensors.
+
+    torchft's AsyncDiLoCo does ordinary tensor arithmetic on parameters
+    (``copy_``, subtraction, ``torch.cat``), which rejects the DTensors
+    torchtitan's FSDP2 build yields. It reaches the model through exactly one
+    method -- ``named_parameters()`` -- so unwrapping there is the entire
+    adaptation. ``to_local()`` returns a view SHARING STORAGE with the
+    DTensor, so AsyncDiLoCo's in-place adoption of pulled global params
+    writes straight into the real model.
+
+    Valid only while each parameter's local tensor IS the whole parameter
+    (one-device or fully replicated mesh). For a sharded parameter,
+    ``to_local()`` is just this rank's slice, and pushing it as though it
+    were the whole tensor would corrupt the sync silently -- that case raises.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        self._model = model
+
+    def named_parameters(self):
+        from torch.distributed.tensor import DTensor
+
+        for name, p in self._model.named_parameters():
+            if not isinstance(p, DTensor):
+                yield name, p
+                continue
+            local = p.to_local()
+            if tuple(local.shape) != tuple(p.shape):
+                raise RuntimeError(
+                    f"parameter {name!r} is SHARDED across the replica "
+                    f"(local {tuple(local.shape)} vs global "
+                    f"{tuple(p.shape)}), which semi_sync_method='heloco' "
+                    "cannot sync: the parameter server would receive this "
+                    "rank's shard as if it were the whole tensor. Use "
+                    "single-device replicas (scale out with more replicas), "
+                    "or diloco/local_sgd, whose lighthouse path handles "
+                    "sharded models."
+                )
+            yield name, local
+
