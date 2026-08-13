@@ -16,6 +16,33 @@ import tyro
 from torchtitan.tools.logging import logger
 
 
+def _import_registry(candidate: str):
+    """Import `candidate`, returning None if the module simply does not exist.
+
+    An ImportError raised from INSIDE the module — a moved torchtitan symbol, a
+    missing third-party dep, a typo in someone's config_registry — is RE-RAISED
+    instead of being reported as "module not found". Swallowing it made every
+    BROKEN registry look like a MISSING one, sending the reader off to check
+    --module spelling while the real traceback (the failing import inside their
+    own file) was discarded. With user-supplied model code overlaid into the
+    engine, that misdirection is the most common first failure.
+
+    Discriminator: a ModuleNotFoundError whose missing name IS the candidate (or a
+    parent package of it) means the candidate isn't there — keep searching. Any
+    other missing name came from the module's own imports.
+    """
+    try:
+        return importlib.import_module(candidate)
+    except ModuleNotFoundError as e:
+        missing = e.name or ""
+        if candidate == missing or candidate.startswith(missing + "."):
+            return None
+        logger.error(
+            "importing %s failed on its own import of %r", candidate, missing
+        )
+        raise
+
+
 class ConfigManager:
     """
     Parses, merges, and validates a config from --module/--config and CLI sources.
@@ -111,11 +138,9 @@ class ConfigManager:
                 "torchtitan.experiments.rl.examples",
             ):
                 module_path = f"{prefix}.{module_name}.config_registry"
-                try:
-                    module = importlib.import_module(module_path)
+                module = _import_registry(module_path)
+                if module is not None:
                     break
-                except ImportError:
-                    continue
             if module is None:
                 raise ImportError(
                     f"Cannot import config_registry for module '{module_name}' "
@@ -127,12 +152,10 @@ class ConfigManager:
             # then fall back to importing directly (e.g., torchtitan.models.llama3
             # -> torchtitan.models.llama3.config_registry)
             for candidate in (f"{module_name}.config_registry", module_name):
-                try:
-                    module = importlib.import_module(candidate)
+                module = _import_registry(candidate)
+                if module is not None:
                     module_path = candidate
                     break
-                except ImportError:
-                    continue
             if module is None:
                 raise ImportError(
                     f"Cannot import module '{module_name}' or "

@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -371,6 +373,27 @@ class TestConfigManager(unittest.TestCase):
                     "foo",
                 ]
             )
+
+    def test_broken_registry_reports_its_own_failing_import(self):
+        """A registry that EXISTS but fails to import must surface its own cause, not
+        be reported as a missing module. Swallowing this made every broken registry
+        (a moved symbol, a missing dep, a typo in overlaid user model code) look like
+        a --module spelling mistake."""
+        root = pathlib.Path(tempfile.mkdtemp())
+        pkg = root / "brokenmodels" / "thing"
+        pkg.mkdir(parents=True)
+        (root / "brokenmodels" / "__init__.py").write_text("")
+        (pkg / "__init__.py").write_text("")
+        (pkg / "config_registry.py").write_text("import totally_absent_dep\n")
+
+        sys.path.insert(0, str(root))
+        try:
+            with pytest.raises(ModuleNotFoundError, match="totally_absent_dep"):
+                ConfigManager().parse_args(
+                    ["--module", "brokenmodels.thing", "--config", "foo"]
+                )
+        finally:
+            sys.path.remove(str(root))
 
 
 if __name__ == "__main__":
