@@ -93,6 +93,7 @@ def build_server(
     grace_period: float = 0.0,
     heartbeat_timeout: float = 15.0,
     should_quantize: bool = False,
+    max_sessions: int | None = None,
 ):
     """Build the parameter server around an unsharded CPU model.
 
@@ -108,6 +109,15 @@ def build_server(
     """
     model = model.to(device="cpu", dtype=torch.float32)
     extra_kwargs = {}
+    # Concurrency cap = MEMORY cap. Each in-flight push materializes
+    # whole-model-sized buffers on this CPU process (2.2 GiB per copy at 0.6B,
+    # ~30 GiB at 8B), so peak RSS scales with concurrent workers, not just model
+    # size — two workers OOM'd a 32 GiB cloud hub. Refused pushes come back 503
+    # and the worker RETRIES the same push (torchft busy_retries), so capping
+    # costs bounded merge delay — staleness HeLoCo absorbs — not lost windows.
+    # None keeps torchft's default (128), i.e. effectively uncapped.
+    if max_sessions is not None:
+        extra_kwargs["max_sessions"] = max_sessions
     if outer_method == "heloco":
         outer = HeLoCoOptimizer(model.parameters(), lr=lr, momentum=momentum)
         server_cls = HeLoCoServer
@@ -567,6 +577,16 @@ def main() -> None:
         help="seconds without a heartbeat before a worker is dropped",
     )
     parser.add_argument("--should_quantize", action="store_true")
+    parser.add_argument(
+        "--max_sessions",
+        type=int,
+        default=None,
+        help="cap concurrently-processing sync sessions (default: torchft's 128, "
+        "effectively uncapped). This is the server's MEMORY knob: each in-flight "
+        "push holds whole-model-sized buffers, so peak RSS scales with concurrent "
+        "workers. Excess pushes get 503 + Retry-After and the worker retries the "
+        "same push, so the cost is bounded delay, not lost training",
+    )
     # Relay publishing (the heloco_async_inference hub role). Leave
     # --relay_addr unset for plain HeLoCo/DiLoCo (no generator pool to feed).
     parser.add_argument(
@@ -624,6 +644,7 @@ def main() -> None:
         grace_period=args.grace_period,
         heartbeat_timeout=args.heartbeat_timeout,
         should_quantize=args.should_quantize,
+        max_sessions=args.max_sessions,
     )
 
     # Replicas read these from the environment (launchers export them).
