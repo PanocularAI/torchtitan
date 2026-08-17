@@ -45,6 +45,7 @@ import torch
 from torch import nn
 
 from torchft.async_diloco import (
+    _fragment_bounds,
     AsyncDiLoCo,
     AsyncDiLoCoServer,
     DelayedNesterovOptimizer,
@@ -94,6 +95,7 @@ def build_server(
     heartbeat_timeout: float = 15.0,
     should_quantize: bool = False,
     max_sessions: int | None = None,
+    num_fragments: int | None = None,
 ):
     """Build the parameter server around an unsharded CPU model.
 
@@ -118,6 +120,18 @@ def build_server(
     # None keeps torchft's default (128), i.e. effectively uncapped.
     if max_sessions is not None:
         extra_kwargs["max_sessions"] = max_sessions
+    # Fragment-wise sync (Decoupled DiLoCo): heloco only. DiLoCo's
+    # DelayedNesterovOptimizer counts pushes GLOBALLY for its momentum
+    # milestones, so per-fragment pushes would corrupt its schedule; HeLoCo's
+    # momentum, block correction and look-ahead are all per-parameter and
+    # commit fragments exactly (see torchft.async_diloco._fragment_bounds).
+    if num_fragments is not None and num_fragments > 1:
+        if outer_method != "heloco":
+            raise ValueError(
+                "num_fragments > 1 requires outer_method 'heloco' "
+                "(diloco's DelayedNesterov milestone count is whole-model)"
+            )
+        extra_kwargs["num_fragments"] = num_fragments
     if outer_method == "heloco":
         outer = HeLoCoOptimizer(model.parameters(), lr=lr, momentum=momentum)
         server_cls = HeLoCoServer
@@ -394,17 +408,22 @@ class HeLoCoRLClient(AsyncDiLoCo):
         heartbeat_interval: float = 2.0,
         should_quantize: bool = False,
         sync_timeout: float = 60.0,
+        num_fragments: int = 1,
+        busy_retries: int = 10,
     ) -> None:
         # Intentionally do NOT call super().__init__: it requires an nn.Module
         # and an inner optimizer, neither of which exists here. The parent
         # methods used are _session_roundtrip (needs _server_address,
         # _baseline_revision, _quantize, _param_numels, _total_numel,
-        # _sync_timeout) and _run_heartbeat (needs _heartbeat_url/_stop/
-        # _interval), whose state is set up below; everything else is
-        # overridden.
+        # _sync_timeout, and the fragment tables) and _run_heartbeat (needs
+        # _heartbeat_url/_stop/_interval), whose state is set up below;
+        # everything else is overridden.
         self._server_address = server_address
         self._quantize = should_quantize
         self._sync_timeout = sync_timeout
+        # 503 (all max_sessions slots busy) re-sends the SAME push after
+        # Retry-After — required by _session_roundtrip on every roundtrip.
+        self._busy_retries: int = busy_retries
 
         self._param_names: list[str] = list(param_names)
         self._param_shapes: dict[str, torch.Size] = dict(param_shapes)
@@ -418,6 +437,15 @@ class HeLoCoRLClient(AsyncDiLoCo):
             self._global_params[name].numel() for name in self._param_names
         ]
         self._total_numel: int = sum(self._param_numels)
+        # Fragment-wise sync: the same deterministic partition the server
+        # derives (must match the server's --num_fragments).
+        self._num_fragments: int = num_fragments
+        self._frag_bounds: list[tuple[int, int]] = _fragment_bounds(
+            self._param_numels, num_fragments
+        )
+        self._frag_numels: list[int] = [
+            sum(self._param_numels[a:b]) for a, b in self._frag_bounds
+        ]
 
         # Revision of the server global model our snapshot is based on; sent
         # with every push so the server can reject a pseudo-gradient computed
@@ -461,33 +489,52 @@ class HeLoCoRLClient(AsyncDiLoCo):
         self._adopt_flat(flat_params, revision, new_steps)
         return {name: t.clone() for name, t in self._global_params.items()}
 
+    def frag_names(self, fragment: int) -> list[str]:
+        """The parameter names of one fragment (contiguous slice of the
+        server's ``named_parameters()`` order)."""
+        a, b = self._frag_bounds[fragment]
+        return self._param_names[a:b]
+
     def push(
-        self, local_state_dict: dict[str, torch.Tensor], speed: float = 0.0
+        self,
+        local_state_dict: dict[str, torch.Tensor],
+        speed: float = 0.0,
+        fragment: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """Push the pseudo-gradient and pull the updated global parameters.
 
         ``pseudo_grad[name] = self._global_params[name] - local_state_dict[name]``
         (computed in fp32 on CPU). Sends ``speed`` for DyLU, receives the new
-        global theta, updates ``self._global_params``, and returns a clone of it.
+        global theta, updates ``self._global_params``, and returns a clone of
+        the updated parameters — the whole model, or with ``fragment`` set,
+        ONLY that fragment's (the caller loads the partial dict).
 
         If the server rejects the push (stale baseline revision, e.g. after
         the server restored from a checkpoint), the window's pseudo-gradient
-        is dropped and the response is adopted as a pure re-baseline.
+        is dropped and the response is adopted as a pure re-baseline. Under
+        fragment rotation each fragment re-baselines the same way on its own
+        next push, so a restore self-heals within one full rotation.
 
         Args:
             local_state_dict: theta_local at the window end, keyed by server
-                parameter names, CPU. Upcast to fp32 here if needed.
+                parameter names, CPU. Upcast to fp32 here if needed. With
+                ``fragment`` set it only needs that fragment's names.
             speed: inner steps/sec over the window, for DyLU.
+            fragment: fragment index for fragment-wise sync (requires
+                matching ``num_fragments`` on client and server).
         """
+        names = (
+            self._param_names if fragment is None else self.frag_names(fragment)
+        )
         grad_chunks: list[torch.Tensor] = []
         with torch.no_grad():
-            for name in self._param_names:
+            for name in names:
                 local = local_state_dict[name].detach().to("cpu", torch.float32)
                 grad_chunks.append((self._global_params[name] - local).reshape(-1))
         flat_grads = torch.cat(grad_chunks)
 
         flat_params, new_steps, revision, applied = self._session_roundtrip(
-            flag=1.0, speed=speed, flat_grads=flat_grads
+            flag=1.0, speed=speed, flat_grads=flat_grads, fragment=fragment
         )
         if not applied:
             logger.warning(
@@ -496,8 +543,8 @@ class HeLoCoRLClient(AsyncDiLoCo):
                 self._baseline_revision,
                 revision,
             )
-        self._adopt_flat(flat_params, revision, new_steps)
-        return {name: t.clone() for name, t in self._global_params.items()}
+        self._adopt_flat(flat_params, revision, new_steps, names=names)
+        return {name: self._global_params[name].clone() for name in names}
 
     # ------------------------------------------------------------------ #
     # Heartbeat lifecycle (explicit, not tied to __enter__/__exit__).
@@ -524,9 +571,14 @@ class HeLoCoRLClient(AsyncDiLoCo):
     # ------------------------------------------------------------------ #
 
     def _adopt_flat(
-        self, flat_params: torch.Tensor, revision: int, new_steps: int
+        self,
+        flat_params: torch.Tensor,
+        revision: int,
+        new_steps: int,
+        names: list[str] | None = None,
     ) -> None:
-        """Unflatten a received fp32 buffer into ``_global_params``.
+        """Unflatten a received fp32 buffer into ``_global_params`` (all
+        parameters, or with ``names`` set, one fragment's contiguous slice).
 
         Replaces the parent's ``_adopt_global`` (which installs into an
         ``nn.Module``); the orchestrator adopts the returned state dict into
@@ -534,7 +586,7 @@ class HeLoCoRLClient(AsyncDiLoCo):
         """
         with torch.no_grad():
             offset = 0
-            for name in self._param_names:
+            for name in names if names is not None else self._param_names:
                 target = self._global_params[name]
                 n = target.numel()
                 target.copy_(flat_params[offset : offset + n].view(target.shape))
@@ -586,6 +638,17 @@ def main() -> None:
         "push holds whole-model-sized buffers, so peak RSS scales with concurrent "
         "workers. Excess pushes get 503 + Retry-After and the worker retries the "
         "same push, so the cost is bounded delay, not lost training",
+    )
+    parser.add_argument(
+        "--num_fragments",
+        type=int,
+        default=None,
+        help="fragment-wise sync (Decoupled DiLoCo): partition the model into "
+        "this many contiguous numel-balanced fragments; workers push one "
+        "fragment per shortened window on a staggered rotation, so every "
+        "transfer and per-push transient is model/num_fragments sized. Must "
+        "match the workers' ft.num_fragments. heloco only. Unset/1: legacy "
+        "whole-model sync",
     )
     # Relay publishing (the heloco_async_inference hub role). Leave
     # --relay_addr unset for plain HeLoCo/DiLoCo (no generator pool to feed).
@@ -645,6 +708,7 @@ def main() -> None:
         heartbeat_timeout=args.heartbeat_timeout,
         should_quantize=args.should_quantize,
         max_sessions=args.max_sessions,
+        num_fragments=args.num_fragments,
     )
 
     # Replicas read these from the environment (launchers export them).

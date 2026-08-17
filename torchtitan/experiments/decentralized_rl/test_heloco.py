@@ -60,6 +60,54 @@ def test_real_server_roundtrip(should_quantize):
         server.shutdown()
 
 
+def test_fragment_roundtrip_matches_whole_model():
+    """Fragment-wise sync end to end: rotating fragment pushes against a
+    fragmented server land bitwise where one whole-model push against a P=1
+    twin lands (per-parameter outer math — see torchft's fragment tests),
+    and each push only carries/returns its own fragment's names."""
+    from torchft.async_diloco import AsyncDiLoCoServer
+
+    def make(num_fragments):
+        torch.manual_seed(0)
+        model = nn.Linear(4, 3)  # 2 params -> P=2 puts weight/bias apart
+        server = AsyncDiLoCoServer(
+            model,
+            torch.optim.SGD(model.parameters(), lr=1.0),
+            port=0,
+            num_fragments=num_fragments,
+        )
+        names, shapes, dtypes = param_metadata(model)
+        client = HeLoCoRLClient(
+            server.address(), names, shapes, dtypes,
+            sync_timeout=10.0, num_fragments=num_fragments,
+        )
+        return model, server, client, names
+
+    model1, server1, client1, names = make(1)
+    model2, server2, client2, _ = make(2)
+    try:
+        client1.pull()
+        client2.pull()
+        local = {n: p.detach() + 0.25 for n, p in model1.named_parameters()}
+        whole = client1.push(local, speed=1.0)
+        merged = {}
+        for frag in range(2):
+            frag_names = client2.frag_names(frag)
+            part = client2.push(
+                {n: local[n] for n in frag_names}, speed=1.0, fragment=frag
+            )
+            assert sorted(part) == sorted(frag_names)
+            merged.update(part)
+        assert sorted(merged) == sorted(names)
+        for name in names:
+            assert torch.equal(merged[name], whole[name]), name
+        assert server2.status()["revision"] == 2
+        assert client2._baseline_revision == 2
+    finally:
+        server1.shutdown()
+        server2.shutdown()
+
+
 def test_push_rejected_by_server_rebaselines():
     """applied=False (stale baseline, e.g. server checkpoint restore): the
     push is dropped but the response is still adopted as a re-baseline."""
@@ -71,7 +119,7 @@ def test_push_rejected_by_server_rebaselines():
     )
     client._global_params["w"].copy_(torch.tensor([1.0, 2.0]))
     # Replace the parent's HTTP roundtrip with a canned rejection response.
-    client._session_roundtrip = lambda flag, speed, flat_grads: (
+    client._session_roundtrip = lambda flag, speed, flat_grads, fragment=None: (
         torch.tensor([9.0, 9.0, 9.0]),
         0,
         42,

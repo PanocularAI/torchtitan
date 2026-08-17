@@ -207,6 +207,18 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
         Mutually exclusive with num_outer_steps: set exactly one."""
         should_quantize: bool = False
         """fp16 wire transfer (must match the server)."""
+        num_fragments: int = 1
+        """Fragment-wise sync with communication overlap (Decoupled DiLoCo,
+        arXiv 2604.21428). The model is split into this many contiguous,
+        numel-balanced fragments; ONE fragment (rotating) syncs every
+        sync_every/num_fragments inner steps, its push/merge roundtrip
+        overlapped with the next fragment-window's training and adopted at
+        the following boundary. The cycle's LAST fragment is pushed
+        synchronously at the window end so each generator refresh sees a
+        fully merged model — the refresh/validation/logging cadence stays
+        once per sync_every steps, exactly like whole-model sync. Requires
+        sync_every % num_fragments == 0 and must match the server's
+        --num_fragments. 1 (default) is legacy whole-model sync."""
         num_generators: int = 1
         """Number of independent vLLM engines this replica spawns (each of
         generator.parallelism's world size, on its own GPU slice out of the
@@ -220,6 +232,15 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
             RLTrainer.Config.__post_init__(self)
             if self.sync_every < 1:
                 raise ValueError(f"sync_every must be >= 1, got {self.sync_every}")
+            if self.num_fragments < 1:
+                raise ValueError(
+                    f"num_fragments must be >= 1, got {self.num_fragments}"
+                )
+            if self.sync_every % self.num_fragments != 0:
+                raise ValueError(
+                    f"sync_every ({self.sync_every}) must be divisible by "
+                    f"num_fragments ({self.num_fragments})"
+                )
             if (self.num_outer_steps > 0) == (self.train_seconds > 0):
                 raise ValueError(
                     "Set exactly one of num_outer_steps (step-bound run) or "
@@ -230,6 +251,14 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
     def __init__(self, config: "HeLoCoRLReplica.Config"):
         super().__init__(config)
         self.client: HeLoCoRLClient | None = None
+        # Fragment rotation state (num_fragments > 1): the rotating fragment
+        # index, the window-step counter, the in-flight background push
+        # (asyncio task + its fragment), and the last boundary's timestamp
+        # for per-fragment-window DyLU speed.
+        self._frag_idx: int = 0
+        self._win_step: int = 0
+        self._frag_inflight: "asyncio.Task | None" = None
+        self._frag_t0: float = 0.0
 
     async def setup_async(self, *, trainer_mesh, generator_meshes):
         """Spawn actors (HeLoCoPolicyTrainer) and connect the torchft client.
@@ -270,6 +299,7 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
             dtypes,
             heartbeat_address=cfg.heartbeat_address or None,
             should_quantize=cfg.should_quantize,
+            num_fragments=cfg.num_fragments,
         )
         self.client.start_heartbeat()
 
@@ -278,30 +308,114 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
         await self.trainer.load_full_state_dict_cpu.call(global_sd)
         await self.trainer.push_model_state_dict.call()
         await self.generator_router.pull_model_state_dict(policy_version=0)
+        self._frag_t0 = time.perf_counter()
         logger.info(
             "[replica %d] connected to server; adopted global theta", cfg.replica_id
         )
 
-    async def _window_sync(self, t0: float) -> None:
-        """The DiLoCo sync boundary: push theta_local (the server applies its
-        outer step to the pseudo-gradient), adopt the returned global theta,
-        refresh the generators from it, and apply any DyLU window-length
-        recommendation to the next window."""
-        theta_local = self._get_rank_0_value(
-            await self.trainer.get_full_state_dict_cpu.call()
+    # ------------------------------------------------------------------ #
+    # Fragment rotation (num_fragments > 1): one fragment exchange per
+    # sync_every/P steps, overlapped with the next fragment-window's
+    # training (Decoupled DiLoCo). Intermediate boundaries live in
+    # _after_inner_step; the cycle's final boundary is _window_sync.
+    # ------------------------------------------------------------------ #
+
+    async def _adopt_inflight_fragment(self, clear_optimizer: bool) -> None:
+        """Await the in-flight fragment exchange (backpressure: blocks only
+        if the roundtrip was slower than one fragment-window of training)
+        and load the merged fragment into the trainer. Generators are NOT
+        refreshed here — they refresh once per full cycle, at _window_sync."""
+        task, self._frag_inflight = self._frag_inflight, None
+        if task is None:
+            return
+        merged = await task  # push errors propagate, like the legacy path
+        await self.trainer.load_full_state_dict_cpu.call(
+            merged, clear_optimizer=clear_optimizer
         )
-        speed = self._sync_every / max(time.perf_counter() - t0, 1e-6)
-        new_global = self.client.push(theta_local, speed=speed)
-        await self.trainer.load_full_state_dict_cpu.call(new_global)
+
+    async def _push_fragment(self, background: bool):
+        """Extract the rotating fragment's local params (fragment-scoped
+        gather — model/P of device->CPU traffic) and push its pseudo-gradient.
+        ``background=True`` launches the roundtrip as a task and returns; the
+        merge is adopted at the next boundary. ``background=False`` awaits
+        and returns the merged fragment."""
+        fragment = self._frag_idx
+        self._frag_idx = (fragment + 1) % self.config.num_fragments
+        names = self.client.frag_names(fragment)
+        theta_frag = self._get_rank_0_value(
+            await self.trainer.get_full_state_dict_cpu.call(names=names)
+        )
+        now = time.perf_counter()
+        frag_window = self._sync_every // self.config.num_fragments
+        speed = frag_window / max(now - self._frag_t0, 1e-6)
+        self._frag_t0 = now
+        if background:
+            self._frag_inflight = asyncio.create_task(
+                asyncio.to_thread(
+                    self.client.push, theta_frag, speed=speed, fragment=fragment
+                )
+            )
+            return None
+        return await asyncio.to_thread(
+            self.client.push, theta_frag, speed=speed, fragment=fragment
+        )
+
+    async def _after_inner_step(self, iter_t0: float) -> None:
+        """Intermediate fragment boundaries: every sync_every/P steps (except
+        the window end, which _window_sync owns), adopt the previous
+        fragment's merge and launch this fragment's exchange in the
+        background. Mid-cycle adopts keep the inner optimizer state — the
+        once-per-cycle clear stays at _window_sync, matching whole-model
+        cadence."""
+        if self.config.num_fragments <= 1 or self.client is None:
+            return
+        self._win_step += 1
+        frag_window = self._sync_every // self.config.num_fragments
+        if self._win_step % frag_window == 0 and self._win_step < self._sync_every:
+            await self._adopt_inflight_fragment(clear_optimizer=False)
+            await self._push_fragment(background=True)
+
+    async def _window_sync(self, t0: float) -> None:
+        """The sync boundary closing a full cycle: with fragments, drain the
+        pipeline and push the LAST fragment synchronously so the generator
+        refresh sees a fully merged model (whole-model cadence for refresh /
+        validation / logging); without, the legacy whole-model push. Applies
+        any DyLU window-length recommendation to the next window (rounded to
+        a multiple of num_fragments so the boundary cadence stays integral)."""
+        self._win_step = 0
+        num_fragments = self.config.num_fragments
+        if num_fragments <= 1:
+            theta_local = self._get_rank_0_value(
+                await self.trainer.get_full_state_dict_cpu.call()
+            )
+            speed = self._sync_every / max(time.perf_counter() - t0, 1e-6)
+            new_global = self.client.push(theta_local, speed=speed)
+            await self.trainer.load_full_state_dict_cpu.call(new_global)
+        else:
+            await self._adopt_inflight_fragment(clear_optimizer=False)
+            merged = await self._push_fragment(background=False)
+            await self.trainer.load_full_state_dict_cpu.call(
+                merged, clear_optimizer=True
+            )
         await self.trainer.push_model_state_dict.call()
         await self.generator_router.pull_model_state_dict(
             policy_version=self._policy_version
         )
         if self.client.last_dylu_steps > 0:
-            self._sync_every = self.client.last_dylu_steps
+            steps = self.client.last_dylu_steps
+            self._sync_every = max(
+                num_fragments, steps // num_fragments * num_fragments
+            )
         return None
 
     async def close(self):
+        if self._frag_inflight is not None:
+            # Drain (never adopt) a leftover exchange, e.g. after divergence.
+            try:
+                await self._frag_inflight
+            except Exception:
+                pass
+            self._frag_inflight = None
         if self.client is not None:
             self.client.stop_heartbeat()
         await super().close()

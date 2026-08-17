@@ -331,6 +331,11 @@ def maybe_semi_sync_training(
                 heartbeat_address=heartbeat,
                 should_quantize=extend_ft_config.should_quantize,
                 replica_pg=replica_pg,
+                # Fragment-wise sync (Decoupled DiLoCo): staggered rotation of
+                # model/num_fragments pushes with the exchange overlapped in
+                # the background; must match the parameter server's
+                # --num_fragments. Default 1 = whole-model sync.
+                num_fragments=extend_ft_config.num_fragments,
             )
         else:
             raise ValueError(

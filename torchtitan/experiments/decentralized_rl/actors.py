@@ -167,13 +167,22 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
     """
 
     @endpoint
-    async def get_full_state_dict_cpu(self) -> dict[str, torch.Tensor]:
+    async def get_full_state_dict_cpu(
+        self, names: list[str] | None = None
+    ) -> dict[str, torch.Tensor]:
         """Return full unsharded *parameters* as native-named fp32 CPU tensors.
 
         Mirrors ``push_model_state_dict``'s unshard but returns to the controller
         and filters out buffers. ``cpu_offload=True`` keeps gathered tensors off
         the GPU; fp32 because the pseudo-gradient subtraction and outer optimizer
         run in fp32 on the server.
+
+        ``names`` restricts the gather to those canonical parameter names (a
+        fragment's slice under fragment-wise sync) — the unshard collectives
+        run only for the requested subset, so a fragment window pays
+        model/num_fragments of device->CPU traffic, not the whole model. The
+        controller ``.call()``s every rank with the same ``names``, so the
+        collective order stays aligned.
         """
         # Iterate named_parameters() (the same source param_metadata keys the
         # wire buffers on) and unshard each DTensor with full_tensor(). Do NOT
@@ -185,17 +194,21 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         # canonical_fqn strips compile/AC/FSDP wrapper segments (e.g. _orig_mod)
         # so keys match the uncompiled meta-model names the server/client are
         # built from (see param_metadata).
+        wanted = None if names is None else set(names)
         sd = {}
         for name, param in self.model.named_parameters():
+            canonical = canonical_fqn(name)
+            if wanted is not None and canonical not in wanted:
+                continue
             tensor = param.detach()
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
-            sd[canonical_fqn(name)] = tensor.to(device="cpu", dtype=torch.float32)
+            sd[canonical] = tensor.to(device="cpu", dtype=torch.float32)
         return sd
 
     @endpoint
     async def load_full_state_dict_cpu(
-        self, global_sd: dict[str, torch.Tensor]
+        self, global_sd: dict[str, torch.Tensor], clear_optimizer: bool = True
     ) -> None:
         """Load global theta (native-named, fp32, CPU) back into the FSDP/TP model.
 
@@ -212,6 +225,12 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         theta jump we clear the inner optimizer state (stale momentum would
         bias the next window) but leave ``policy_version`` monotone so
         staleness tracking stays correct.
+
+        ``global_sd`` may be a SUBSET of the parameters (one fragment's merged
+        slice under fragment-wise sync) — only matching keys are copied.
+        ``clear_optimizer=False`` skips the inner-state clear for those
+        mid-cycle fragment adopts, keeping the once-per-full-cycle clearing
+        cadence the whole-model path has.
         """
         train_dtype = TORCH_DTYPE_MAP[self.config.training.dtype]
         # Copy the incoming global theta straight into named_parameters() (same
@@ -231,9 +250,10 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
                     v = distribute_tensor(v, ref.device_mesh, ref.placements)
                 ref.copy_(v)
 
-        self.optimizers.zero_grad(set_to_none=True)
-        for opt in self.optimizers:
-            opt.state.clear()
+        if clear_optimizer:
+            self.optimizers.zero_grad(set_to_none=True)
+            for opt in self.optimizers:
+                opt.state.clear()
         logger.info(
             "HeLoCoPolicyTrainer loaded global theta (policy_version=%d)",
             self.policy_version,
