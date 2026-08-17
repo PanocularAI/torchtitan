@@ -218,6 +218,7 @@ def maybe_semi_sync_training(
     n_layers: int,
     optimizer: torch.optim.Optimizer,
     fragment_fn: Callable[..., list[nn.Module]] | None = None,
+    pp_enabled: bool = False,
 ) -> AbstractContextManager["local_sgd.DiLoCo" | "local_sgd.LocalSGD" | None]:
     """
     If TorchFT is enabled and the config is set, use semi_sync_method
@@ -280,8 +281,18 @@ def maybe_semi_sync_training(
             # coordinator's stdout, hence env rather than config fields.
             import os
 
+            import torch.distributed as pt_dist
+
             from torchft.async_diloco import AsyncDiLoCo
 
+            if pp_enabled:
+                raise RuntimeError(
+                    "semi_sync_method='heloco' cannot run under pipeline "
+                    "parallelism: PP splits named_parameters() itself across "
+                    "ranks, so no gather can reassemble the parameter "
+                    "server's full-model wire layout. Shard with FSDP/TP "
+                    "instead, or use semi_sync_method='diloco'."
+                )
             server_address = os.environ.get("DILOCO_SERVER_ADDR", "").strip()
             if not server_address:
                 raise RuntimeError(
@@ -297,63 +308,33 @@ def maybe_semi_sync_training(
                 f"{extend_ft_config.sync_steps} steps "
                 f"(heartbeat: {heartbeat or 'disabled'})"
             )
+            # Replica mode (torchft): a multi-GPU/multi-node replica behaves
+            # as ONE parameter-server worker — rank 0 owns the HTTP session
+            # and heartbeat identity; boundaries gather full DTensor values
+            # (FSDP/TP shards included) and every rank installs its own shard
+            # from a broadcast. The group is GLOO so followers wait out
+            # rank 0's HTTP without an NCCL watchdog in the blast radius.
+            # torchrun always initializes dist — at nproc=1 the one-rank
+            # group is ~free and keeps the DTensor install path uniform
+            # (FSDP2 wraps params as DTensors even at world size 1).
+            replica_pg = (
+                pt_dist.new_group(backend="gloo")
+                if pt_dist.is_available() and pt_dist.is_initialized()
+                else None
+            )
             return AsyncDiLoCo(
                 server_address=server_address,
-                # torchtitan builds models through FSDP2 (DTensor params even
-                # at world size 1); torchft is DTensor-agnostic, so hand it
-                # the plain-tensor view of this model (see _PlainParamsView).
-                model=_PlainParamsView(model),
+                model=model,
                 inner_optimizer=optimizer,
                 sync_every=extend_ft_config.sync_steps,
                 fragment_update_alpha=extend_ft_config.fragment_update_alpha,
                 heartbeat_address=heartbeat,
                 should_quantize=extend_ft_config.should_quantize,
+                replica_pg=replica_pg,
             )
         else:
             raise ValueError(
                 f"Unknown training method: {semi_sync_method}, only 'diloco', 'local_sgd' and 'heloco' are supported."
             )
     return nullcontext()
-
-
-class _PlainParamsView:
-    """FSDP2 -> torchft adapter: a model's parameters as PLAIN tensors.
-
-    torchft's AsyncDiLoCo does ordinary tensor arithmetic on parameters
-    (``copy_``, subtraction, ``torch.cat``), which rejects the DTensors
-    torchtitan's FSDP2 build yields. It reaches the model through exactly one
-    method -- ``named_parameters()`` -- so unwrapping there is the entire
-    adaptation. ``to_local()`` returns a view SHARING STORAGE with the
-    DTensor, so AsyncDiLoCo's in-place adoption of pulled global params
-    writes straight into the real model.
-
-    Valid only while each parameter's local tensor IS the whole parameter
-    (one-device or fully replicated mesh). For a sharded parameter,
-    ``to_local()`` is just this rank's slice, and pushing it as though it
-    were the whole tensor would corrupt the sync silently -- that case raises.
-    """
-
-    def __init__(self, model: nn.Module) -> None:
-        self._model = model
-
-    def named_parameters(self):
-        from torch.distributed.tensor import DTensor
-
-        for name, p in self._model.named_parameters():
-            if not isinstance(p, DTensor):
-                yield name, p
-                continue
-            local = p.to_local()
-            if tuple(local.shape) != tuple(p.shape):
-                raise RuntimeError(
-                    f"parameter {name!r} is SHARDED across the replica "
-                    f"(local {tuple(local.shape)} vs global "
-                    f"{tuple(p.shape)}), which semi_sync_method='heloco' "
-                    "cannot sync: the parameter server would receive this "
-                    "rank's shard as if it were the whole tensor. Use "
-                    "single-device replicas (scale out with more replicas), "
-                    "or diloco/local_sgd, whose lighthouse path handles "
-                    "sharded models."
-                )
-            yield name, local
 
