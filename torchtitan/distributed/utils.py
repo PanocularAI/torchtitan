@@ -591,8 +591,15 @@ def set_pg_timeouts(
         mesh.get_group()
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
+    # torch nightlies around 2.13 ship only the private spelling of this API
+    # (fork compat shim; drops out once the pin has the public one again).
+    set_timeout = getattr(
+        torch.distributed,
+        "set_timeout",
+        torch.distributed.distributed_c10d._set_pg_timeout,
+    )
     for group in groups:
-        torch.distributed.set_timeout(timeout, group)
+        set_timeout(timeout, group)
 
 
 @torch.no_grad()
