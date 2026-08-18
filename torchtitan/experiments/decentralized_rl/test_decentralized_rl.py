@@ -158,6 +158,43 @@ def test_rollouter_is_a_swappable_task():
     assert base.rollouter is custom
     cfg = wrap_replica(HeLoCoRLReplica, base, train_seconds=60.0)
     assert cfg.rollouter is custom
+
+
+def test_dapo_math_preset():
+    """The DAPO-Math preset swaps the task bundle AND the reference recipe's
+    training knobs onto the heloco stack: Math-Verify rollouter, DAPO
+    clip-higher loss under the chunked wrapper, thinking on, temp/top-p 1.0,
+    and math-sized token budgets (alphabet-sort's 700-token budget would
+    truncate every solution). math_verify is an example-only dep, so skip
+    where it isn't installed -- and its absence must not break the registry's
+    OTHER presets (the lazy-import contract)."""
+    base_rl_config()  # registry import + alphabet-sort preset work regardless
+
+    pytest.importorskip("math_verify")
+    from torchtitan.components.loss import ChunkedLossWrapper
+    from torchtitan.experiments.decentralized_rl.config_registry import (
+        rl_heloco_dapo_math_qwen3_0_6b,
+        rl_heloco_dapo_math_qwen3_4b,
+    )
+    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
+    from torchtitan.experiments.rl.losses import DAPOLoss
+
+    cfg = rl_heloco_dapo_math_qwen3_0_6b()
+    assert isinstance(cfg, HeLoCoRLReplica.Config)
+    assert isinstance(cfg.rollouter, DapoMathRollouter.Config)
+    assert cfg.rollouter.token_env.max_rollout_tokens == 10240
+    assert isinstance(cfg.trainer.loss, ChunkedLossWrapper.Config)
+    assert isinstance(cfg.trainer.loss.loss_fn, DAPOLoss.Config)
+    assert cfg.trainer.loss.loss_fn.ratio_clip_high == 0.28
+    assert cfg.renderer.enable_thinking is True
+    assert cfg.generator.sampling.temperature == 1.0
+    assert cfg.generator.sampling.max_tokens == 8192
+    assert cfg.async_loop.batcher.batch.seq_len == 10240
+    assert cfg.async_loop.validation.num_samples == 30
+
+    large = rl_heloco_dapo_math_qwen3_4b()
+    assert large.model_spec.flavor == "4B"
+    assert large.hf_assets_path.endswith("Qwen3-4B-Base")
     # Default preserved when not passed.
     assert type(base_rl_config().rollouter) is AlphabetSortRollouter.Config
 

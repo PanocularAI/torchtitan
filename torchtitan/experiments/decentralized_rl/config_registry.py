@@ -31,6 +31,7 @@ import dataclasses
 import os
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import (
@@ -52,7 +53,9 @@ from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGener
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.controller import AsyncLoopConfig, ValidationConfig
+from torchtitan.experiments.rl.environment import TokenEnv
 from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
+from torchtitan.experiments.rl.losses import DAPOLoss
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
@@ -108,6 +111,7 @@ _EXAMPLE_CHECKPOINT_DIR = os.path.join(_rl_pkg.__path__[0], "example_checkpoint"
 _DEFAULT_HF_ASSETS_PATH = {
     ("qwen3", "0.6B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-0.6B"),
     ("qwen3", "1.7B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-1.7B"),
+    ("qwen3", "4B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-4B-Base"),
     ("llama3", "8B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Llama-3.1-8B"),
     # HF backend A/B baselines: same checkpoints as the native qwen3 presets.
     ("hf", "Qwen3-0.6B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-0.6B"),
@@ -318,6 +322,61 @@ def rl_heloco_llama3_8b(**kwargs) -> HeLoCoRLReplica.Config:
     kwargs.setdefault("model", "llama3")
     kwargs.setdefault("flavor", "8B")
     return rl_heloco_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_dapo_math_qwen3_0_6b(
+    max_response_tokens: int = 8192,
+    max_total_tokens: int = 10240,
+    **kwargs,
+) -> HeLoCoRLReplica.Config:
+    """DAPO-Math on the heloco stack: single-turn math prompts (DAPO-Math-17k
+    filtered for training, all 30 AIME 2025 problems for validation) scored by
+    a binary Math-Verify reward, trained with the DAPO clip-higher loss
+    (arXiv:2503.14476) instead of stock GRPO. Everything else -- the async
+    multi-worker loop, the CPU parameter server, quantized pushes -- is
+    rl_heloco_qwen3_0_6b (see its docstring for the strategy layout).
+
+    Values follow the single-node reference recipe in
+    torchtitan/experiments/rl/examples/dapo_math/config_registry.py: thinking
+    on, temperature/top-p 1.0, clip [0.2, 0.28], chunked loss, and 8K
+    response / 10K packing budgets (alphabet-sort's 700-token budget would
+    truncate every solution to reward 0).
+
+    Extra dependency: math-verify (examples/dapo_math/requirements.txt) --
+    NOT baked into the engine image; declare it on the run so the islands and
+    the parameter-server hub install it at provisioning.
+    """
+    # Lazy: the rollouter's rubric imports math_verify at module level. A
+    # top-level import here would take the WHOLE registry down without it --
+    # every preset, alphabet-sort included -- and ConfigManager reports that
+    # as the baffling "config function not found".
+    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
+
+    cfg = rl_heloco_qwen3_0_6b(**kwargs)
+    cfg.rollouter = DapoMathRollouter.Config(
+        token_env=TokenEnv.Config(
+            max_rollout_tokens=max_total_tokens, max_num_turns=1
+        ),
+    )
+    cfg.renderer.enable_thinking = True
+    cfg.generator.sampling.temperature = 1.0
+    cfg.generator.sampling.top_p = 1.0
+    cfg.generator.sampling.max_tokens = max_response_tokens
+    cfg.async_loop.batcher.batch.seq_len = max_total_tokens
+    cfg.async_loop.validation.num_samples = 30  # all of AIME 2025
+    cfg.trainer.loss = ChunkedLossWrapper.Config(
+        num_chunks=8,
+        loss_fn=DAPOLoss.Config(ratio_clip_low=0.2, ratio_clip_high=0.28),
+    )
+    return cfg
+
+
+def rl_heloco_dapo_math_qwen3_4b(**kwargs) -> HeLoCoRLReplica.Config:
+    """The reference DAPO-Math model (Qwen3-4B-Base); needs the checkpoint
+    downloaded into _DEFAULT_HF_ASSETS_PATH's dir (or hf_assets_path passed).
+    See rl_heloco_dapo_math_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "4B")
+    return rl_heloco_dapo_math_qwen3_0_6b(**kwargs)
 
 
 def rl_heloco_hf_qwen3_0_6b(**kwargs) -> HeLoCoRLReplica.Config:
