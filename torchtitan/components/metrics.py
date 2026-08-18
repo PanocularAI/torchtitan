@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import os
 import time
 from collections import namedtuple
@@ -172,6 +173,27 @@ class WandBLogger(BaseLogger):
     def close(self) -> None:
         if self.wandb.run is not None:
             self.wandb.finish()
+
+
+class StdoutJsonLogger(BaseLogger):
+    """Last-resort sink: one JSON line per log step on stdout.
+
+    Console logging prints a fixed handful of fields (loss/tps/mfu), so on a run
+    with neither wandb nor TensorBoard every OTHER metric -- the whole RL set:
+    rewards, rollout counts, the timing breakdown -- is computed and dropped.
+    Emitting the dict verbatim makes any captured-stdout pipeline a complete
+    metrics sink, with no credentials, no egress and no per-node files to fetch.
+
+    ponytail: prefix-tagged JSON lines, parsed with grep+json.loads. A real sink
+    (wandb/TB) is still the answer for long or many-actor runs."""
+
+    PREFIX = "PFMETRICS "
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        logger.info(
+            "%s%s", self.PREFIX,
+            json.dumps({"step": step, **metrics}, default=str, sort_keys=True),
+        )
 
 
 class LoggerContainer(BaseLogger):
@@ -384,7 +406,8 @@ class MetricsProcessor(Configurable):
         )
 
         # Check if any logging backend is enabled
-        has_logging_enabled = config.enable_tensorboard or config.enable_wandb
+        # StdoutJsonLogger always backs these up, so metrics are never simply lost.
+        has_logging_enabled = True
 
         # Determine if this rank should log
         should_log = has_logging_enabled
@@ -445,7 +468,8 @@ class MetricsProcessor(Configurable):
             logger_container.add_logger(tensorboard_logger)
 
         if logger_container.number_of_loggers == 0:
-            logger.debug("No loggers enabled, returning an empty LoggerContainer")
+            logger.debug("No metrics backend configured; falling back to stdout JSON")
+            logger_container.add_logger(StdoutJsonLogger())
         return logger_container
 
     def log(
