@@ -173,7 +173,7 @@ class AsyncInferenceWorker:
         )
         # Start the vLLM engine loop before any pull_model_state_dict: the
         # generator now guards weight pulls on a running engine loop (the
-        # controller starts it via generator_router.fanout("start_engine_loop");
+        # controller starts it via generator_router.start_engine_loop;
         # this worker has a single generator actor and must do the same).
         await self.generator.start_engine_loop.call()
 

@@ -307,7 +307,7 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
         global_sd = self.client.pull()
         await self.trainer.load_full_state_dict_cpu.call(global_sd)
         await self.trainer.push_model_state_dict.call()
-        await self.generator_router.pull_model_state_dict(policy_version=0)
+        await self.generator_router.pull_model_state_dict.call_one(0)
         self._frag_t0 = time.perf_counter()
         logger.info(
             "[replica %d] connected to server; adopted global theta", cfg.replica_id
@@ -398,8 +398,8 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
                 merged, clear_optimizer=True
             )
         await self.trainer.push_model_state_dict.call()
-        await self.generator_router.pull_model_state_dict(
-            policy_version=self._policy_version
+        await self.generator_router.pull_model_state_dict.call_one(
+            self._policy_version
         )
         if self.client.last_dylu_steps > 0:
             steps = self.client.last_dylu_steps

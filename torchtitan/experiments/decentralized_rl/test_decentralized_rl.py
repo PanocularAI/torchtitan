@@ -414,6 +414,49 @@ def test_train_step_bound_hook_order():
     ]
 
 
+_MONARCH_VERBS = frozenset(
+    {"call", "call_one", "broadcast", "choose", "stream", "rref"}
+)
+
+
+def test_router_calls_name_public_endpoints_and_use_a_monarch_verb():
+    """InterGeneratorRouter is upstream's, and it is a monarch Actor: every call
+    must name an @endpoint and go through a monarch verb.
+
+    Upstream actorized the router and privatized the implementations
+    (fanout -> _fanout, pull_model_state_dict -> _pull_model_state_dict behind
+    an endpoint of the same name). Our stack kept calling the old plain-object
+    API, which a rebase cannot catch because it only sweeps upstream's files --
+    an ActorEndpoint has no __call__, so A-4b died 12 GPU-minutes in with
+    "ActorEndpoint object is not callable". Scanning the source is the cheap
+    version of that discovery."""
+    import re
+    import types
+
+    from torchtitan.experiments.rl.routing.inter_generator_router import (
+        InterGeneratorRouter,
+    )
+
+    here = os.path.dirname(__file__)
+    pattern = re.compile(r"generator_router\.(\w+)(?:\.(\w+))?\s*\(")
+    checked = 0
+    for fname in ("controller.py", "replicas.py"):
+        src = open(os.path.join(here, fname)).read()
+        for name, verb in pattern.findall(src):
+            checked += 1
+            attr = getattr(InterGeneratorRouter, name, None)
+            assert attr is not None, f"{fname}: router has no attribute {name!r}"
+            assert not isinstance(attr, types.FunctionType), (
+                f"{fname}: {name!r} is a plain method, not an endpoint -- "
+                "upstream privatized it or never exposed it"
+            )
+            assert verb in _MONARCH_VERBS, (
+                f"{fname}: {name!r} is called as {verb or 'a direct call'}; "
+                f"an ActorEndpoint needs one of {sorted(_MONARCH_VERBS)}"
+            )
+    assert checked, "regex matched nothing -- the scan silently covered zero calls"
+
+
 def test_train_survives_transient_outer_sync_failures():
     """A dropped push must not end the run -- the hub still holds good weights
     and the next window boundary retries. Regression for run 947642665102,

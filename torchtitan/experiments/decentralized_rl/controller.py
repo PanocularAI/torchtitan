@@ -169,7 +169,15 @@ class RLControllerMixin:
         ``(packed_batch, rollout_groups)``; the groups are kept for the reward
         metric in the per-window log line."""
         await self.trainer.sync_log_step.call(step)
-        await self.generator_router.fanout("sync_log_step", step)
+        # InterGeneratorRouter is a monarch Actor: reach it through its
+        # @concurrent_endpoint (a single-actor mesh, hence call_one), never by
+        # calling the implementation directly. Upstream privatized those to
+        # _fanout/_pull_model_state_dict when it actorized the router, and an
+        # ActorEndpoint has no __call__ -- a direct call raises
+        # "ActorEndpoint object is not callable" at the first co-located step.
+        # The endpoint also sets the router process's own step counter, which
+        # _fanout alone skipped.
+        await self.generator_router.sync_log_step.call_one(step)
         return await self._collect_training_batch(step)
 
     async def _train_on(self, packed, rollout_groups) -> dict:
@@ -221,8 +229,8 @@ class RLControllerMixin:
         by controllers that decouple the pull from the train step
         (AsyncInferenceReplica stages only; its producers pull per-round)."""
         await self.trainer.push_model_state_dict.call()
-        await self.generator_router.pull_model_state_dict(
-            policy_version=self._policy_version
+        await self.generator_router.pull_model_state_dict.call_one(
+            self._policy_version
         )
 
     # ------------------------------------------------------------------ #
