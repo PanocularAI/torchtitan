@@ -25,7 +25,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from monarch.actor import endpoint
+from monarch.actor import concurrent_endpoint
 from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchft.checkpointing.http_transport import HTTPTransport
@@ -62,7 +62,7 @@ class DiLoCoManagerTrainer(PolicyTrainer):
         self.model.load_state_dict(state_dict["model"])
         self.optimizers.optimizers[0].load_state_dict(state_dict["inner_optim"])
 
-    @endpoint
+    @concurrent_endpoint
     async def setup_diloco(
         self,
         *,
@@ -134,7 +134,7 @@ class DiLoCoManagerTrainer(PolicyTrainer):
             outer_momentum,
         )
 
-    @endpoint
+    @concurrent_endpoint
     async def diloco_step_info(self) -> dict:
         """Expose the Manager's current step / participant count for logging."""
         return {
@@ -142,7 +142,7 @@ class DiLoCoManagerTrainer(PolicyTrainer):
             "num_participants": int(self._diloco_manager.num_participants()),
         }
 
-    @endpoint
+    @concurrent_endpoint
     async def close_diloco(self) -> None:
         if getattr(self, "_diloco", None) is not None:
             self._diloco.__exit__(None, None, None)
@@ -166,7 +166,7 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         generator.pull_model_state_dict(v)
     """
 
-    @endpoint
+    @concurrent_endpoint
     async def get_full_state_dict_cpu(
         self, names: list[str] | None = None
     ) -> dict[str, torch.Tensor]:
@@ -206,7 +206,7 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
             sd[canonical] = tensor.to(device="cpu", dtype=torch.float32)
         return sd
 
-    @endpoint
+    @concurrent_endpoint
     async def load_full_state_dict_cpu(
         self, global_sd: dict[str, torch.Tensor], clear_optimizer: bool = True
     ) -> None:
@@ -272,7 +272,7 @@ class SnapshotPolicyTrainer(PolicyTrainer):
         trainer.load_full_state_dict_cpu(theta)      # theta -> model
     """
 
-    @endpoint
+    @concurrent_endpoint
     async def get_full_state_dict_cpu(self) -> dict[str, torch.Tensor]:
         """Return the full unsharded model state dict as fp32 CPU tensors.
 
@@ -294,7 +294,7 @@ class SnapshotPolicyTrainer(PolicyTrainer):
             sd[name] = tensor.to(device="cpu", dtype=torch.float32)
         return sd
 
-    @endpoint
+    @concurrent_endpoint
     async def load_full_state_dict_cpu(
         self, global_sd: dict[str, torch.Tensor]
     ) -> None:

@@ -32,8 +32,7 @@ import os
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.config import (
     CompileConfig,
     DebugConfig,
@@ -177,7 +176,12 @@ def base_rl_config(
             # decentralized_rl replicas drive a SYNCHRONOUS windowed loop
             # (RLControllerMixin), so no off-policy buffering: each step trains
             # on rollouts generated under the just-published policy.
-            max_offpolicy_steps=0,
+            # BOTH knobs are required for that: upstream's windowed FIFO
+            # (window_fraction, default 0.3) lets observed offpolicy steps
+            # EXCEED the target, so target=0 alone derives a bound of 1, not 0.
+            # window_fraction=None is strict FIFO (window_size 1) => bound 0.
+            target_offpolicy_steps=0,
+            window_fraction=None,
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -421,7 +425,10 @@ def rl_heloco_dapo_math_qwen3_0_6b(
     # the lag is priced in rather than silently biasing the update. Keep it
     # below sync_every so the deepest stale sample still sits INSIDE a window
     # instead of straddling a parameter-server merge.
-    cfg.async_loop.max_offpolicy_steps = 4
+    cfg.async_loop.target_offpolicy_steps = 4
+    # base_rl_config pins strict FIFO for the on-policy default; the reference
+    # recipe uses upstream's windowed default, so restore it here.
+    cfg.async_loop.window_fraction = 0.3
     # Generators finish at different times under an 8K budget; round-robin
     # hands work to a generator that is still busy.
     cfg.generator_router.strategy = LeastLoadedRoutingStrategy.Config()

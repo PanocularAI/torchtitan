@@ -199,7 +199,12 @@ def test_dapo_math_preset():
     # reproducing upstream needed an override pile at the call site.
     assert cfg.async_loop.num_prompts_per_train_step == 8
     assert cfg.async_loop.num_samples_per_prompt == 16
-    assert cfg.async_loop.max_offpolicy_steps == 4
+    # The reference's rollout lag. Upstream (fd2776584) made
+    # max_offpolicy_steps a DERIVED bound and moved the knob to
+    # target_offpolicy_steps + window_fraction, so assert the knobs we set --
+    # matching upstream's own dapo_math preset -- not the derived value.
+    assert cfg.async_loop.target_offpolicy_steps == 4
+    assert cfg.async_loop.window_fraction == 0.3
     assert cfg.trainer.optimizer.param_groups[0].optimizer_kwargs["lr"] == 1e-6
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
     assert cfg.trainer.lr_scheduler.min_lr_factor == 1.0  # constant LR
@@ -208,6 +213,8 @@ def test_dapo_math_preset():
     assert large.model_spec.flavor == "4B"
     assert large.hf_assets_path.endswith("Qwen3-4B-Base")
     # Default preserved when not passed.
+    from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
+
     assert type(base_rl_config().rollouter) is AlphabetSortRollouter.Config
 
 
