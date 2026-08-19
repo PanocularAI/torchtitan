@@ -564,3 +564,51 @@ def test_hf_backend_1_7b_flavor_registered():
     assert cfg.model_spec.model.num_hidden_layers == 28
     assert cfg.model_spec.model.hidden_size == 2048
     assert ("hf", "Qwen3-1.7B") in _DEFAULT_HF_ASSETS_PATH
+
+
+def test_gpu_memory_limit_is_not_pinned_by_the_presets():
+    """The KV budget must stay at the engine's own default, and removing the
+    old pin must not shift `hf_assets_path`.
+
+    These presets used to force `gpu_memory_limit=0.35` for shared dev boxes.
+    Every generator actor already owns a disjoint GPU slice, so on a
+    provisioned island that just threw the card away (measured on a decoupled
+    H100 generator: 9.4 GiB used of 79, vLLM capped at ~3.2 concurrent
+    full-length requests, ~68 GiB idle) -- and because it was a preset KWARG,
+    ConfigManager could not reach it from argv, so no spec could raise it.
+
+    The removed pin was also `base_rl_config`'s FIRST POSITIONAL parameter and
+    four presets forwarded it positionally, so dropping it in one place only
+    would have silently bound the next argument to `hf_assets_path`. Both
+    halves are asserted here.
+    """
+    from torchtitan.experiments.decentralized_rl.config_registry import (
+        rl_heloco_async_inference_dapo_math_qwen3_0_6b,
+        rl_heloco_async_inference_qwen3_0_6b,
+        rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b,
+        rl_heloco_dapo_math_qwen3_0_6b,
+        rl_heloco_qwen3_0_6b,
+    )
+    from torchtitan.experiments.rl.actors.generator import VLLMGenerator
+
+    engine_default = VLLMGenerator.Config().gpu_memory_limit
+    for fn in (
+        base_rl_config,
+        rl_heloco_qwen3_0_6b,
+        rl_heloco_async_inference_qwen3_0_6b,
+        rl_heloco_dapo_math_qwen3_0_6b,
+        rl_heloco_async_inference_dapo_math_qwen3_0_6b,
+        rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b,
+    ):
+        cfg = fn()
+        assert cfg.generator.gpu_memory_limit == engine_default, (
+            f"{fn.__name__} pins gpu_memory_limit to "
+            f"{cfg.generator.gpu_memory_limit}; leave it at the engine default "
+            "and override per run with --generator.gpu_memory_limit"
+        )
+        # the positional-shift guard
+        sentinel = "/tmp/sentinel-assets"
+        assert fn(hf_assets_path=sentinel).hf_assets_path == sentinel, fn.__name__
+
+    # base_rl_config's first positional arg must be hf_assets_path now
+    assert base_rl_config("/tmp/sentinel-assets").hf_assets_path == "/tmp/sentinel-assets"

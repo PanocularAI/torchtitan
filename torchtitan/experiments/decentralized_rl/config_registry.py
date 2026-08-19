@@ -120,7 +120,6 @@ _DEFAULT_HF_ASSETS_PATH = {
 
 
 def base_rl_config(
-    gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     *,
     model: str = "qwen3",
@@ -134,9 +133,18 @@ def base_rl_config(
     ``model``/``flavor`` select the model spec (via ``_MODEL_REGISTRY_BY_MODEL``)
     and the default checkpoint path (via ``_DEFAULT_HF_ASSETS_PATH``);
     hf_assets_path overrides the default (e.g. for a fine-tuned checkpoint of
-    the same flavor, or any (model, flavor) with no default). gpu_memory_limit
-    is lowered from the base 0.9 so workers (and other users on a shared box)
-    coexist without vLLM grabbing ~90% of each GPU for KV cache.
+    the same flavor, or any (model, flavor) with no default).
+
+    vLLM's KV-cache budget is deliberately NOT pinned here: it stays at
+    VLLMGenerator.Config.gpu_memory_limit's own default. These presets used to
+    force 0.35 so a generator would coexist with other tenants of a shared dev
+    box, but every generator actor already owns a disjoint GPU slice, so on a
+    provisioned island that only threw the rest of the card away -- measured on
+    a decoupled H100 generator: 9.4 GiB used of 79, and vLLM capped at ~3.2
+    concurrent full-length requests while ~68 GiB sat idle. It was also a
+    preset KWARG, which ConfigManager cannot reach from argv, so no spec could
+    raise it. Tune it per run instead: `--generator.gpu_memory_limit=0.35`
+    (spec `overrides`), which is how a shared box should ask for less.
     trainer/generator tensor_parallel_degree default to 1; raise either for a
     model too large to fit one GPU per role -- the GPU mesh spawned by
     torchtitan.experiments.decentralized_rl.train (and therefore the GPU count a
@@ -224,7 +232,6 @@ def base_rl_config(
         generator=VLLMGenerator.Config(
             debug=DebugConfig(enable_structured_logging=False),
             model_dtype="bfloat16",
-            gpu_memory_limit=gpu_memory_limit,
             parallelism=InferenceParallelismConfig(
                 data_parallel_degree=1,
                 tensor_parallel_degree=generator_tensor_parallel_degree,
@@ -273,7 +280,6 @@ def wrap_replica(cls, base: RLTrainer.Config, **kwargs):
 
 
 def rl_heloco_qwen3_0_6b(
-    gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     sync_every: int = 4,
     train_seconds: float = 3600.0,
@@ -297,7 +303,6 @@ def rl_heloco_qwen3_0_6b(
     return wrap_replica(
         HeLoCoRLReplica,
         base_rl_config(
-            gpu_memory_limit,
             hf_assets_path,
             model=model,
             flavor=flavor,
@@ -470,7 +475,6 @@ def rl_heloco_hf(**kwargs) -> HeLoCoRLReplica.Config:
 
 
 def rl_heloco_async_inference_qwen3_0_6b(
-    gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     sync_every: int = 4,
     train_seconds: float = 3600.0,
@@ -503,7 +507,6 @@ def rl_heloco_async_inference_qwen3_0_6b(
     return wrap_replica(
         HeLoCoAsyncInferenceReplica,
         base_rl_config(
-            gpu_memory_limit,
             hf_assets_path,
             model=model,
             flavor=flavor,
@@ -610,7 +613,6 @@ def rl_heloco_async_inference_dapo_math_qwen3_4b(
 
 
 def rl_diloco_qwen3_0_6b(
-    gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     sync_every: int = 4,
     train_seconds: float = 3600.0,
@@ -634,7 +636,6 @@ def rl_diloco_qwen3_0_6b(
     return wrap_replica(
         DiLoCoRLReplica,
         base_rl_config(
-            gpu_memory_limit,
             hf_assets_path,
             model=model,
             flavor=flavor,
@@ -699,7 +700,6 @@ def rl_diloco_llama3_8b(**kwargs) -> DiLoCoRLReplica.Config:
 
 
 def rl_async_inference_qwen3_0_6b(
-    gpu_memory_limit: float = 0.35,
     hf_assets_path: str | None = None,
     sync_every: int = 4,
     train_seconds: float = 3600.0,
@@ -732,7 +732,6 @@ def rl_async_inference_qwen3_0_6b(
     return wrap_replica(
         AsyncInferenceReplica,
         base_rl_config(
-            gpu_memory_limit,
             hf_assets_path,
             model=model,
             flavor=flavor,
