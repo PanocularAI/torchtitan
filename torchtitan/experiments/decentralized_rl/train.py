@@ -36,6 +36,7 @@ from monarch.actor import ProcMesh, this_host  # noqa: E402
 from monarch.spmd import setup_torch_elastic_env_async  # noqa: E402
 
 from torchtitan.config import ConfigManager  # noqa: E402
+from torchtitan.tools.logging import init_logger  # noqa: E402
 from torchtitan.experiments.rl.train import (  # noqa: E402
     _compute_generator_world_size,
     _compute_trainer_world_size,
@@ -158,6 +159,21 @@ def _ensure_cuda_toolchain() -> None:
 
 async def main() -> None:
     _ensure_cuda_toolchain()
+    # Give THIS process a stdout handler. init_logger() is called inside the
+    # actor processes (rl/actors/trainer.py, .../generator.py) and by pretrain's
+    # torchtitan/train.py, but never by the replica/worker mains -- so their root
+    # logger had no handler and Python's `lastResort` fallback (level WARNING)
+    # silently dropped every logger.info.
+    #
+    # That is not cosmetic: `_run_window` logs "[replica %d] step: %d" as the
+    # documented progress contract an external supervisor greps for, and
+    # controld's SkyPilot handle greps exactly that to drive its readiness gate.
+    # With the message discarded, progress() always returned 0, quorum never
+    # advanced past "ready 0/1", and healthy 4B decoupled runs were killed at the
+    # quorum deadline -- six of them, over ~10,700 captured log lines with not a
+    # single step line between them, while the trainer was in fact training
+    # (verified locally: reward_mean=0.094, finite loss, PS applied_pushes=1).
+    init_logger()
     config = ConfigManager().parse_args()
     for field, (env_names, cast) in _ENV_OVERRIDES.items():
         if not hasattr(config, field):

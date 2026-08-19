@@ -618,19 +618,64 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         await self.trainer.sync_log_step.call(step)
         rollout_groups = []
         packed = None
+        # Silent-hang guard (training_sample_builder's own TODO(robustness)): if
+        # every group is dropped -- too stale, zero-std reward, or untrainable --
+        # this loop consumes the queue forever, trains nothing, and says nothing,
+        # because the drop counters live in metrics that only flush AT a train
+        # step. Diagnosing that once cost an hour of a paid 4B cluster's time, so
+        # the loop now reports itself. Counted per call; a batch that legitimately
+        # needs several groups is normal and stays quiet.
+        seen = stale = untrainable = 0
         while packed is None:
             group, version = await self._buffer_get_checked()
+            seen += 1
             if self._staleness_reference() - version > self.config.max_staleness:
                 self._num_dropped += 1
+                stale += 1
+                self._warn_if_starved(step, seen, stale, untrainable)
                 continue
             rollout_groups.append(group)
             training_sample_group = self._training_sample_builder.build_from_group(
                 rollout_group=group
             )
+            # getattr: this counter is diagnostics only and must never be the
+            # thing that breaks a train step -- test fakes and any future
+            # builder return shape are tolerated.
+            if not getattr(training_sample_group, "training_samples", None):
+                untrainable += 1
             packed = self._batcher.add_training_samples(
                 training_sample_group=training_sample_group
             )
+            if packed is None:
+                self._warn_if_starved(step, seen, stale, untrainable)
         return packed, rollout_groups
+
+    # Warn once per power-of-two so a long starvation escalates in the log
+    # without flooding it.
+    _STARVE_WARN_AT = 32
+
+    def _warn_if_starved(
+        self, step: int, seen: int, stale: int, untrainable: int
+    ) -> None:
+        """Say something when a train step cannot be assembled.
+
+        `_collect_and_build` is unbounded by design (rollouts arrive
+        asynchronously), so the failure mode is silence, not an exception. Emit
+        at 32 groups and then at every doubling, naming WHY groups are going
+        away -- the reason is otherwise unrecoverable, since the builder's
+        drop counters flush only at a completed train step.
+        """
+        if seen < self._STARVE_WARN_AT or seen & (seen - 1):
+            return
+        logger.warning(
+            "[replica %d] step %d: consumed %d rollout group(s) without "
+            "assembling a batch (%d dropped as too stale > max_staleness=%d, "
+            "%d dropped as untrainable/zero-std reward). Generation is feeding "
+            "the queue but nothing is trainable -- check the reward function "
+            "and rollout_reward/group_zero_std_frac.",
+            self.config.replica_id, step, seen, stale,
+            self.config.max_staleness, untrainable,
+        )
 
     def _batch_staleness(
         self, pre_optim_policy_version: int, min_policy_versions

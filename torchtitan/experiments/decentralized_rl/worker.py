@@ -29,6 +29,8 @@ import tyro
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torchstore as ts  # noqa: E402
+
+from torchtitan.tools.logging import init_logger  # noqa: E402
 from monarch.actor import this_host  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
@@ -293,6 +295,21 @@ class AsyncInferenceWorker:
 
 async def _main() -> None:
     _ensure_cuda_toolchain()
+    # Give THIS process a stdout handler. init_logger() is called inside the
+    # actor processes (rl/actors/trainer.py, .../generator.py) and by pretrain's
+    # torchtitan/train.py, but never by the replica/worker mains -- so their root
+    # logger had no handler and Python's `lastResort` fallback (level WARNING)
+    # silently dropped every logger.info.
+    #
+    # That is not cosmetic: `_run_window` logs "[replica %d] step: %d" as the
+    # documented progress contract an external supervisor greps for, and
+    # controld's SkyPilot handle greps exactly that to drive its readiness gate.
+    # With the message discarded, progress() always returned 0, quorum never
+    # advanced past "ready 0/1", and healthy 4B decoupled runs were killed at the
+    # quorum deadline -- six of them, over ~10,700 captured log lines with not a
+    # single step line between them, while the trainer was in fact training
+    # (verified locally: reward_mean=0.094, finite loss, PS applied_pushes=1).
+    init_logger()
     from torchtitan.config import ConfigManager
 
     config = ConfigManager().parse_args()
