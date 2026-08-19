@@ -43,6 +43,7 @@ import time
 from dataclasses import dataclass
 
 from torchtitan.experiments.decentralized_rl.train import setup_mesh_elastic_env
+from torchtitan.experiments.rl.components.weight_sync import WeightSyncManager
 from torchtitan.experiments.rl.controller import Controller
 from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
 
@@ -99,6 +100,17 @@ class RLTrainer(Controller):
         # getattr: pure-learner fakes in the tests carry a bare namespace config.
         if getattr(self.config, "num_generators", 0) > 0:
             self._start_rollout_producers()
+            # Overlaps each step's weight handoff (push -> pull -> slot
+            # release) with the next step's fwd/bwd, as upstream's
+            # _trainer_loop does.
+            self._weight_sync = WeightSyncManager(
+                trainer=self.trainer,
+                generator_router=self.generator_router,
+                group_buffer=self._group_buffer,
+                num_prompts_per_train_step=(
+                    self.config.async_loop.num_prompts_per_train_step
+                ),
+            )
             self._producers_started = True
 
     async def _stop_producers_if_started(self) -> None:
@@ -106,6 +118,9 @@ class RLTrainer(Controller):
         # the flag, and there is nothing to stop for them.
         if getattr(self, "_producers_started", False):
             self._producers_started = False
+            # Land the last step's overlapped handoff first: its release
+            # touches the buffer this is about to close.
+            await self._weight_sync.wait_inflight_push_pull()
             await self._stop_rollout_producers()
 
     async def _rollout_one_group(self, *, sampling, step: int) -> RolloutGroup:
@@ -183,6 +198,10 @@ class RLTrainer(Controller):
                 )
             )
             last_loss = mb.get("loss/mean", mb.get("loss", last_loss))
+        if getattr(self, "_producers_started", False):
+            # The previous step's overlapped weight push must land before this
+            # optimizer step mutates the weights (upstream _trainer_loop order).
+            await self._weight_sync.wait_prev_push()
         optim_output = self._get_rank_0_value(await self.trainer.optim_step.call())
         return optim_output, last_loss
 
@@ -234,14 +253,14 @@ class RLControllerMixin:
 
         optim_output, last_loss = await self._apply_training_batch(packed)
         self._policy_version = optim_output.policy_version
-        await self._refresh_generators()
         if getattr(self, "_producers_started", False):
-            # Born-fresh: admit the next groups only now that the generators
-            # hold the just-trained weights (mirrors upstream's
-            # WeightSyncManager release-after-pull).
-            await self._group_buffer.release_active_groups(
-                self.config.async_loop.num_prompts_per_train_step, reason="trained"
-            )
+            # Overlap this step's push -> pull -> buffer-slot release with the
+            # next step's fwd/bwd (upstream _trainer_loop's WeightSyncManager
+            # pattern; the manager's release-after-pull keeps born-fresh).
+            await self._weight_sync.wait_prev_pull()
+            self._weight_sync.start_async_push_pull(version=self._policy_version)
+        else:
+            await self._refresh_generators()
 
         rewards = [
             r.reward for g in rollout_groups for r in g.rollouts if r.reward is not None
@@ -477,6 +496,9 @@ class RLControllerMixin:
                     # groups keep generating and are IS-priced by version.
                     if getattr(self, "_producers_started", False):
                         await self._group_buffer.pause()
+                        # The merge reads/replaces trainer weights: the last
+                        # step's overlapped push/pull must settle first.
+                        await self._weight_sync.wait_inflight_push_pull()
                     extra = await self._window_sync(t0)
                     sync_failures = 0
                 except Exception:
