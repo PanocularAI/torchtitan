@@ -308,12 +308,30 @@ class RelayClient:
         *,
         rng: random.Random | None = None,
         timeout_s: float = 30.0,
+        stall_timeout_s: float = 120.0,
     ):
         if not relay_urls:
             raise ValueError("relay_urls must be non-empty")
         self.relay_urls = list(relay_urls)
         self._rng = rng or random.Random()
-        self._timeout_s = timeout_s
+        # A checkpoint transfer is multi-GB, so `total` is the wrong bound: it
+        # caps the whole manifest+shards exchange regardless of progress. At
+        # Qwen3-4B (~8.8 GB bf16 across 4 shards) a 30 s total made publishing
+        # arithmetically impossible -- run a033803b3539 logged 26 consecutive
+        # `publish of checkpoint v1 failed ()` (an empty str(), i.e.
+        # asyncio.TimeoutError), with shards 0-2 landing and shard 3 always
+        # 404, so no worker ever assembled a checkpoint and generation never
+        # started. 0.6B (~1.2 GB) fit inside 30 s, which is why it took a 4B
+        # run to surface.
+        #
+        # Bound the things that indicate a BROKEN relay instead: connecting,
+        # and going quiet mid-transfer. A slow-but-progressing upload now
+        # finishes rather than being killed on a stopwatch.
+        self._transfer_timeout = aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=timeout_s,
+            sock_read=stall_timeout_s,
+        )
         self._success_rate = {url: 1.0 for url in self.relay_urls}
         self._bandwidth = {
             url: 1.0 for url in self.relay_urls
@@ -355,10 +373,12 @@ class RelayClient:
         """Upload the manifest + every shard to every target relay (default:
         the whole configured tier), so any fetcher can reach any of them."""
         targets = relays if relays is not None else self.relay_urls
+        total_bytes = sum(len(d) for d in shard_bytes)
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self._timeout_s)
+            timeout=self._transfer_timeout
         ) as session:
             for url in targets:
+                t0 = time.perf_counter()
                 async with session.post(
                     f"{url}/publish/{version}/manifest", json=manifest.to_json()
                 ) as resp:
@@ -368,6 +388,18 @@ class RelayClient:
                         f"{url}/publish/{version}/shard/{idx}", data=data
                     ) as resp:
                         resp.raise_for_status()
+                # Measured, because we could not explain the failure without it:
+                # the run that exposed the `total` timeout showed ~8.9 Gbps on
+                # the hub link, at which 8.8 GB should take ~8 s, yet 30 s was
+                # never enough. Log the real rate so the next slow publish is a
+                # number instead of a guess.
+                dt = time.perf_counter() - t0
+                logger.info(
+                    "published checkpoint v%d to %s: %d shards, %.2f GB in "
+                    "%.1fs (%.0f MB/s)",
+                    version, url, len(shard_bytes), total_bytes / 1e9, dt,
+                    total_bytes / 1e6 / max(dt, 1e-9),
+                )
 
     async def _fetch_manifest(
         self, session: aiohttp.ClientSession, url: str, min_version: int
@@ -415,7 +447,7 @@ class RelayClient:
         or ``None`` if no relay has anything newer / every attempt failed."""
         remaining = list(self.relay_urls)
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self._timeout_s)
+            timeout=self._transfer_timeout
         ) as session:
             while remaining:
                 url = self._weighted_choice(remaining)

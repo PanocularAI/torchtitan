@@ -10,6 +10,7 @@
 # is faked.
 
 import asyncio
+import time
 import itertools
 import pickle
 from types import SimpleNamespace
@@ -623,5 +624,61 @@ def test_train_end_to_end_pure_learner_on_fakes():
         # Never spawned a generator: the attribute was never set, and nothing
         # touched it (else AttributeError would have failed train()).
         assert not hasattr(r, "generator_router")
+
+    asyncio.run(scenario())
+
+
+def test_relay_transfer_timeout_does_not_cap_total_transfer_time():
+    """A checkpoint transfer must not be bounded by a stopwatch.
+
+    `RelayClient` used to wrap publish/fetch in ClientTimeout(total=30s),
+    covering the manifest plus EVERY shard. At Qwen3-4B (~8.8 GB bf16 over 4
+    shards) that made publishing arithmetically impossible: run a033803b3539
+    logged 26 consecutive `publish of checkpoint v1 failed ()` -- an empty
+    str(), i.e. asyncio.TimeoutError -- with shards 0-2 landing and shard 3
+    always 404, so no worker assembled a checkpoint and generation never
+    started. 0.6B (~1.2 GB) fit in 30 s, so only a 4B run exposed it.
+
+    The bound must be on symptoms of a BROKEN relay (can't connect, went quiet)
+    and never on how long a healthy multi-GB upload legitimately takes.
+    """
+    client = RelayClient(["http://localhost:1"], timeout_s=30.0,
+                         stall_timeout_s=120.0)
+    t = client._transfer_timeout
+    assert t.total is None, (
+        "a total timeout caps the whole multi-GB transfer regardless of "
+        f"progress; got total={t.total}"
+    )
+    assert t.sock_connect == 30.0
+    assert t.sock_read == 120.0
+
+
+def test_relay_publish_survives_a_transfer_slower_than_the_old_total():
+    """End-to-end: a publish that takes longer than the old 30 s total budget
+    must still complete. Simulated by a relay whose shard handler is slow,
+    with the bounds compressed so the test stays fast."""
+    async def scenario():
+        relay, server, base_url = await _start_relay(retain_last=2)
+        try:
+            sd = _state_dict()
+            shards = shard_state_dict(sd, num_shards=2)
+            manifest = build_manifest(11, shards)
+
+            # total=None is what matters: each shard takes longer than the
+            # whole budget would have allowed, but neither stalls.
+            client = RelayClient([base_url], timeout_s=5.0, stall_timeout_s=5.0)
+            slow = relay.publish_shard
+
+            def slow_put(version, idx, data):
+                time.sleep(0.15)
+                return slow(version, idx, data)
+
+            relay.publish_shard = slow_put
+            await client.publish(11, shards, manifest)
+            assert relay.latest_version() == 11
+            assert relay.get_shard(11, 0) == shards[0]
+            assert relay.get_shard(11, 1) == shards[1]
+        finally:
+            await server.close()
 
     asyncio.run(scenario())
