@@ -315,6 +315,12 @@ class RLControllerMixin:
         subclass-side per-step instrumentation or pacing (e.g. the
         benchmark's slow-worker emulation) hooks in here."""
 
+    #: Consecutive failed outer syncs before train() gives up. A replica that
+    #: keeps training locally but never merges looks healthy and produces
+    #: nothing, so an unreachable hub must eventually be fatal -- just not on
+    #: the first socket stall.
+    _MAX_SYNC_FAILURES = 3
+
     async def _window_sync(self, t0: float) -> str | None:
         """The coordinator's window-boundary work, between the window's last
         optim_step and its validation pass (e.g. HeLoCo's push/pull). ``t0``
@@ -359,6 +365,7 @@ class RLControllerMixin:
 
             global_step = 0
             outer = 0
+            sync_failures = 0
             deadline = (
                 time.monotonic() + cfg.train_seconds
                 if cfg.train_seconds > 0
@@ -375,7 +382,31 @@ class RLControllerMixin:
                     logger.error("[replica %d] loss diverged; stopping", rid)
                     return
 
-                extra = await self._window_sync(t0)
+                # A failed outer sync must not kill the run. torchft's contract
+                # is "drop the push, keep training on the current params,
+                # retry at the next window boundary" (AsyncDiLoCo class
+                # docstring), but that catch-all lives in its
+                # _step_post_hook -- the decentralized_rl replicas call
+                # client.push directly and inherited none of it. One 60 s
+                # socket stall on the hub therefore ended run 947642665102
+                # four steps in, with the PS holding perfectly good weights.
+                try:
+                    extra = await self._window_sync(t0)
+                    sync_failures = 0
+                except Exception:
+                    sync_failures += 1
+                    logger.warning(
+                        "[replica %d] window %d: outer sync failed (%d in a "
+                        "row); dropping this window's pseudo-gradient and "
+                        "retrying at the next boundary",
+                        rid,
+                        outer,
+                        sync_failures,
+                        exc_info=True,
+                    )
+                    if sync_failures >= self._MAX_SYNC_FAILURES:
+                        raise
+                    extra = None
                 val_agg = self._aggregate_validation(
                     await self._validate_fixed(global_step)
                 )

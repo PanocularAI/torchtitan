@@ -327,6 +327,7 @@ class _LoopHost(RLControllerMixin):
         sync_every=2,
         window_s=0.0,
         diverge_after=None,
+        sync_fails=(),
     ):
         self.config = SimpleNamespace(
             replica_id=3,
@@ -338,6 +339,9 @@ class _LoopHost(RLControllerMixin):
         self.calls = []
         self._window_s = window_s
         self._diverge_after = diverge_after
+        # 1-based _window_sync attempt numbers that raise.
+        self._sync_fails = set(sync_fails)
+        self.sync_attempts = 0
         self.windows_run = 0
 
     def _build_sync_pipeline(self):
@@ -375,6 +379,9 @@ class _LoopHost(RLControllerMixin):
 
     async def _window_sync(self, t0):
         self.calls.append(("sync",))
+        self.sync_attempts += 1
+        if self.sync_attempts in self._sync_fails:
+            raise TimeoutError("timed out")
         return "detail line"
 
     async def _after_validation(self):
@@ -405,6 +412,31 @@ def test_train_step_bound_hook_order():
         ("validate", 4),  # post-training validation
         ("cleanup",),
     ]
+
+
+def test_train_survives_transient_outer_sync_failures():
+    """A dropped push must not end the run -- the hub still holds good weights
+    and the next window boundary retries. Regression for run 947642665102,
+    killed four steps in when one 60 s socket stall on the parameter server let
+    a TimeoutError out of client.push. Runs of failures shorter than
+    _MAX_SYNC_FAILURES must also RESET the counter, so a run that loses one
+    push every few windows never accumulates its way to fatal."""
+    host = _LoopHost(num_outer_steps=6, sync_every=2, sync_fails={1, 2, 4, 5})
+    asyncio.run(host.train())
+    assert host.windows_run == 6
+    assert host.sync_attempts == 6
+    assert ("teardown",) in host.calls
+
+
+def test_train_gives_up_after_consecutive_outer_sync_failures():
+    """A replica that keeps training but never merges looks healthy and
+    produces nothing, so a permanently unreachable hub still has to be fatal.
+    num_outer_steps bounds the loop so a broken guard fails instead of hanging."""
+    host = _LoopHost(num_outer_steps=10, sync_every=2, sync_fails=range(1, 100))
+    with pytest.raises(TimeoutError):
+        asyncio.run(host.train())
+    assert host.sync_attempts == RLControllerMixin._MAX_SYNC_FAILURES
+    assert ("cleanup",) in host.calls  # the finally: block still ran
 
 
 def test_train_divergence_skips_teardown_but_cleans_up():

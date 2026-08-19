@@ -394,7 +394,9 @@ class HeLoCoRLClient(AsyncDiLoCo):
         should_quantize: Upload pseudo-gradients as blockwise symmetric int8
             (the parameter download stays float32). Must match the server.
         sync_timeout: Socket timeout per sync request. Must exceed the
-            server's ``grace_period``.
+            server's ``grace_period`` and any stall the server can hit
+            mid-body; see ``AsyncDiLoCoServer.request_timeout``. Nothing in
+            the RL path overrides this, so the default is the live value.
     """
 
     def __init__(
@@ -407,7 +409,7 @@ class HeLoCoRLClient(AsyncDiLoCo):
         heartbeat_address: str | None = None,
         heartbeat_interval: float = 2.0,
         should_quantize: bool = False,
-        sync_timeout: float = 60.0,
+        sync_timeout: float = 600.0,
         num_fragments: int = 1,
         busy_retries: int = 10,
     ) -> None:
