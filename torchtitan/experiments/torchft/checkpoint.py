@@ -102,7 +102,12 @@ class TorchFTCheckpointManager(CheckpointManager):
             base_folder=base_folder,
         )
 
-        full_state_dict = ft_manager.rank0_synchronization_only
+        # getattr, not attribute access: this is OUR field (heterogeneous-island
+        # rank-0 sync) and not every FTManager carries it -- upstream's test
+        # double doesn't, and an AttributeError here takes down checkpoint
+        # construction entirely. False is the field's own default (whole-model
+        # sync), so absent == legacy behaviour.
+        full_state_dict = getattr(ft_manager, "rank0_synchronization_only", False)
 
         self.ft_manager = (
             ft_manager.manager if ft_manager and ft_manager.enabled else None
