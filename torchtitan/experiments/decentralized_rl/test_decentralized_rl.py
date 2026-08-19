@@ -190,13 +190,54 @@ def test_dapo_math_preset():
     assert cfg.generator.sampling.temperature == 1.0
     assert cfg.generator.sampling.max_tokens == 8192
     assert cfg.async_loop.batcher.batch.seq_len == 10240
+    # One packed sequence per rank: 2 OOMs a 140 GiB H200 at this seq_len.
+    assert cfg.async_loop.batcher.batch.local_batch_size == 1
     assert cfg.async_loop.validation.num_samples == 30
+
+    # The reference LOOP, not just the reference task: without these the
+    # preset ran alphabet-sort's 5x8 step at lr 2e-6 with warmup+decay, and
+    # reproducing upstream needed an override pile at the call site.
+    assert cfg.async_loop.num_prompts_per_train_step == 8
+    assert cfg.async_loop.num_samples_per_prompt == 16
+    assert cfg.async_loop.max_offpolicy_steps == 4
+    assert cfg.trainer.optimizer.param_groups[0].optimizer_kwargs["lr"] == 1e-6
+    assert cfg.trainer.lr_scheduler.warmup_steps == 0
+    assert cfg.trainer.lr_scheduler.min_lr_factor == 1.0  # constant LR
 
     large = rl_heloco_dapo_math_qwen3_4b()
     assert large.model_spec.flavor == "4B"
     assert large.hf_assets_path.endswith("Qwen3-4B-Base")
     # Default preserved when not passed.
     assert type(base_rl_config().rollouter) is AlphabetSortRollouter.Config
+
+
+def test_dapo_math_decoupled_presets():
+    """The decoupled (pure-learner + worker-pool) DAPO-Math pair. The launcher
+    derives the worker preset name from the trainer's by inserting the engine's
+    _worker_ segment, so both names must exist -- and the worker's group_size
+    must match the trainer's num_samples_per_prompt or its groups are unusable."""
+    pytest.importorskip("math_verify")
+    from torchtitan.experiments.decentralized_rl.config_registry import (
+        rl_heloco_async_inference_dapo_math_qwen3_0_6b,
+        rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b,
+    )
+    from torchtitan.experiments.decentralized_rl.replicas import (
+        HeLoCoAsyncInferenceReplica,
+    )
+    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
+
+    trainer = rl_heloco_async_inference_dapo_math_qwen3_0_6b(num_outer_steps=2)
+    assert isinstance(trainer, HeLoCoAsyncInferenceReplica.Config)
+    assert trainer.num_generators == 0        # pure learner, still
+    assert isinstance(trainer.rollouter, DapoMathRollouter.Config)
+    assert trainer.async_loop.num_samples_per_prompt == 16
+    assert trainer.trainer.optimizer.param_groups[0].optimizer_kwargs["lr"] == 1e-6
+
+    worker = rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b()
+    assert isinstance(worker.rollouter, DapoMathRollouter.Config)
+    assert worker.group_size == trainer.async_loop.num_samples_per_prompt
+    assert worker.renderer.enable_thinking is True
+    assert worker.generator.sampling.max_tokens == 8192
 
 
 # === controller.py =========================================================

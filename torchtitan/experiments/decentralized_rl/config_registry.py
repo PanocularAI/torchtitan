@@ -61,6 +61,7 @@ from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.routing import (
     InterGeneratorRouter,
+    LeastLoadedRoutingStrategy,
     RoundRobinRoutingStrategy,
 )
 from torchtitan.models.llama3 import model_registry as _llama3_model_registry
@@ -324,6 +325,67 @@ def rl_heloco_llama3_8b(**kwargs) -> HeLoCoRLReplica.Config:
     return rl_heloco_qwen3_0_6b(**kwargs)
 
 
+def _apply_dapo_math(cfg, *, max_response_tokens: int, max_total_tokens: int):
+    """Overlay the single-node DAPO-Math reference recipe
+    (torchtitan/experiments/rl/examples/dapo_math/config_registry.py, the
+    ``rl_dapo_qwen3_*_math_*`` presets) onto a decentralized_rl replica config,
+    in place.
+
+    Everything the reference sets that is not a single-node topology choice is
+    here: the task (DAPO-Math-17k train / AIME 2025 validation, math-verify
+    reward), thinking on, temperature/top-p 1.0, the 8K response / 10K packing
+    budgets, DAPO clip [0.2, 0.28] under a chunked loss, the 8 prompts x 16
+    samples train step at up to 4 steps of lag, and the 1e-6 CONSTANT LR with
+    betas (0.9, 0.98). A caller that wants a different loop overrides these
+    fields from the CLI as usual -- the point is that the DEFAULTS are
+    upstream's, so "run the reference recipe" needs no override pile.
+
+    Not carried over: ``num_generators`` and the trainer's tensor-parallel
+    degree (topology, owned by the launcher and the island's GPU count), and
+    the reference's fp32-lm-head converter / vLLM cudagraph capture (memory and
+    warmup tradeoffs that are not the recipe).
+    """
+    # Lazy: the rollouter's rubric imports math_verify at module level. A
+    # top-level import here would take the WHOLE registry down without it --
+    # every preset, alphabet-sort included -- and ConfigManager reports that
+    # as the baffling "config function not found".
+    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
+
+    cfg.rollouter = DapoMathRollouter.Config(
+        token_env=TokenEnv.Config(
+            max_rollout_tokens=max_total_tokens, max_num_turns=1
+        ),
+    )
+    cfg.renderer.enable_thinking = True
+    cfg.generator.sampling.temperature = 1.0
+    cfg.generator.sampling.top_p = 1.0
+    cfg.generator.sampling.max_tokens = max_response_tokens
+    cfg.async_loop.batcher.batch.seq_len = max_total_tokens
+    # Upstream's per-rank batch is ONE packed sequence, and at this seq_len that is
+    # not a tuning preference: measured on an H200, a 4B trainer peaks at 112 GiB at
+    # local_batch_size=1 and OOMs a 140 GiB card at 2 (there is no activation
+    # checkpointing in this config). base_rl_config's 2 is sized for alphabet-sort's
+    # 2048-token budget, not a 10K one.
+    cfg.async_loop.batcher.batch.local_batch_size = 1
+    cfg.async_loop.validation.num_samples = 30  # all of AIME 2025
+    # The reference train step: 8 prompt groups x 16 samples = 128 rollouts.
+    cfg.async_loop.num_prompts_per_train_step = 8
+    cfg.async_loop.num_samples_per_prompt = 16
+    cfg.trainer.loss = ChunkedLossWrapper.Config(
+        num_chunks=8,
+        loss_fn=DAPOLoss.Config(ratio_clip_low=0.2, ratio_clip_high=0.28),
+    )
+    # 1e-6 held CONSTANT (warmup 0, floor factor 1.0) -- base_rl_config's
+    # 2e-6 warmup+linear-decay is alphabet-sort's schedule, not this recipe's.
+    cfg.trainer.optimizer = default_adamw(
+        lr=1e-6, betas=(0.9, 0.98), weight_decay=0.1
+    )
+    cfg.trainer.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=0, min_lr_factor=1.0
+    )
+    return cfg
+
+
 def rl_heloco_dapo_math_qwen3_0_6b(
     max_response_tokens: int = 8192,
     max_total_tokens: int = 10240,
@@ -336,38 +398,33 @@ def rl_heloco_dapo_math_qwen3_0_6b(
     multi-worker loop, the CPU parameter server, quantized pushes -- is
     rl_heloco_qwen3_0_6b (see its docstring for the strategy layout).
 
-    Values follow the single-node reference recipe in
-    torchtitan/experiments/rl/examples/dapo_math/config_registry.py: thinking
-    on, temperature/top-p 1.0, clip [0.2, 0.28], chunked loss, and 8K
-    response / 10K packing budgets (alphabet-sort's 700-token budget would
-    truncate every solution to reward 0).
+    Defaults ARE the single-node reference recipe (see _apply_dapo_math), so
+    this is upstream's ``rl_dapo_qwen3_4b_math_8k`` run on N replicas rather
+    than one node -- no override pile needed to reproduce it.
 
     Extra dependency: math-verify (examples/dapo_math/requirements.txt) --
     NOT baked into the engine image; declare it on the run so the islands and
     the parameter-server hub install it at provisioning.
     """
-    # Lazy: the rollouter's rubric imports math_verify at module level. A
-    # top-level import here would take the WHOLE registry down without it --
-    # every preset, alphabet-sort included -- and ConfigManager reports that
-    # as the baffling "config function not found".
-    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
-
-    cfg = rl_heloco_qwen3_0_6b(**kwargs)
-    cfg.rollouter = DapoMathRollouter.Config(
-        token_env=TokenEnv.Config(
-            max_rollout_tokens=max_total_tokens, max_num_turns=1
-        ),
+    cfg = _apply_dapo_math(
+        rl_heloco_qwen3_0_6b(**kwargs),
+        max_response_tokens=max_response_tokens,
+        max_total_tokens=max_total_tokens,
     )
-    cfg.renderer.enable_thinking = True
-    cfg.generator.sampling.temperature = 1.0
-    cfg.generator.sampling.top_p = 1.0
-    cfg.generator.sampling.max_tokens = max_response_tokens
-    cfg.async_loop.batcher.batch.seq_len = max_total_tokens
-    cfg.async_loop.validation.num_samples = 30  # all of AIME 2025
-    cfg.trainer.loss = ChunkedLossWrapper.Config(
-        num_chunks=8,
-        loss_fn=DAPOLoss.Config(ratio_clip_low=0.2, ratio_clip_high=0.28),
-    )
+    # Local generation only (the pure-learner variant has no generators, and
+    # no router to point at them).
+    #
+    # The reference's rollout lag. base_rl_config pins 0 -- fully on-policy,
+    # which caps in-flight work at ONE train step's worth (128 sequences) and
+    # leaves a replica's generators idle waiting for each publish. At 4 the cap
+    # is 640; the loss is importance-sampling corrected (_batch_staleness), so
+    # the lag is priced in rather than silently biasing the update. Keep it
+    # below sync_every so the deepest stale sample still sits INSIDE a window
+    # instead of straddling a parameter-server merge.
+    cfg.async_loop.max_offpolicy_steps = 4
+    # Generators finish at different times under an 8K budget; round-robin
+    # hands work to a generator that is still busy.
+    cfg.generator_router.strategy = LeastLoadedRoutingStrategy.Config()
     return cfg
 
 
@@ -505,6 +562,44 @@ def rl_heloco_async_inference_hf(**kwargs) -> HeLoCoAsyncInferenceReplica.Config
         # checkpoint dir so the architecture resolves from it at call time.
         kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
     return rl_heloco_async_inference_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_dapo_math_qwen3_0_6b(
+    max_response_tokens: int = 8192,
+    max_total_tokens: int = 10240,
+    **kwargs,
+) -> HeLoCoAsyncInferenceReplica.Config:
+    """DAPO-Math on the decoupled heloco stack: the task and recipe of
+    rl_heloco_dapo_math_qwen3_0_6b (see _apply_dapo_math) on the pure-learner
+    topology of rl_heloco_async_inference_qwen3_0_6b (see its docstring for the
+    relay / rollout-queue / parameter-server layout).
+
+    The generator side of the recipe reaches the swarm through the matching
+    rl_heloco_async_inference_worker_dapo_math_* preset, not this one: a pure
+    learner runs no local vLLM, so the sampling knobs set here are inert and
+    only the trainer-side ones (batch width, loss, optimizer, group size)
+    take effect. Both must move together -- the worker's ``group_size`` is
+    this config's ``async_loop.num_samples_per_prompt``.
+
+    Extra dependency: math-verify, on the trainers AND the worker islands.
+    """
+    # No max_offpolicy_steps / router overlay here (unlike the non-decoupled
+    # preset): a pure learner consumes the shared queue, where lag is bounded
+    # by max_staleness, and it has no local generator pool to route between.
+    return _apply_dapo_math(
+        rl_heloco_async_inference_qwen3_0_6b(**kwargs),
+        max_response_tokens=max_response_tokens,
+        max_total_tokens=max_total_tokens,
+    )
+
+
+def rl_heloco_async_inference_dapo_math_qwen3_4b(
+    **kwargs,
+) -> HeLoCoAsyncInferenceReplica.Config:
+    """The reference DAPO-Math model (Qwen3-4B-Base) on the decoupled stack;
+    see rl_heloco_dapo_math_qwen3_4b for the checkpoint requirement."""
+    kwargs.setdefault("flavor", "4B")
+    return rl_heloco_async_inference_dapo_math_qwen3_0_6b(**kwargs)
 
 
 def rl_diloco_qwen3_0_6b(
@@ -854,3 +949,45 @@ def rl_heloco_async_inference_worker_hf(**kwargs) -> AsyncInferenceWorker.Config
         # checkpoint dir so the architecture resolves from it at call time.
         kwargs.setdefault("hf_assets_path", os.environ["RL_HF_ASSETS_PATH"])
     return rl_heloco_async_inference_worker_hf_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b(
+    max_response_tokens: int = 8192,
+    max_total_tokens: int = 10240,
+    **kwargs,
+) -> AsyncInferenceWorker.Config:
+    """Generator role for the DAPO-Math swarm: the worker of
+    rl_heloco_async_inference_worker_qwen3_0_6b (see it for the role) running
+    the DAPO-Math task with the reference sampling settings -- thinking on,
+    temperature/top-p 1.0, 8K response budget.
+
+    ``group_size`` is 16 to match the trainer preset's
+    ``async_loop.num_samples_per_prompt``: a worker emits whole GRPO groups and
+    a trainer that expects 16 siblings cannot use groups of 8.
+
+    Extra dependency: math-verify.
+    """
+    # Lazy import: see _apply_dapo_math.
+    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
+
+    kwargs.setdefault("group_size", 16)
+    cfg = rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
+    cfg.rollouter = DapoMathRollouter.Config(
+        token_env=TokenEnv.Config(
+            max_rollout_tokens=max_total_tokens, max_num_turns=1
+        ),
+    )
+    cfg.renderer.enable_thinking = True
+    cfg.generator.sampling.temperature = 1.0
+    cfg.generator.sampling.top_p = 1.0
+    cfg.generator.sampling.max_tokens = max_response_tokens
+    return cfg
+
+
+def rl_heloco_async_inference_worker_dapo_math_qwen3_4b(
+    **kwargs,
+) -> AsyncInferenceWorker.Config:
+    """4B DAPO-Math worker; see
+    rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "4B")
+    return rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b(**kwargs)
