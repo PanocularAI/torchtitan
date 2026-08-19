@@ -36,6 +36,7 @@
 
 import asyncio
 import itertools
+import json
 import logging
 import math
 import time
@@ -323,6 +324,13 @@ class RLControllerMixin:
         subclass-side per-step instrumentation or pacing (e.g. the
         benchmark's slow-worker emulation) hooks in here."""
 
+    def _window_yield_snapshot(self) -> dict | None:
+        """This window's rollout-accounting counters ({groups_consumed,
+        dropped_stale, dropped_zero_std}), or None on paths that don't track
+        them (the co-located collector drops zero-std groups inside the
+        upstream builder, invisibly from here). Read-and-reset."""
+        return None
+
     #: Consecutive failed outer syncs before train() gives up. A replica that
     #: keeps training locally but never merges looks healthy and produces
     #: nothing, so an unreachable hub must eventually be fatal -- just not on
@@ -437,6 +445,26 @@ class RLControllerMixin:
                 )
                 if extra:
                     logger.info("[replica %d] %s", rid, extra)
+                # One machine-readable line per window, same wire format as
+                # components/metrics.py::StdoutJsonLogger ("PFMETRICS " +
+                # JSON with a "step" key) so the platform's telemetry sink
+                # parses pretrain and RL with one grammar. This is what the
+                # PanoFabric run page charts; keys are additive.
+                pf: dict = {
+                    "step": global_step,
+                    "loss": float(last["loss"]),
+                    "reward_mean": reward_mean,
+                    "rollouts": last["num_rollouts"],
+                    "sync_every": self._sync_every,
+                    "staleness": last.get("staleness", 0),
+                    "window_s": round(time.perf_counter() - t0, 3),
+                }
+                if not math.isnan(val_reward):
+                    pf["val_reward"] = val_reward
+                window_yield = self._window_yield_snapshot()
+                if window_yield:
+                    pf.update(window_yield)
+                logger.info("PFMETRICS %s", json.dumps(pf, sort_keys=True))
                 outer += 1
 
             await self._train_teardown()
@@ -687,7 +715,25 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
             )
             if packed is None:
                 self._warn_if_starved(step, seen, stale, untrainable)
+        # Window-level accounting for the PFMETRICS line: trainable yield is
+        # THE decoupled health number (a 4B DAPO run measured 84% of groups
+        # discarded as zero-std -- every throughput and $ metric is off ~6x
+        # unless read against it). Lazy init tolerates the object.__new__
+        # test fakes.
+        y = getattr(self, "_win_yield", None)
+        if y is None:
+            y = self._win_yield = {
+                "groups_consumed": 0, "dropped_stale": 0, "dropped_zero_std": 0,
+            }
+        y["groups_consumed"] += seen
+        y["dropped_stale"] += stale
+        y["dropped_zero_std"] += untrainable
         return packed, rollout_groups
+
+    def _window_yield_snapshot(self) -> dict | None:
+        y = getattr(self, "_win_yield", None)
+        self._win_yield = None
+        return y
 
     # Warn once per power-of-two so a long starvation escalates in the log
     # without flooding it.

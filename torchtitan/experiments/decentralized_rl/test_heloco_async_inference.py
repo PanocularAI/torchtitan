@@ -12,6 +12,8 @@
 # is faked.
 
 import asyncio
+import json
+import logging
 import itertools
 from types import SimpleNamespace
 
@@ -294,7 +296,7 @@ class _InfiniteQueueClient:
         return (0, self.version, [_e2e_group() for _ in range(self.groups_per_batch)])
 
 
-def test_train_end_to_end_pure_learner_on_fakes():
+def test_train_end_to_end_pure_learner_on_fakes(caplog):
     async def scenario():
         r = object.__new__(HeLoCoAsyncInferenceReplica)
         r.config = SimpleNamespace(
@@ -363,7 +365,24 @@ def test_train_end_to_end_pure_learner_on_fakes():
         r.client = _FakeClient()
         r._aggregate_validation = lambda metrics: {}
 
-        await asyncio.wait_for(r.train(), 15)
+        with caplog.at_level(logging.INFO):
+            await asyncio.wait_for(r.train(), 15)
+
+        # The pure-learner path tracks per-window rollout accounting and
+        # ships it on the PFMETRICS line (trainable yield -- see
+        # _collect_and_build). 2 windows x 2 steps x 1 group per packed
+        # batch = 2 consumed per window; the passthrough builder fake has
+        # no .training_samples, so every group also counts untrainable.
+        pf_lines = [rec.getMessage() for rec in caplog.records
+                    if rec.getMessage().startswith("PFMETRICS ")]
+        assert len(pf_lines) == 2
+        for line in pf_lines:
+            payload = json.loads(line.removeprefix("PFMETRICS "))
+            assert payload["groups_consumed"] == 2
+            assert payload["dropped_stale"] == 0
+            assert payload["dropped_zero_std"] == 2
+        # read-and-reset: nothing carries over past the last window
+        assert r._window_yield_snapshot() is None
 
         # 2 windows x sync_every=2 optim steps.
         assert r._policy_version == 4

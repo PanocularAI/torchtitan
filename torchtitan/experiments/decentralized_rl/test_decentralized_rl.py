@@ -7,6 +7,8 @@
 # Per-strategy tests live next to their package (heloco/test_heloco.py etc).
 
 import asyncio
+import json
+import logging
 import math
 import os
 import subprocess
@@ -455,6 +457,29 @@ def test_router_calls_name_public_endpoints_and_use_a_monarch_verb():
                 f"an ActorEndpoint needs one of {sorted(_MONARCH_VERBS)}"
             )
     assert checked, "regex matched nothing -- the scan silently covered zero calls"
+
+
+def test_train_emits_one_pfmetrics_line_per_window(caplog):
+    """The platform's metrics sink parses `PFMETRICS {json}` lines (same
+    grammar as components/metrics.py::StdoutJsonLogger). One line per window,
+    keyed by global step; no yield keys on hosts that don't track them."""
+    host = _LoopHost(num_outer_steps=2, sync_every=2)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(host.train())
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("PFMETRICS ")]
+    assert len(lines) == 2
+    first = json.loads(lines[0].removeprefix("PFMETRICS "))
+    assert first["step"] == 2 and first["rollouts"] == 8
+    assert first["loss"] == pytest.approx(0.1234)
+    assert first["reward_mean"] == pytest.approx(0.6)
+    assert first["val_reward"] == pytest.approx(0.25)
+    assert first["sync_every"] == 2 and first["staleness"] == 1
+    assert first["window_s"] >= 0
+    # _LoopHost inherits the mixin default (no yield tracking) -> keys absent.
+    assert "groups_consumed" not in first
+    second = json.loads(lines[1].removeprefix("PFMETRICS "))
+    assert second["step"] == 4
 
 
 def test_train_survives_transient_outer_sync_failures():
