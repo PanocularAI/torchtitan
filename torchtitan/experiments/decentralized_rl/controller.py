@@ -83,6 +83,30 @@ class RLTrainer(Controller):
         )
         self._generate_fn = self._make_generate_fn(metrics_prefix="generator")
         self._group_counter = itertools.count()
+        # Local-generation replicas source groups from the upstream async
+        # producer pipeline (RolloutGroupWorkBuffer + one rollout worker per
+        # slot + data input) instead of the serial one-group-at-a-time path:
+        # serial collection left the vLLM engines at group_size sequences in
+        # flight (~2% of the sized rollout_concurrency budget) and paid
+        # sum(group latencies) per step where the pipeline pays max().
+        # Pure learners (num_generators == 0) have no local generation to
+        # pipeline; they keep consuming their remote queue.
+        self._producers_started = False
+
+    def _start_producers_if_local_generation(self) -> None:
+        """Start the rollout producer pipeline (after pre-training validation,
+        so validation runs on idle engines, matching Controller.run's order)."""
+        # getattr: pure-learner fakes in the tests carry a bare namespace config.
+        if getattr(self.config, "num_generators", 0) > 0:
+            self._start_rollout_producers()
+            self._producers_started = True
+
+    async def _stop_producers_if_started(self) -> None:
+        # getattr: pure learners override _build_sync_pipeline and never set
+        # the flag, and there is nothing to stop for them.
+        if getattr(self, "_producers_started", False):
+            self._producers_started = False
+            await self._stop_rollout_producers()
 
     async def _rollout_one_group(self, *, sampling, step: int) -> RolloutGroup:
         """Generate + score one rollout group synchronously (the synchronous
@@ -111,15 +135,37 @@ class RLTrainer(Controller):
         happens once ``num_prompts_per_train_step`` trainable groups have
         accumulated. Returns ``(packed_batch, rollout_groups)``; the groups are
         kept for the reward metric in the per-window log line.
+
+        With the producer pipeline running, groups come out of the shared
+        ``RolloutGroupWorkBuffer`` (windowed FIFO, generated concurrently by
+        the rollout workers); the serial ``_rollout_one_group`` path remains
+        only as the no-pipeline fallback. Untrainable groups release their
+        buffer slot immediately (upstream ``_batcher_loop`` contract); trained
+        slots are released after the post-step generator refresh, preserving
+        the born-fresh invariant.
         """
         rollout_groups: list[RolloutGroup] = []
         packed = None
         while packed is None:
-            group = await self._rollout_one_group(sampling=self._sampling, step=step)
+            if self._producers_started:
+                group = await self._group_buffer.take_finalized()
+                if group is None:
+                    raise RuntimeError(
+                        "rollout group buffer closed while a training batch "
+                        "was still being collected"
+                    )
+            else:
+                group = await self._rollout_one_group(
+                    sampling=self._sampling, step=step
+                )
             rollout_groups.append(group)
             training_sample_group = self._training_sample_builder.build_from_group(
                 rollout_group=group
             )
+            if self._producers_started and not training_sample_group.training_samples:
+                await self._group_buffer.release_active_groups(
+                    1, reason="untrainable_group"
+                )
             packed = self._batcher.add_training_samples(
                 training_sample_group=training_sample_group
             )
@@ -189,6 +235,13 @@ class RLControllerMixin:
         optim_output, last_loss = await self._apply_training_batch(packed)
         self._policy_version = optim_output.policy_version
         await self._refresh_generators()
+        if getattr(self, "_producers_started", False):
+            # Born-fresh: admit the next groups only now that the generators
+            # hold the just-trained weights (mirrors upstream's
+            # WeightSyncManager release-after-pull).
+            await self._group_buffer.release_active_groups(
+                self.config.async_loop.num_prompts_per_train_step, reason="trained"
+            )
 
         rewards = [
             r.reward for g in rollout_groups for r in g.rollouts if r.reward is not None
@@ -378,6 +431,16 @@ class RLControllerMixin:
 
         try:
             await self._train_setup()
+            # After pre-training validation (idle engines for it) and after
+            # _train_setup (the coordinator connection precedes any rollout
+            # work, same order as the serial loop).
+            # getattr: the mixin's documented host is RLTrainer, but the unit
+            # tests drive train() on bare fakes; producer hooks are optional there.
+            start_producers = getattr(
+                self, "_start_producers_if_local_generation", None
+            )
+            if start_producers is not None:
+                start_producers()
 
             global_step = 0
             outer = 0
@@ -407,6 +470,13 @@ class RLControllerMixin:
                 # socket stall on the hub therefore ended run 947642665102
                 # four steps in, with the PS holding perfectly good weights.
                 try:
+                    # Pause admission during the merge so no rollout is BORN
+                    # under weights the sync is about to replace ("keep the
+                    # deepest stale sample inside a window" — the preset's
+                    # target_offpolicy_steps < sync_every contract). In-flight
+                    # groups keep generating and are IS-priced by version.
+                    if getattr(self, "_producers_started", False):
+                        await self._group_buffer.pause()
                     extra = await self._window_sync(t0)
                     sync_failures = 0
                 except Exception:
@@ -423,6 +493,8 @@ class RLControllerMixin:
                     if sync_failures >= self._MAX_SYNC_FAILURES:
                         raise
                     extra = None
+                if getattr(self, "_producers_started", False):
+                    await self._group_buffer.resume()
                 val_agg = self._aggregate_validation(
                     await self._validate_fixed(global_step)
                 )
@@ -467,6 +539,12 @@ class RLControllerMixin:
                 logger.info("PFMETRICS %s", json.dumps(pf, sort_keys=True))
                 outer += 1
 
+            # Idle the engines before the held-out pass (mirrors run()'s
+            # producers-then-validate teardown order); the finally's stop is
+            # then a no-op on this path.
+            stop_producers = getattr(self, "_stop_producers_if_started", None)
+            if stop_producers is not None:
+                await stop_producers()
             await self._train_teardown()
             logger.info("[replica %d] post-training validation", rid)
             post_acc = self._aggregate_validation(
@@ -474,6 +552,9 @@ class RLControllerMixin:
             )
             logger.info("[replica %d] pre=%s -> post=%s", rid, pre_acc, post_acc)
         finally:
+            stop_producers = getattr(self, "_stop_producers_if_started", None)
+            if stop_producers is not None:
+                await stop_producers()
             await self._train_cleanup()
 
 

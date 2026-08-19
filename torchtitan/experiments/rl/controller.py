@@ -778,10 +778,7 @@ class Controller(Configurable):
             f"window_size={window_size}, max_offpolicy_steps={async_loop.max_offpolicy_steps}"
         )
 
-        self._group_buffer = async_loop.group_buffer.build(
-            max_active_rollout_groups=max_active_rollout_groups,
-            window_size=window_size,
-        )
+        self._start_rollout_producers()
 
         # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step's fwd/bwd
         self._weight_sync = WeightSyncManager(
@@ -806,28 +803,6 @@ class Controller(Configurable):
             maxsize=1
         )
 
-        # rollout_loop
-        generate_fn = self._make_generate_fn(metrics_prefix="generator")
-
-        # One rollout worker per active buffer slot: lets generation fill the whole windowed FIFO range,
-        # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
-        # TODO: support warm start
-        rollout_tasks = [
-            asyncio.create_task(
-                self._rollout_loop(
-                    group_buffer=self._group_buffer,
-                    generate_fn=generate_fn,
-                ),
-                name=f"rollout_worker_{group_worker_id}",
-            )
-            for group_worker_id in range(max_active_rollout_groups)
-        ]
-
-        # data_input_loop
-        data_input_task = asyncio.create_task(
-            self._data_input_loop(self._group_buffer), name="data_input"
-        )
-
         # training_sample_batcher_loop
         batcher_task = asyncio.create_task(
             self._batcher_loop(
@@ -850,8 +825,7 @@ class Controller(Configurable):
         # run everything until trainer finishes its number of steps
         # or some other loop breaks
         background_tasks = [
-            data_input_task,
-            *rollout_tasks,
+            *self._producer_tasks,
             batcher_task,
         ]
         try:
@@ -899,6 +873,47 @@ class Controller(Configurable):
                 f"  {key}:  {pre.get(key, float('nan')):+.3f}  /  {post.get(key, float('nan')):+.3f}"
             )
         logger.info("=" * 60)
+
+    def _start_rollout_producers(self) -> None:
+        """Build the group buffer and start the producer tasks (rollout workers +
+        data input). Factored out of run() so coordinators that drive the consume
+        side themselves (decentralized_rl's windowed loop) can reuse the exact
+        producer pipeline. Sets ``self._group_buffer`` / ``self._producer_tasks``.
+        """
+        async_loop = self.config.async_loop
+        max_active_rollout_groups = async_loop.max_active_rollout_groups
+        self._group_buffer = async_loop.group_buffer.build(
+            max_active_rollout_groups=max_active_rollout_groups,
+            window_size=async_loop.window_size,
+        )
+        generate_fn = self._make_generate_fn(metrics_prefix="generator")
+        # One rollout worker per active buffer slot: lets generation fill the whole windowed FIFO range,
+        # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
+        # TODO: support warm start
+        self._producer_tasks: list[asyncio.Task] = [
+            asyncio.create_task(
+                self._rollout_loop(
+                    group_buffer=self._group_buffer,
+                    generate_fn=generate_fn,
+                ),
+                name=f"rollout_worker_{group_worker_id}",
+            )
+            for group_worker_id in range(max_active_rollout_groups)
+        ]
+        self._producer_tasks.append(
+            asyncio.create_task(
+                self._data_input_loop(self._group_buffer), name="data_input"
+            )
+        )
+
+    async def _stop_rollout_producers(self) -> None:
+        """Tear down what _start_rollout_producers started: close the buffer
+        (wakes loops blocked on it), cancel the tasks, and await them. run()
+        has its own equivalent finally block; this is for external drivers."""
+        await self._group_buffer.close()
+        for task in self._producer_tasks:
+            task.cancel()
+        await asyncio.gather(*self._producer_tasks, return_exceptions=True)
 
     async def _data_input_loop(self, group_buffer: RolloutGroupWorkBuffer) -> None:
         """produces a RolloutGroupWork into group_buffer.
