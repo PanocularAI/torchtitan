@@ -216,18 +216,24 @@ class AsyncInferenceWorker:
             )
             return result.get(0)
 
-        groups = []
-        for i in range(self.config.groups_per_round):
-            sample = self._rollouter.get_training_sample()
-            group = await self._rollouter.run_group_rollouts(
-                generate_fn=generate_fn,
-                sample=sample,
-                group_id=f"worker={self.config.worker_id}/v{self._version}/group={i}",
-                group_size=self.config.group_size,
-                sampling=self._sampling,
-                renderer=self.renderer,
+        # All of the round's groups generate CONCURRENTLY: the serial
+        # one-group-at-a-time loop capped the engine at group_size sequences
+        # in flight (measured: 16 of a ~107-seq budget on B-dec-n1), the same
+        # bug class the co-located collector had (controller.py's
+        # _collect_training_batch).
+        groups = await asyncio.gather(
+            *(
+                self._rollouter.run_group_rollouts(
+                    generate_fn=generate_fn,
+                    sample=self._rollouter.get_training_sample(),
+                    group_id=f"worker={self.config.worker_id}/v{self._version}/group={i}",
+                    group_size=self.config.group_size,
+                    sampling=self._sampling,
+                    renderer=self.renderer,
+                )
+                for i in range(self.config.groups_per_round)
             )
-            groups.append(group)
+        )
 
         accepted = await self._rollout_queue_client.send(
             self.config.worker_id, self._version, groups
