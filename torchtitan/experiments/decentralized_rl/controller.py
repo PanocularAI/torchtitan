@@ -324,6 +324,10 @@ class RLControllerMixin:
         window_rewards: list[float] = []
         last = None
         global_step = start_step
+        # Trainer idle: wall time the trainer mesh spent blocked on the
+        # collection task instead of doing fwd/bwd. High fraction => generation
+        # is the bottleneck (add generators); ~0 => trainer-bound.
+        self._window_wait_s = 0.0
 
         global_step += 1
         pending = asyncio.create_task(self._collect_and_build(global_step))
@@ -331,6 +335,7 @@ class RLControllerMixin:
             for _h in range(sync_every):
                 iter_t0 = time.perf_counter()
                 packed, rollout_groups = await pending
+                self._window_wait_s += time.perf_counter() - iter_t0
                 pending = None
                 if _h != sync_every - 1:
                     global_step += 1
@@ -555,6 +560,12 @@ class RLControllerMixin:
                 }
                 if not math.isnan(val_reward):
                     pf["val_reward"] = val_reward
+                # getattr: tests drive train() with a stubbed _run_window.
+                pf["trainer_idle_frac"] = round(
+                    getattr(self, "_window_wait_s", 0.0)
+                    / max(pf["window_s"], 1e-9),
+                    3,
+                )
                 window_yield = self._window_yield_snapshot()
                 if window_yield:
                     pf.update(window_yield)
