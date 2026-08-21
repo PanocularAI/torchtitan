@@ -17,6 +17,7 @@
 
 
 import asyncio
+import itertools
 import logging
 import os
 import time
@@ -190,13 +191,19 @@ class AsyncInferenceWorker:
             version,
         )
 
-    async def _generate_and_send_round(self) -> None:
-        """Generate groups_per_round rollout groups against the current
-        weights, then push them to the trainer's rollout queue. Mirrors
+    async def _rollout_one_group(self, index: int):
+        """Generate ONE rollout group and return ``(group, version)``, where
+        version is the checkpoint the group was SPAWNED under -- the send must
+        tag it with that, not with whatever the worker holds at send time (a
+        checkpoint may swap while the group is in flight). Mirrors
         AsyncInferenceReplica._collect_groups_on's generate_fn wiring (same
         rollouter.run_group_rollouts contract), minus the training-batch
         plumbing this role has no use for -- the trainer assembles training
-        batches from these groups itself once they land in its buffer."""
+        batches from these groups itself once they land in its buffer.
+
+        round_slowdown_factor (heterogeneous-hardware emulation) stretches the
+        group's own duration, keeping its concurrency slot occupied the way a
+        slower inference GPU would."""
 
         async def generate_fn(
             prompt_token_ids,
@@ -216,45 +223,48 @@ class AsyncInferenceWorker:
             )
             return result.get(0)
 
-        groups = []
-        for i in range(self.config.groups_per_round):
-            sample = self._rollouter.get_training_sample()
-            group = await self._rollouter.run_group_rollouts(
-                generate_fn=generate_fn,
-                sample=sample,
-                group_id=f"worker={self.config.worker_id}/v{self._version}/group={i}",
-                group_size=self.config.group_size,
-                sampling=self._sampling,
-                renderer=self.renderer,
-            )
-            groups.append(group)
-
-        accepted = await self._rollout_queue_client.send(
-            self.config.worker_id, self._version, groups
+        version = self._version
+        t0 = time.perf_counter()
+        group = await self._rollouter.run_group_rollouts(
+            generate_fn=generate_fn,
+            sample=self._rollouter.get_training_sample(),
+            group_id=f"worker={self.config.worker_id}/v{version}/group={index}",
+            group_size=self.config.group_size,
+            sampling=self._sampling,
+            renderer=self.renderer,
         )
-        if not accepted:
-            logger.warning(
-                "[worker %d] trainer rejected/unreachable; dropped %d rollout group(s)",
-                self.config.worker_id,
-                len(groups),
-            )
+        factor = self.config.round_slowdown_factor
+        if factor > 1.0:
+            await asyncio.sleep((factor - 1.0) * (time.perf_counter() - t0))
+        return group, version
 
     async def run(self) -> None:
-        """Free-run generation with a BACKGROUND checkpoint prefetch: a
-        newer checkpoint downloads from the relay concurrently with the
-        current round's generation (the vLLM awaits yield the event loop),
-        so the GPU never idles through a multi-GB fetch -- only the brief
-        engine weight swap between rounds pauses generation. The worker never
-        waits for a newer checkpoint before generating (that would deadlock
-        the trainer; its max_staleness bound tolerates the version skew).
-        Before the first checkpoint lands, poll every poll_interval_s. Stops
-        after config.num_rounds counted rounds (0 = run until cancelled).
+        """Free-run generation as a CONTINUOUS pipeline: keep groups_per_round
+        rollout groups in flight and spawn a replacement the moment one
+        completes, sending each finished group to the trainer's rollout queue
+        immediately. The engine therefore never drains to a round's last
+        straggler (the old round barrier left it at 1-2 running sequences for
+        most of each round -- measured 0.385 vs ~1.5 rollouts/s/engine against
+        the co-located loop).
+
+        A newer checkpoint downloads from the relay in the background and swaps
+        in with groups still in flight -- the same in-flight weight update the
+        co-located async loop performs on its engines every optimizer step; a
+        group keeps the version it was spawned under (see _rollout_one_group).
+        The worker never waits for a newer checkpoint before generating (that
+        would deadlock the trainer; its max_staleness bound tolerates the
+        skew). Before the first checkpoint lands, poll every poll_interval_s.
+        Counts a round per groups_per_round groups sent; stops after
+        config.num_rounds rounds (0 = run until cancelled).
 
         The mean reward of the rollouts generated here is the benchmark's
         learning-curve signal: the trainer logs it per window as it consumes
         them (RLControllerMixin.train's ``reward`` field), so a decoupled swarm
         needs no separate greedy validator to measure progress."""
         rounds = 0
+        sent = 0
+        group_index = itertools.count()
+        inflight: set[asyncio.Task] = set()
         fetch = asyncio.ensure_future(
             self._relay_client.fetch_latest(min_version=self._version)
         )
@@ -264,7 +274,6 @@ class AsyncInferenceWorker:
                     result = fetch.result()  # fetch_latest never raises: None on fail
                     if result is not None:
                         version, state_dict = result
-                        # The only generation pause: the engine weight swap.
                         await self._load_checkpoint(version, state_dict)
                     fetch = asyncio.ensure_future(
                         self._relay_client.fetch_latest(min_version=self._version)
@@ -273,18 +282,38 @@ class AsyncInferenceWorker:
                     # No weights loaded yet -- nothing to generate from.
                     await asyncio.sleep(self.config.poll_interval_s)
                     continue
-                t0 = time.perf_counter()
-                await self._generate_and_send_round()
-                factor = self.config.round_slowdown_factor
-                if factor > 1.0:
-                    # Heterogeneous-hardware emulation: stretch this round to
-                    # factor x its measured duration (a slower inference GPU).
-                    await asyncio.sleep((factor - 1.0) * (time.perf_counter() - t0))
-                rounds += 1
+                while len(inflight) < self.config.groups_per_round:
+                    inflight.add(
+                        asyncio.create_task(
+                            self._rollout_one_group(next(group_index))
+                        )
+                    )
+                # The timeout keeps checkpoint swaps from being gated on a
+                # slow group's completion.
+                done, inflight = await asyncio.wait(
+                    inflight,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=self.config.poll_interval_s or 1.0,
+                )
+                for task in done:
+                    group, version = task.result()
+                    accepted = await self._rollout_queue_client.send(
+                        self.config.worker_id, version, [group]
+                    )
+                    if not accepted:
+                        logger.warning(
+                            "[worker %d] trainer rejected/unreachable; dropped "
+                            "a rollout group",
+                            self.config.worker_id,
+                        )
+                    sent += 1
+                    if sent % self.config.groups_per_round == 0:
+                        rounds += 1
         finally:
-            if not fetch.done():
-                fetch.cancel()
-                await asyncio.gather(fetch, return_exceptions=True)
+            for task in (fetch, *inflight):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(fetch, *inflight, return_exceptions=True)
 
     async def close(self) -> None:
         if self.generator is not None:
