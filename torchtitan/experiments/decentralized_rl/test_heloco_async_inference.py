@@ -23,8 +23,8 @@ from aiohttp.test_utils import TestServer
 
 from torchtitan.experiments.decentralized_rl.config_registry import base_rl_config, wrap_replica
 
-from torchtitan.experiments.decentralized_rl.relay import RelayClient, RelayServer
-from torchtitan.experiments.decentralized_rl.parameter_server import _watch_and_publish
+from panoengine.decentralized.relay import RelayClient, RelayServer
+from panoengine.decentralized.parameter_server import _watch_and_publish
 from torchtitan.experiments.decentralized_rl.replicas import HeLoCoAsyncInferenceReplica
 
 

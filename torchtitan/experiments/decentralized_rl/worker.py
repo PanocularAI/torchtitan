@@ -35,8 +35,8 @@ from torchtitan.tools.logging import init_logger  # noqa: E402
 from monarch.actor import this_host  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
-from torchtitan.experiments.decentralized_rl.relay import RelayClient  # noqa: E402
-from torchtitan.experiments.decentralized_rl.rollout_queue import (
+from panoengine.decentralized.relay import RelayClient  # noqa: E402
+from panoengine.decentralized.rollout_queue import (
     RolloutQueuePushClient,
 )  # noqa: E402
 

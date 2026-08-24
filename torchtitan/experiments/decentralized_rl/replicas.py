@@ -36,16 +36,16 @@ from torchtitan.experiments.decentralized_rl.controller import (
     RLControllerMixin,
     RLTrainer,
 )
-from torchtitan.experiments.decentralized_rl.parameter_server import (
+from panoengine.decentralized.parameter_server import (
     HeLoCoRLClient,
     param_metadata,
 )
-from torchtitan.experiments.decentralized_rl.relay import (
+from panoengine.decentralized.relay import (
     build_manifest,
     RelayClient,
     shard_state_dict,
 )
-from torchtitan.experiments.decentralized_rl.rollout_queue import (
+from panoengine.decentralized.rollout_queue import (
     RolloutQueuePopClient,
 )
 from torchtitan.experiments.rl import controller as _rl_controller_mod

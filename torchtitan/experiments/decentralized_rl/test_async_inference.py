@@ -22,7 +22,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 import torchtitan.experiments.decentralized_rl.worker as worker_mod
-from torchtitan.experiments.decentralized_rl.relay import (
+from panoengine.decentralized.relay import (
     build_manifest,
     reassemble_state_dict,
     RelayClient,
@@ -31,7 +31,7 @@ from torchtitan.experiments.decentralized_rl.relay import (
     ShardIntegrityError,
     verify_shard,
 )
-from torchtitan.experiments.decentralized_rl.rollout_queue import (
+from panoengine.decentralized.rollout_queue import (
     RolloutQueuePopClient,
     RolloutQueuePushClient,
     RolloutQueueServer,
