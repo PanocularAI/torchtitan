@@ -41,6 +41,15 @@ directory: the controller, actors, parameter server, relay, replicas, rollout qu
 | `run_train.sh` | +43 / −5 | |
 | `tests/unit_tests/test_config_manager.py` | +23 / −0 | Covers the `_import_registry` change. |
 
+## The engine owns the decentralized primitives
+
+`experiments/torchft/manager.py` and `experiments/decentralized_rl/parameter_server.py` now
+import `panoengine.decentralized.{async_diloco,heloco}` — the algorithms moved to
+panofabric-engine. Both imports are **deferred** (inside the HeLoCo code path), so nothing
+here imports the engine at module-init time, and `panofabric-engine[decentralized]` pulls
+torchft only, never torchtitan. The dependency direction stays one-way: this fork is an
+adapter over the engine's primitives, not their home.
+
 ## Why `decentralized_rl` cannot leave the fork
 
 It subclasses `torchtitan.experiments.rl`'s `PolicyTrainer` — upstream's *own experimental

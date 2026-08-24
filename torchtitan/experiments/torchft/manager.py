@@ -283,7 +283,7 @@ def maybe_semi_sync_training(
 
             import torch.distributed as pt_dist
 
-            from torchft.async_diloco import AsyncDiLoCo
+            from panoengine.decentralized.async_diloco import AsyncDiLoCo
 
             if pp_enabled:
                 raise RuntimeError(

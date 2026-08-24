@@ -20,7 +20,7 @@ def test_real_server_roundtrip(should_quantize):
     With plain SGD(lr=1) the outer step theta - 1.0 * (theta - theta_local)
     lands exactly on theta_local, so the expected result is exact (up to int8
     quantization error on the uploaded pseudo-gradient when quantizing)."""
-    from torchft.async_diloco import AsyncDiLoCoServer
+    from panoengine.decentralized.async_diloco import AsyncDiLoCoServer
 
     torch.manual_seed(0)
     model = nn.Linear(4, 3)  # fp32 CPU
@@ -65,7 +65,7 @@ def test_fragment_roundtrip_matches_whole_model():
     fragmented server land bitwise where one whole-model push against a P=1
     twin lands (per-parameter outer math — see torchft's fragment tests),
     and each push only carries/returns its own fragment's names."""
-    from torchft.async_diloco import AsyncDiLoCoServer
+    from panoengine.decentralized.async_diloco import AsyncDiLoCoServer
 
     def make(num_fragments):
         torch.manual_seed(0)

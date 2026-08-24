@@ -44,13 +44,13 @@ import aiohttp
 import torch
 from torch import nn
 
-from torchft.async_diloco import (
+from panoengine.decentralized.async_diloco import (
     _fragment_bounds,
     AsyncDiLoCo,
     AsyncDiLoCoServer,
     DelayedNesterovOptimizer,
 )
-from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
+from panoengine.decentralized.heloco import HeLoCoOptimizer, HeLoCoServer
 
 from torchtitan.experiments.decentralized_rl.relay import (
     build_manifest,
@@ -124,7 +124,7 @@ def build_server(
     # DelayedNesterovOptimizer counts pushes GLOBALLY for its momentum
     # milestones, so per-fragment pushes would corrupt its schedule; HeLoCo's
     # momentum, block correction and look-ahead are all per-parameter and
-    # commit fragments exactly (see torchft.async_diloco._fragment_bounds).
+    # commit fragments exactly (see panoengine.decentralized.async_diloco._fragment_bounds).
     if num_fragments is not None and num_fragments > 1:
         if outer_method != "heloco":
             raise ValueError(
