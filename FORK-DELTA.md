@@ -3,20 +3,32 @@
 What this fork adds on top of upstream `pytorch/torchtitan`, why it cannot all live outside
 the fork, and which patches are candidates to send upstream.
 
-Measured at `8dab0716` vs upstream base `0b2a804dd`: **34 files, +8032 / −119.**
+Measured vs upstream base `0b2a804dd`: **34 files, +5561 / −119.**
+
+> The HeLoCo parameter server, the relay, the rollout queue and the 44 RL presets **used to
+> live here** (~2500 lines). They moved to panofabric-engine, because the three services are
+> torchtitan-free and the presets only compose public classes. Four shims remain at their old
+> module paths, because the control plane launches three of them by name on the node and
+> `--module decentralized_rl` is a stored-spec value.
 
 ## The cost model
 
 A rebase conflicts only on files **both sides touched**. Added files never conflict. So the
-carrying cost of this fork is not the 8,032 added lines — it is the **119 deleted lines
+carrying cost of this fork is not the 5,561 added lines — it is the **119 deleted lines
 across 18 modified files**. Shrinking that set is the only thing that makes upstream syncs
 cheap.
 
 ### Added — never conflicts, stays here
 
-`torchtitan/experiments/decentralized_rl/` — 15 of our 16 new files, one self-contained
-directory: the controller, actors, parameter server, relay, replicas, rollout queue, and a
-44-function `config_registry` of RL presets.
+`torchtitan/experiments/decentralized_rl/` — one self-contained directory, now the RL
+**adapter**: the controller, the Monarch trainer actors, and the replica classes, i.e. exactly
+the parts that subclass upstream's `PolicyTrainer` and `Controller`. Plus four transitional
+shims for what moved to the engine.
+
+The three service shims are **dual-use** — entry point under `-m`, client library when
+imported — and the two halves must stay mutually exclusive. Doing both unconditionally
+executes the real module twice (once imported, once as `__main__`), duplicating module-level
+server state; Python warns about it. Read the shim docstrings before touching them.
 
 ### Modified — the conflict surface
 
