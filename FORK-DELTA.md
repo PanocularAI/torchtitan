@@ -3,34 +3,50 @@
 What this fork adds on top of upstream `pytorch/torchtitan`, why it cannot all live outside
 the fork, and which patches are candidates to send upstream.
 
-Measured vs upstream base `0b2a804dd`: **34 files, +5561 / −119.**
+Measured vs upstream base `0b2a804dd`: **17 files, +756 / −114** — and 16 of those 17 are
+*modified upstream files*. The only added file is this one.
+(It was 34 files / +5561 before everything RL moved to the engine.)
 
-> The HeLoCo parameter server, the relay, the rollout queue and the 44 RL presets **used to
-> live here** (~2500 lines). They moved to panofabric-engine, because the three services are
-> torchtitan-free and the presets only compose public classes. Four shims remain at their old
-> module paths, because the control plane launches three of them by name on the node and
-> `--module decentralized_rl` is a stored-spec value.
+> **This fork now adds no packages of its own.** The HeLoCo parameter server, the relay, the
+> rollout queue, the RL presets, the whole of `decentralized_rl`, and the HF-backend RL glue
+> all moved to panofabric-engine — including the compatibility shims, which live there now as
+> `panoengine.train.rl`. Run specs stored in the control plane's database still say `--module
+> decentralized_rl`; controld translates that to the engine path when it builds the argv, so
+> neither repo ships a package under that name. `experiments/rl/` — the RL implementation
+> itself — stays here, and the engine imports it from this fork.
 
 ## The cost model
 
 A rebase conflicts only on files **both sides touched**. Added files never conflict. So the
-carrying cost of this fork is not the 5,561 added lines — it is the **119 deleted lines
-across 18 modified files**. Shrinking that set is the only thing that makes upstream syncs
+carrying cost of this fork is not the 756 added lines — it is the **114 deleted lines
+across 16 modified files**. Shrinking that set is the only thing that makes upstream syncs
 cheap.
 
 ### Added — never conflicts, stays here
 
-`torchtitan/experiments/decentralized_rl/` — one self-contained directory, now the RL
-**adapter**: the controller, the Monarch trainer actors, and the replica classes, i.e. exactly
-the parts that subclass upstream's `PolicyTrainer` and `Controller`. Plus four transitional
-shims for what moved to the engine.
+**Nothing but this file.** Every Panocular package that used to live here — the HeLoCo
+parameter server, the relay, the rollout queue, the RL presets, all of `decentralized_rl`
+(controller, Monarch trainer actors, replica strategies), and the HF-backend RL glue that sat
+in `experiments/transformers_modeling_backend/rl/` — is in panofabric-engine now.
 
-The three service shims are **dual-use** — entry point under `-m`, client library when
-imported — and the two halves must stay mutually exclusive. Doing both unconditionally
-executes the real module twice (once imported, once as `__main__`), duplicating module-level
-server state; Python warns about it. Read the shim docstrings before touching them.
+The control plane launches the engine's paths directly: `panoengine.train.rl.{train,worker}`
+and `panoengine.decentralized.{parameter_server,relay,rollout_queue}`. Run specs already stored
+in its database name `--module decentralized_rl`. That name is a **control-plane** value and
+never was an importable module, so controld maps it to `panoengine.train.rl` on the way into
+argv (`spec/runspec.py`'s `engine_module()`), and neither repo carries a shim package for it.
+The spec keeps the value its author wrote; only the argv is translated.
+
+Consequence worth knowing: `panofabric-engine` must be importable wherever a run is launched.
+It already was — the presets have lived there for a while — but now the entry points do too, so
+**controld and the engine image have to move together**. A controld that names
+`panoengine.train.rl.train` cannot launch against an image predating it.
 
 ### Modified — the conflict surface
+
+Two files that used to be here are gone from this list: `run_train.sh` (its `FT_ENABLE`
+launch wrapper moved to the engine's own `run_train.sh`, so this one is byte-identical to
+upstream) and `experiments/__init__.py` (it only registered `decentralized_rl`).
+
 
 | File | Δ | What we changed |
 |---|---|---|
@@ -49,26 +65,35 @@ server state; Python warns about it. Read the shim docstrings before touching th
 | `torchtitan/experiments/transformers_modeling_backend/parallelize.py` | +26 / −20 | HF-architecture backend fixes. |
 | `torchtitan/experiments/transformers_modeling_backend/state_dict_adapter.py` | +18 / −0 | Tied-embedding aliasing at load. |
 | `torchtitan/distributed/utils.py` | +8 / −1 | |
-| `torchtitan/experiments/__init__.py` | +1 / −0 | Registers `decentralized_rl`. |
-| `run_train.sh` | +43 / −5 | |
 | `tests/unit_tests/test_config_manager.py` | +23 / −0 | Covers the `_import_registry` change. |
 
 ## The engine owns the decentralized primitives
 
-`experiments/torchft/manager.py` and `experiments/decentralized_rl/parameter_server.py` now
-import `panoengine.decentralized.{async_diloco,heloco}` — the algorithms moved to
-panofabric-engine. Both imports are **deferred** (inside the HeLoCo code path), so nothing
-here imports the engine at module-init time, and `panofabric-engine[decentralized]` pulls
+`experiments/torchft/manager.py` imports `panoengine.decentralized.{async_diloco,heloco}` —
+the algorithms live in panofabric-engine. The import is **deferred** (inside the HeLoCo code
+path), so nothing here imports the engine at module-init time, and `panofabric-engine[decentralized]` pulls
 torchft only, never torchtitan. The dependency direction stays one-way: this fork is an
 adapter over the engine's primitives, not their home.
 
-## Why `decentralized_rl` cannot leave the fork
+## Why `decentralized_rl` left the fork — and why `experiments/rl` did not
 
-It subclasses `torchtitan.experiments.rl`'s `PolicyTrainer` — upstream's *own experimental
-directory*, the least stable API surface in the repo. Out of tree we would still eat every
-API break (`dae3961af compat(rl): adapt decentralized_rl to upstream's post-rebase APIs` is
-that bill already arriving once) **and** lose the ability to patch upstream in place when it
-breaks. Strictly worse.
+`decentralized_rl` subclassed `torchtitan.experiments.rl`'s `PolicyTrainer` and `Controller`.
+Subclassing works across a package boundary, so that alone never required living in-tree —
+and measured on the current code those classes override **zero** base methods between them;
+every method they define is an addition. They needed those classes as bases, not as things to
+patch. So they moved to `panoengine/train/rl/`, with shims left here at every
+path a stored spec or a live image can name.
+
+`experiments/rl` itself did NOT move, and a vendored copy of it in the engine was tried and
+deleted. Duplicating a directory this fork already carries — including this fork's own six
+modified files in it (+280/−80) — means every upstream rebase improves one copy and not the
+other. One live copy, here, imported by the engine.
+
+The bill that remains is real: the engine now eats upstream's experimental-API breaks
+(`dae3961af compat(rl): adapt decentralized_rl to upstream's post-rebase APIs` is that bill
+arriving once already), and it cannot patch upstream in place from over there. It is bounded by
+the engine's SHA pin on this fork. If the drift gets expensive, moving the coordinators back
+here is the escape hatch.
 
 Keeping a fork is free. Carrying a diff on *modified* files is what costs. Optimize the latter.
 
@@ -84,7 +109,7 @@ Each merged PR permanently deletes fork surface. All are small and independently
 | Don't bound a multi-GB relay transfer with a total timeout (`fa05a8f05`) | small | |
 | Give the replica/worker mains a stdout log handler (`6a0741b41`) | small | |
 
-**Target: 18 modified files → 2–3.** Then the next upstream sync is minutes, not a branch.
+**Target: 16 modified files → 2–3.** Then the next upstream sync is minutes, not a branch.
 
 Nothing in this repo blocks on a PR landing. The fork already carries every patch and keeps
 carrying it; each merge is simply a free deletion whenever it happens.

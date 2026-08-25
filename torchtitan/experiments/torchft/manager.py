@@ -272,9 +272,12 @@ def maybe_semi_sync_training(
             )
         elif semi_sync_method.lower() == "heloco":
             # The parameter-server member of the family: each worker POSTs
-            # its pseudo-gradient to torchft's HeLoCoServer over HTTP (the
-            # decentralized_rl parameter_server process) and pulls back the
-            # look-ahead global params -- no cross-worker collective. The FT
+            # its pseudo-gradient over HTTP to the HeLoCoServer running inside
+            # the `panoengine.decentralized.parameter_server` process, and pulls
+            # back the look-ahead global params -- no cross-worker collective.
+            # The trainer-side class is AsyncDiLoCo for both parameter-server
+            # strategies; what makes this HeLoCo is server-side
+            # (panoengine.decentralized.heloco.HeLoCoOptimizer). The FT
             # manager (and its lighthouse) stays required regardless: the
             # trainer derives its dataloader shard from it. The server's
             # URLs are runtime addresses launchers export from the PS
