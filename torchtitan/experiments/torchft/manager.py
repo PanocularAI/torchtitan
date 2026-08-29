@@ -339,6 +339,7 @@ def maybe_semi_sync_training(
                 # the background; must match the parameter server's
                 # --num_fragments. Default 1 = whole-model sync.
                 num_fragments=extend_ft_config.num_fragments,
+                min_replicas=extend_ft_config.min_replica_size,
             )
         else:
             raise ValueError(
