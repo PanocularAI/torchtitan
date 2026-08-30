@@ -115,7 +115,20 @@ class TorchFTManager(Configurable):
 
         self._rank0_synchronization_only = config.rank0_synchronization_only
         if self._rank0_synchronization_only:
-            assert config.num_fragments == 1, "num_fragments > 1 not supported with rank 0 synchronization only"
+            # Structural for the torchft-internal methods: their fragments live
+            # inside _StreamingDiLoCoFragment, whose machinery rank0-only mode
+            # bypasses. NOT structural for heloco -- its fragment rotation runs
+            # entirely inside panoengine's AsyncDiLoCo (which splits the flat
+            # param space itself and never touches the torchft fragment path),
+            # and the heloco branch of maybe_semi_sync_training reads nothing
+            # from rank0_synchronization_only. Blanket-asserting here kept
+            # heterogeneous-island runs (which need rank0-only for the
+            # manager's init_sync) from ever overlapping their exchanges.
+            if (config.semi_sync_method or "").lower() != "heloco":
+                assert config.num_fragments == 1, (
+                    "num_fragments > 1 not supported with rank 0 "
+                    "synchronization only (except semi_sync_method='heloco')"
+                )
 
         process_group_timeout = timedelta(milliseconds=config.process_group_timeout_ms)
         if config.process_group == "gloo":
