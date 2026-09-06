@@ -27,16 +27,11 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from torchtitan.distributed.minimal_async_ep.kernels import (
-    copy_full_counts_to_peers_kernel,
-    copy_rows_to_peers_kernel,
-    expand_topk_grad_kernel,
-    fill_combine_metadata_kernel,
-    fill_dispatch_metadata_kernel,
-    invert_flat_indices_kernel,
-    reduce_topk_slots_kernel,
-    topk_scores_grad_kernel,
-)
+# Kernels are imported INSIDE each function below, not here: kernels.py does
+# `import triton` at module scope, and this module is reachable from every
+# model's config path (models/common/token_dispatcher.py). Deferring keeps a
+# triton-free install able to DESCRIBE a MoE model even though it could never
+# run these ops -- which is exactly what CPU-only perf modelling and tooling do.
 from torchtitan.tools.logging import logger
 
 
@@ -183,6 +178,13 @@ def init_buffer(
     device: torch.device,
 ) -> None:
     """Initialize or reuse the process-local MinimalAsyncEP communication buffer."""
+    # Import the kernels here even though this function uses none of them: with the
+    # module-level import deferred (see the note at the top), a triton-less install
+    # would otherwise get all the way to the first dispatch before failing. This is
+    # setup, runs once, and is the earliest point that knows MinimalAsyncEP is really
+    # in use — so the ModuleNotFoundError lands somewhere it can be understood.
+    from torchtitan.distributed.minimal_async_ep import kernels  # noqa: F401
+
     global _buffer_key, _buffer_state
 
     device = torch.device(device)
@@ -315,6 +317,10 @@ def _copy_rows_to_peers_and_wait_cuda(
     simple for graph capture, but means this backend does not provide
     microbatch communication overlap.
     """
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        copy_rows_to_peers_kernel,
+    )
+
     assert _buffer_state is not None
 
     buffer_index = _buffer_state.hidden_recv_buffer_index
@@ -372,6 +378,10 @@ def _copy_all_counts_to_peers_and_wait_cuda(
     ep_size: int,
 ) -> torch.Tensor:
     """Copy this rank's expert counts to all peers and wait for peer counts."""
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        copy_full_counts_to_peers_kernel,
+    )
+
     assert _buffer_state is not None
 
     num_experts = num_local_tokens_per_expert_E.numel()
@@ -401,6 +411,11 @@ def _compute_direct_metadata(
     torch.Tensor,
     torch.Tensor,
 ]:
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        fill_combine_metadata_kernel,
+        fill_dispatch_metadata_kernel,
+    )
+
     assert _buffer_state is not None
 
     rank = _buffer_state.group.rank()
@@ -593,6 +608,10 @@ def dispatch_op(
         ``hidden_states`` plus all tensor metadata needed by combine and
         backward.
     """
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        invert_flat_indices_kernel,
+    )
+
     T_row_to_expert_N = topk_expert_ids_TK.reshape(-1)  # noqa: N806
     num_routed_rows = T_row_to_expert_N.numel()
     E_row_to_T_row_N = torch.argsort(  # noqa: N806
@@ -723,6 +742,10 @@ def combine_op(
         ``routed_output_ND``: ``(N, D)`` origin-rank E-major routed rows, saved
         for routing-score gradients.
     """
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        reduce_topk_slots_kernel,
+    )
+
     routed_output_ND = _combine_to_origin(  # noqa: N806
         x,
         combine_dst_ranks,
@@ -795,6 +818,10 @@ def dispatch_backward_op(
     Returns:
         ``(T, D)`` gradient for the dispatch input token rows.
     """
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        reduce_topk_slots_kernel,
+    )
+
     grad_routed_input = _combine_to_origin(
         grad_hidden,
         combine_dst_ranks,
@@ -858,6 +885,11 @@ def combine_backward_op(
         ``grad_x``: ``(R_max, D)`` gradient for expert output rows.
         ``grad_scores``: ``(N,)`` gradient for routed scores.
     """
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        expand_topk_grad_kernel,
+        topk_scores_grad_kernel,
+    )
+
     grad_routed_output = expand_topk_grad_kernel(
         grad_out,
         E_row_to_T_row_N,

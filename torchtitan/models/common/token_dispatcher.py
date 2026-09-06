@@ -14,12 +14,13 @@ from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.tensor import DeviceMesh
 
 from torchtitan.config import Configurable
-from torchtitan.distributed.minimal_async_ep import (
-    combine_op as minimal_async_ep_combine_op,
-    dispatch_op as minimal_async_ep_dispatch_op,
-    init_buffer as minimal_async_ep_init_buffer,
-    MinimalAsyncEPDispatchMetadata,
-)
+# minimal_async_ep is imported INSIDE the three methods that use it, not here:
+# minimal_async_ep -> api -> kernels does `import triton` unconditionally, and this
+# module sits on the import path of EVERY model (models/common/decoder.py -> moe.py
+# -> here). That made triton a hard requirement for merely DESCRIBING a dense model
+# -- 895 MB of GPU kernels for a process that may never launch one (analytical perf
+# modelling on CPU, tooling, CI). `maybe_update_minimal_async_ep_config` at the
+# bottom of this file already defers its import the same way.
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.ops.scatter_add import deterministic_scatter_add
@@ -1063,6 +1064,10 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
 
     def init_buffer(self) -> None:
         """Initialize MinimalAsyncEP's process-local symmetric-memory buffer."""
+        from torchtitan.distributed.minimal_async_ep import (
+            init_buffer as minimal_async_ep_init_buffer,
+        )
+
         if self.ep_mesh is None:
             raise ValueError("MinimalAsyncEPTokenDispatcher requires an EP mesh.")
         missing_fields = [
@@ -1122,6 +1127,11 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
             metadata: dispatch metadata for combine()
         """
         assert self.ep_mesh is not None, "ep_mesh must be set before dispatch"
+        from torchtitan.distributed.minimal_async_ep import (
+            dispatch_op as minimal_async_ep_dispatch_op,
+            MinimalAsyncEPDispatchMetadata,
+        )
+
         ep_group = self.ep_mesh.get_group()
 
         top_k = self.top_k
@@ -1175,6 +1185,11 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
         x_TD: torch.Tensor,
     ) -> torch.Tensor:
         """Combine tokens via MinimalAsyncEP."""
+        from torchtitan.distributed.minimal_async_ep import (
+            combine_op as minimal_async_ep_combine_op,
+            MinimalAsyncEPDispatchMetadata,
+        )
+
         del x_TD
         state = cast(MinimalAsyncEPDispatchMetadata, metadata.state)
         combined_TD, _routed_output_ND = minimal_async_ep_combine_op(  # noqa: N806

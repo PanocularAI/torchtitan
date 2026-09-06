@@ -108,6 +108,7 @@ Each merged PR permanently deletes fork surface. All are small and independently
 | Don't hard-require `rank0_synchronization_only` on the FT manager (`23a45fbb7`) | small | |
 | Don't bound a multi-GB relay transfer with a total timeout (`fa05a8f05`) | small | |
 | Give the replica/worker mains a stdout log handler (`6a0741b41`) | small | |
+| Defer the `triton` import off the model-description path | ~10 lines, 2 files | `models/common/token_dispatcher.py` and `distributed/minimal_async_ep/api.py` imported the MinimalAsyncEP kernels at module scope, so `import triton` was reachable from **every** model via `decoder.py -> moe.py -> token_dispatcher.py`. Merely *describing* a dense model therefore required 895 MB of GPU kernels. Both now import inside the functions that use them — the same idiom `maybe_update_minimal_async_ep_config` already used. Verified: every model registry (`llama3`, `qwen3`, `gpt_oss`, `deepseek_v3`) imports and traces with triton absent, and the kernels still resolve normally when it is present. Pure win upstream: CPU-only installs, docs builds and CI stop paying for a GPU compiler. |
 
 **Target: 16 modified files → 2–3.** Then the next upstream sync is minutes, not a branch.
 
