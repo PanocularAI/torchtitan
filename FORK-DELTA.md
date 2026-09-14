@@ -53,7 +53,8 @@ upstream) and `experiments/__init__.py` (it only registered `decentralized_rl`).
 | `torchtitan/experiments/torchft/manager.py` | +117 / −1 | FT manager wiring for the decentralized strategies. |
 | `torchtitan/experiments/torchft/checkpoint.py` | +80 / −1 | Checkpoint handling for fragment-wise sync and HF weight loads. |
 | `torchtitan/experiments/torchft/optimizer.py` | +25 / −1 | `default_ft_adamw` and friends. |
-| `torchtitan/experiments/torchft/trainer.py` | +3 / −0 | |
+| `torchtitan/experiments/torchft/trainer.py` | +3 / −0 | Plus the `ChunkedLossWrapper` lm_head wiring `Trainer.__init__` does and this subclass never did — without it ANY FT preset with a chunked loss dies at step 1. |
+| `torchtitan/models/qwen3_5/model.py` | +20 / −3 | Vision special-token lookups moved into the branches that use them, so a TEXT batch (which carries none) no longer crashes before step 1. |
 | `torchtitan/config/manager.py` | +31 / −8 | `_import_registry` re-raises a real `ImportError` instead of reporting "module not found". |
 | `torchtitan/components/metrics.py` | +26 / −2 | `StdoutJsonLogger` fallback so runs with neither wandb nor TensorBoard still emit metrics. |
 | `torchtitan/experiments/rl/models/vllm_wrapper.py` | +151 / −47 | vLLM integration for the RL generator. |
@@ -108,6 +109,8 @@ Each merged PR permanently deletes fork surface. All are small and independently
 | Don't hard-require `rank0_synchronization_only` on the FT manager (`23a45fbb7`) | small | |
 | Don't bound a multi-GB relay transfer with a total timeout (`fa05a8f05`) | small | |
 | Give the replica/worker mains a stdout log handler (`6a0741b41`) | small | |
+| qwen3_5 text-only: look up vision special tokens where used | ~20 lines | `_prepare_multimodal_embeds` read `special_tokens["image_id"]` eagerly, so any text dataloader crashed with `'NoneType' object is not subscriptable` before step 1 — though both ids are only used inside the `pixel_values is not None` branches. `muse_glimmer` already guards the same lookup. |
+| torchft trainer: wire lm_head for `ChunkedLossWrapper` | ~15 lines | A straight port of what `Trainer.__init__` already does. Without it no fault-tolerant preset can use a chunked loss, which is why every recipe pays the full logits tensor at large-vocab scale. |
 | Defer the `triton` import off the model-description path | ~10 lines, 2 files | `models/common/token_dispatcher.py` and `distributed/minimal_async_ep/api.py` imported the MinimalAsyncEP kernels at module scope, so `import triton` was reachable from **every** model via `decoder.py -> moe.py -> token_dispatcher.py`. Merely *describing* a dense model therefore required 895 MB of GPU kernels. Both now import inside the functions that use them — the same idiom `maybe_update_minimal_async_ep_config` already used. Verified: every model registry (`llama3`, `qwen3`, `gpt_oss`, `deepseek_v3`) imports and traces with triton absent, and the kernels still resolve normally when it is present. Pure win upstream: CPU-only installs, docs builds and CI stop paying for a GPU compiler. |
 
 **Target: 16 modified files → 2–3.** Then the next upstream sync is minutes, not a branch.
