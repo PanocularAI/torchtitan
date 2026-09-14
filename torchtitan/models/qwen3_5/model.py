@@ -705,7 +705,10 @@ class Qwen35Model(Decoder):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        vision_encoder: Qwen35VisionEncoder.Config
+        # None builds a DECODER-ONLY Qwen3.5: no tower, no vision params in
+        # the optimizer, and nothing for FSDP to shard. A text workload wants
+        # this -- the tower is dead weight it would still sync every step.
+        vision_encoder: Qwen35VisionEncoder.Config | None = None
 
         def update_from_config(
             self,
@@ -765,8 +768,14 @@ class Qwen35Model(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
 
-        self.vision_encoder = config.vision_encoder.build()
-        self.spatial_merge_size = config.vision_encoder.spatial_merge_size
+        self.vision_encoder = (
+            config.vision_encoder.build() if config.vision_encoder is not None else None
+        )
+        self.spatial_merge_size = (
+            config.vision_encoder.spatial_merge_size
+            if config.vision_encoder is not None
+            else None
+        )
 
     def get_attention_masks(
         self,
@@ -855,6 +864,11 @@ class Qwen35Model(Decoder):
             vision_embeds: (num_items, max_tokens, dim) padded vision embeddings
             num_tokens_per_item: (num_items,) actual token count per item
         """
+        if self.vision_encoder is None:
+            raise ValueError(
+                "this Qwen3.5 was built decoder-only (vision_encoder=None) but "
+                "the batch carries image or video inputs"
+            )
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
         vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
 
