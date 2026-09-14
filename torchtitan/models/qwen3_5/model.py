@@ -642,6 +642,27 @@ class Qwen35TransformerBlock(Module):
         return x_BLD
 
 
+def _require_special_token(special_tokens: dict[str, int] | None, name: str) -> int:
+    """The id for `name`, or a clear error naming what is missing.
+
+    Only the vision branches need these, and only a multimodal batch carries
+    them: `special_tokens` reaches forward as a dataloader-batch key, which the
+    multimodal collator sets and a text dataloader does not. Reading them
+    eagerly therefore made a TEXT-ONLY batch crash with
+    `'NoneType' object is not subscriptable` before a single step, even though
+    nothing in the text path uses them. (muse_glimmer already guards the same
+    lookup.) Looking them up where they are used keeps the text path working
+    and still fails loudly on a real multimodal batch that lacks them.
+    """
+    if not special_tokens or name not in special_tokens:
+        raise ValueError(
+            f"a multimodal batch needs special_tokens[{name!r}]; the dataloader "
+            "supplied none. Use the multimodal dataloader/tokenizer "
+            "(MMDataLoader + MultiModalTokenizer) for image or video inputs."
+        )
+    return special_tokens[name]
+
+
 class Qwen35Model(Decoder):
     """Qwen3.5: Multimodal model with hybrid attention.
 
@@ -865,14 +886,12 @@ class Qwen35Model(Decoder):
         Returns:
             (batch, seq_len, dim) embeddings with vision tokens scattered in
         """
-        image_token_id = special_tokens["image_id"]
-        video_token_id = special_tokens["video_id"]
-
         inputs_embeds = (
             self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         )
 
         if pixel_values is not None and grid_thw is not None:
+            image_token_id = _require_special_token(special_tokens, "image_id")
             vision_embeds, num_tokens = self._get_vision_embeds(
                 pixel_values, grid_thw=grid_thw
             )
@@ -885,6 +904,7 @@ class Qwen35Model(Decoder):
                 )
 
         if pixel_values_videos is not None and grid_thw_videos is not None:
+            video_token_id = _require_special_token(special_tokens, "video_id")
             vision_embeds, num_tokens = self._get_vision_embeds(
                 pixel_values_videos, grid_thw=grid_thw_videos
             )
