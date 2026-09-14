@@ -99,6 +99,7 @@ class RolloutGroupWorkBuffer(Configurable):
         self._max_active_rollout_groups = max_active_rollout_groups
         self._window_size = window_size
         self._active_rollout_groups = 0
+        self._paused = False
         # metric: Per-flush peak active slots; reset on `.metrics()` call.
         self._active_rollout_groups_peak_since_flush = 0
         self._work_by_group_id: collections.OrderedDict[
@@ -115,7 +116,23 @@ class RolloutGroupWorkBuffer(Configurable):
         # batcher consumes, so a cold start doesn't fill the whole off-policy window at policy version 0.
 
     def _has_active_slot_available(self) -> bool:
-        return self._active_rollout_groups < self._max_active_rollout_groups
+        return (
+            not self._paused
+            and self._active_rollout_groups < self._max_active_rollout_groups
+        )
+
+    async def pause(self) -> None:
+        """Stop admitting new groups (wait_for_slot blocks) without touching
+        in-flight work. Callers that must not have rollouts straddle an outer
+        weight merge (decentralized_rl's window sync) pause around the merge."""
+        async with self._condition:
+            self._paused = True
+
+    async def resume(self) -> None:
+        """Undo pause(): admission resumes, blocked wait_for_slot callers wake."""
+        async with self._condition:
+            self._paused = False
+            self._condition.notify_all()
 
     async def wait_for_slot(self) -> bool:
         """Wait until one more rollout group may enter the active buffer.

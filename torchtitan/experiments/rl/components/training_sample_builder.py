@@ -86,6 +86,11 @@ class TrainingSampleBuilder(Configurable):
             )
 
         # Zero-std reward: no learning signal across siblings.
+        # The silent hang this used to warn about (every group zero-std => the
+        # batcher never reaches num_prompts_per_train_step => no step => no
+        # metrics, since they flush AT a step) is now reported by the consumer:
+        # RLControllerMixin._collect_and_build counts groups consumed without a
+        # packed batch and warns with the drop reasons. See _warn_if_starved.
         rewards = [rollout.reward for rollout in rollout_group.rollouts]
         is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
         metrics.append(
