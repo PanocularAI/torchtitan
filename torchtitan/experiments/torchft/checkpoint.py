@@ -14,8 +14,8 @@ Adds TorchFT fault tolerance support on top of the base CheckpointManager:
 
 from __future__ import annotations
 
+import functools
 import logging
-
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -24,6 +24,13 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
 
 from torchtitan.components.checkpointer import (
     AsyncMode,
@@ -33,6 +40,7 @@ from torchtitan.components.checkpointer import (
     MODEL,
     OPTIMIZER,
     TRAIN_STATE,
+    ModelWrapper,
 )
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
@@ -99,6 +107,13 @@ class TorchFTCheckpointManager(CheckpointManager):
             base_folder=base_folder,
         )
 
+        # getattr, not attribute access: this is OUR field (heterogeneous-island
+        # rank-0 sync) and not every FTManager carries it -- upstream's test
+        # double doesn't, and an AttributeError here takes down checkpoint
+        # construction entirely. False is the field's own default (whole-model
+        # sync), so absent == legacy behaviour.
+        full_state_dict = getattr(ft_manager, "rank0_synchronization_only", False)
+
         self.ft_manager = (
             ft_manager.manager if ft_manager and ft_manager.enabled else None
         )
@@ -117,6 +132,69 @@ class TorchFTCheckpointManager(CheckpointManager):
             return
 
         if self.ft_manager:
+            if full_state_dict:
+                
+                model: ModelWrapper = self.states[MODEL]
+                assert isinstance(model, ModelWrapper)
+                def model_get_state_dict(self: ModelWrapper) -> dict[str, Any]:
+                    options = StateDictOptions(full_state_dict=True)
+                    state_dict = {
+                        k: v
+                        for sd in
+                        (get_model_state_dict(m, options=options) for m in self.model)
+                        for k, v in sd.items()
+                    }
+                    return state_dict
+
+                def model_load_state_dict(self: ModelWrapper, state_dict: dict[str, Any]) -> None:
+                    options = StateDictOptions(full_state_dict=True, strict=False)
+                    func = functools.partial(
+                        set_model_state_dict,
+                        model_state_dict=state_dict,
+                        options=options,
+                    )
+                    list(map(func, self.model))
+                    self.cache_state_dict = self._get_state_dict()
+
+                ModelWrapper._get_state_dict = model_get_state_dict
+                ModelWrapper.load_state_dict = model_load_state_dict
+
+                # overwrite cached state dict with full_state_dict == True
+                model.cache_state_dict = model._get_state_dict()
+
+                assert isinstance(optimizers, TorchFTOptimizersContainer)
+                def optimizer_init_cache_state_dict(self: TorchFTOptimizersContainer) -> None:
+                    options = StateDictOptions(
+                        full_state_dict=True,
+                        flatten_optimizer_state_dict=False
+                    )
+                    func = functools.partial(
+                        get_optimizer_state_dict,
+                        options=options,
+                    )
+                    self.cache_state_dict = {
+                        k: v
+                        for sd in map(func, self.model_parts, self.optimizers)
+                        for k, v in sd.items()
+                    }
+
+                def optimizer_load_state_dict(self: TorchFTOptimizersContainer, state_dict: dict[str, Any]) -> None:
+                    self.cache_state_dict = {}
+                    options = StateDictOptions(
+                        full_state_dict=True,
+                        flatten_optimizer_state_dict=False
+                    )
+                    func = functools.partial(
+                        set_optimizer_state_dict,
+                        optim_state_dict=state_dict,
+                        options=options,
+                    )
+                    list(map(func, self.model_parts, self.optimizers))
+                    self.init_cache_state_dict()
+
+                TorchFTOptimizersContainer.init_cache_state_dict = optimizer_init_cache_state_dict
+                TorchFTOptimizersContainer.load_state_dict = optimizer_load_state_dict
+            
             optimizers.init_cache_state_dict()
 
             def state_dict():
