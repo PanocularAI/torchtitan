@@ -474,6 +474,9 @@ class FaultTolerantTrainer(Configurable):
                 ),
                 optimizer=engine.optimizers,
                 fragment_fn=getattr(engine.model_cls, "_fragment", None),
+                # heloco refuses PP: it splits named_parameters() itself, so
+                # no gather reassembles the PS's full-model wire layout.
+                pp_enabled=engine.parallelism_context.pp_enabled,
             ),
         ):
             data_iterator = self.microbatch_generator(self.dataloader)
