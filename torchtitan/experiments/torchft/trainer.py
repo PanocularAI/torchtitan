@@ -16,7 +16,7 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
-from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.loss import ChunkedLossWrapper, IGNORE_INDEX
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.cudagraph import wrap_with_cuda_graph
@@ -254,6 +254,35 @@ class FaultTolerantTrainer(Trainer):
             model.train()
 
             self.model_parts = [model]
+
+        # Set lm_head for ChunkedLossWrapper, mirroring Trainer.__init__.
+        # The base trainer does this right after model construction; this
+        # subclass builds its model parts itself and never did, so ANY
+        # fault-tolerant preset using a chunked loss died on
+        # "Set lm_head before calling ChunkedLossWrapper" at the first step --
+        # which is why every recipe here settles for an unchunked
+        # CrossEntropyLoss, and pays the full logits tensor for it at
+        # large-vocab scale.
+        if isinstance(self.loss_fn, ChunkedLossWrapper):
+            if parallel_dims.pp_enabled:
+                if self.pp_has_last_stage:
+                    lm_head = self.model_parts[-1].lm_head
+                    assert (
+                        lm_head is not None
+                    ), "Last PP stage must have lm_head for ChunkedLossWrapper"
+                    self.loss_fn.set_lm_head(lm_head)
+                    self.model_parts[-1]._skip_lm_head = True
+            else:
+                assert len(self.model_parts) == 1
+                lm_head = self.model_parts[0].lm_head
+                assert (
+                    lm_head is not None
+                ), "Model must have lm_head for ChunkedLossWrapper"
+                self.loss_fn.set_lm_head(lm_head)
+                # Both halves are required: the loss now owns the projection, so
+                # the model must stop doing it or lm_head runs twice and the
+                # second call sees vocab-width input.
+                self.model_parts[0]._skip_lm_head = True
 
         # FT addition: set all reduce hook
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
