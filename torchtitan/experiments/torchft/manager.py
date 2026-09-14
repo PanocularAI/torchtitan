@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 if importlib.util.find_spec("torchft") is not None:
     import torchft
+    from torchft.checkpointing.pg_transport import PGTransport
 
     if TYPE_CHECKING:
         from torchft import local_sgd
@@ -79,6 +80,31 @@ class TorchFTManager(Configurable):
         (https://github.com/pytorch/torchft/blob/360c5c534bdeac959507e9d238ba9f3902d3fda9/torchft/local_sgd.py#L41)
         """
 
+        manager_hostname: str | None = None
+        """
+        The hostname to advertise to the TorchFT lighthouse server if rank == 0.
+        """
+
+        use_pg_checkpoint_transport: bool = False
+        """
+        Whether to use the process group for checkpoint transport.
+        """
+
+        rank0_synchronization_only: bool = False
+        """
+        Whether inter-replica synchronization occurs only among rank 0. This allows training and healing in
+        heterogeneous configurations (i.e., varying sharding degree). Note that this will increase rank 0's
+        memory footprint and introduce potential network contention during inter-replica synchronization.
+        This feature is experimental.
+        """
+
+        copy_pseudogradients_to_cpu: bool = False
+        """
+        Whether to copy the pseudogradients to the CPU before the outer step when process_group is set to "gloo".
+        This flag is introduced as a workaround due to a bug when using a process group with the Gloo backend on
+        AMD GPU tensors. Ignored when process_group is not "gloo" or rank0_synchronization_only is "true".
+        """
+
     def __init__(
         self,
         config: Config,
@@ -90,11 +116,32 @@ class TorchFTManager(Configurable):
         if not has_torchft:
             raise ImportError("torchft is not installed. Please install it.")
 
+        self._rank0_synchronization_only = config.rank0_synchronization_only
+        if self._rank0_synchronization_only:
+            # Structural for the torchft-internal methods: their fragments live
+            # inside _StreamingDiLoCoFragment, whose machinery rank0-only mode
+            # bypasses. NOT structural for heloco -- its fragment rotation runs
+            # entirely inside panoengine's AsyncDiLoCo (which splits the flat
+            # param space itself and never touches the torchft fragment path),
+            # and the heloco branch of maybe_semi_sync_training reads nothing
+            # from rank0_synchronization_only. Blanket-asserting here kept
+            # heterogeneous-island runs (which need rank0-only for the
+            # manager's init_sync) from ever overlapping their exchanges.
+            if (config.semi_sync_method or "").lower() != "heloco":
+                assert config.num_fragments == 1, (
+                    "num_fragments > 1 not supported with rank 0 "
+                    "synchronization only (except semi_sync_method='heloco')"
+                )
+
         process_group_timeout = timedelta(milliseconds=config.process_group_timeout_ms)
         if config.process_group == "gloo":
             pg = torchft.ProcessGroupGloo(timeout=process_group_timeout)
+            if config.use_pg_checkpoint_transport:
+                pg_checkpoint_transport = PGTransport(pg, timeout=process_group_timeout, device="cpu")
         elif config.process_group == "nccl":
             pg = torchft.ProcessGroupNCCL(timeout=process_group_timeout)
+            if config.use_pg_checkpoint_transport:
+                pg_checkpoint_transport = PGTransport(pg, timeout=process_group_timeout, device="cuda")
         elif config.process_group == "mccl":
             import torchcomms
             from torchft.torchcomms import ProcessGroupTorchComms
@@ -113,6 +160,8 @@ class TorchFTManager(Configurable):
         # If the training method is specific, then the quorum should be synchronous
         self.use_async_quorum = config.semi_sync_method is None
 
+        init_sync = not config.rank0_synchronization_only
+        checkpoint_transport = pg_checkpoint_transport if config.use_pg_checkpoint_transport else None
         self._manager = torchft.Manager(
             pg=pg,
             min_replica_size=config.min_replica_size,
@@ -120,6 +169,11 @@ class TorchFTManager(Configurable):
             state_dict=None,
             use_async_quorum=self.use_async_quorum,
             replica_id=f"torchtitan_ft_{config.replica_id}",
+            hostname=config.manager_hostname,
+            init_sync=init_sync,
+            checkpoint_transport=checkpoint_transport,
+            rank0_synchronization_only=config.rank0_synchronization_only,
+            copy_pseudogradients_to_cpu=config.copy_pseudogradients_to_cpu
         )
         self.group_size = config.group_size
         self.replica_id = config.replica_id
@@ -136,6 +190,12 @@ class TorchFTManager(Configurable):
     def manager(self) -> "torchft.Manager":
         assert self._manager is not None
         return self._manager
+
+    @property
+    def rank0_synchronization_only(self) -> bool:
+        if not hasattr(self, "_rank0_synchronization_only"):
+            return False
+        return self._rank0_synchronization_only
 
     def get_dp_info(self, dp_degree: int, dp_rank: int) -> tuple[int, int]:
         if self.enabled:
@@ -174,6 +234,7 @@ def maybe_semi_sync_training(
     n_layers: int,
     optimizer: torch.optim.Optimizer,
     fragment_fn: Callable[..., list[nn.Module]] | None = None,
+    pp_enabled: bool = False,
 ) -> AbstractContextManager["local_sgd.DiLoCo" | "local_sgd.LocalSGD" | None]:
     """
     If TorchFT is enabled and the config is set, use semi_sync_method
@@ -225,8 +286,80 @@ def maybe_semi_sync_training(
                 optimizer=optimizer,
                 sync_every=extend_ft_config.sync_steps,
             )
+        elif semi_sync_method.lower() == "heloco":
+            # The parameter-server member of the family: each worker POSTs
+            # its pseudo-gradient over HTTP to the HeLoCoServer running inside
+            # the `panoengine.decentralized.parameter_server` process, and pulls
+            # back the look-ahead global params -- no cross-worker collective.
+            # The trainer-side class is AsyncDiLoCo for both parameter-server
+            # strategies; what makes this HeLoCo is server-side
+            # (panoengine.decentralized.heloco.HeLoCoOptimizer). The FT
+            # manager (and its lighthouse) stays required regardless: the
+            # trainer derives its dataloader shard from it. The server's
+            # URLs are runtime addresses launchers export from the PS
+            # coordinator's stdout, hence env rather than config fields.
+            import os
+
+            import torch.distributed as pt_dist
+
+            from panoengine.decentralized.async_diloco import AsyncDiLoCo
+
+            if pp_enabled:
+                raise RuntimeError(
+                    "semi_sync_method='heloco' cannot run under pipeline "
+                    "parallelism: PP splits named_parameters() itself across "
+                    "ranks, so no gather can reassemble the parameter "
+                    "server's full-model wire layout. Shard with FSDP/TP "
+                    "instead, or use semi_sync_method='diloco'."
+                )
+            server_address = os.environ.get("DILOCO_SERVER_ADDR", "").strip()
+            if not server_address:
+                raise RuntimeError(
+                    "semi_sync_method='heloco' needs the parameter server's "
+                    "/sync URL in $DILOCO_SERVER_ADDR (launchers export it "
+                    "from the run's PS coordinator); got an empty value. Use "
+                    "semi_sync_method='diloco' for lighthouse-coordinated "
+                    "training with no parameter server."
+                )
+            heartbeat = os.environ.get("DILOCO_HB_ADDR", "").strip() or None
+            logger.info(
+                f"heloco worker: syncing to {server_address} every "
+                f"{extend_ft_config.sync_steps} steps "
+                f"(heartbeat: {heartbeat or 'disabled'})"
+            )
+            # Replica mode (torchft): a multi-GPU/multi-node replica behaves
+            # as ONE parameter-server worker — rank 0 owns the HTTP session
+            # and heartbeat identity; boundaries gather full DTensor values
+            # (FSDP/TP shards included) and every rank installs its own shard
+            # from a broadcast. The group is GLOO so followers wait out
+            # rank 0's HTTP without an NCCL watchdog in the blast radius.
+            # torchrun always initializes dist — at nproc=1 the one-rank
+            # group is ~free and keeps the DTensor install path uniform
+            # (FSDP2 wraps params as DTensors even at world size 1).
+            replica_pg = (
+                pt_dist.new_group(backend="gloo")
+                if pt_dist.is_available() and pt_dist.is_initialized()
+                else None
+            )
+            return AsyncDiLoCo(
+                server_address=server_address,
+                model=model,
+                inner_optimizer=optimizer,
+                sync_every=extend_ft_config.sync_steps,
+                fragment_update_alpha=extend_ft_config.fragment_update_alpha,
+                heartbeat_address=heartbeat,
+                should_quantize=extend_ft_config.should_quantize,
+                replica_pg=replica_pg,
+                # Fragment-wise sync (Decoupled DiLoCo): staggered rotation of
+                # model/num_fragments pushes with the exchange overlapped in
+                # the background; must match the parameter server's
+                # --num_fragments. Default 1 = whole-model sync.
+                num_fragments=extend_ft_config.num_fragments,
+                min_replicas=extend_ft_config.min_replica_size,
+            )
         else:
             raise ValueError(
-                f"Unknown training method: {semi_sync_method}, only 'diloco' and 'local_sgd' are supported."
+                f"Unknown training method: {semi_sync_method}, only 'diloco', 'local_sgd' and 'heloco' are supported."
             )
     return nullcontext()
+
