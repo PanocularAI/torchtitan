@@ -10,7 +10,7 @@ from typing import Any, TYPE_CHECKING
 
 import torch.nn as nn
 
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import AdamW, OptimizersContainer
 from torchtitan.components.optimizer.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
@@ -84,3 +84,14 @@ class TorchFTOptimizersContainer(OptimizersContainer):
         if self._quorum_manager is not None:
             self._quorum_manager.start_quorum()
         super().zero_grad(set_to_none=set_to_none)
+
+
+def default_ft_adamw(lr: float = 8e-4, **kwargs: Any) -> TorchFTOptimizersContainer.Config:
+    """A TorchFTOptimizersContainer.Config with one catch-all AdamW.
+
+    ``kwargs`` are ``AdamW.Config`` fields; its defaults (betas (0.9, 0.95),
+    eps 1e-8, weight_decay 0.1) are the ones this helper always used.
+    """
+    return TorchFTOptimizersContainer.Config(
+        optimizers=[AdamW.Config(pattern=r".*", lr=lr, **kwargs)]
+    )
