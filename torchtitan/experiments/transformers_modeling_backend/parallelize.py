@@ -96,6 +96,7 @@ def parallelize_hf_transformers(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
 
@@ -192,23 +193,26 @@ def parallelize_hf_transformers(
             parallel_dims=parallel_dims,
         )
 
-    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+    # skip_dp: inference hosts (the RL vLLM wrapper) parallelize without FSDP,
+    # mirroring parallelize_qwen3's kwarg of the same name.
+    if not skip_dp:
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
 
-    apply_fsdp(
-        model,
-        dp_mesh,
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
-        ep_degree=parallel_dims.ep,
-        dp_mod_ep_mesh=edp_mesh,
-        dp_mesh_dims=dp_mesh_dims,
-        edp_mesh_dims=edp_mesh_dims,
-    )
+        apply_fsdp(
+            model,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+            ep_degree=parallel_dims.ep,
+            dp_mod_ep_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+        )
 
     if training.enable_cpu_offload:
         logger.info("Applied CPU Offloading to the model")
