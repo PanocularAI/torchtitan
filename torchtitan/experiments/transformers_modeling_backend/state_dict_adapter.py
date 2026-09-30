@@ -22,6 +22,8 @@ Two complementary pieces live here:
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from typing import Any, TYPE_CHECKING
 
@@ -58,7 +60,24 @@ class HFTransformerStateDictAdapter(StateDictAdapter):
         hf_assets_path: str | None,
     ):
         super().__init__(model_config, hf_assets_path)
+        # Tie state comes from the CHECKPOINT's config.json, not model_config:
+        # panofabric-engine forces every HF-backend model untied (FSDP can't
+        # shard one weight into two param groups), so the model trains untied
+        # even when the checkpoint on disk ties embeddings -- and a tied
+        # checkpoint has no lm_head.weight to load. Fall back to the model
+        # config's flag when no checkpoint config is available.
         self._tie_word_embeddings = getattr(model_config, "tie_word_embeddings", False)
+        if hf_assets_path:
+            cfg_path = os.path.join(hf_assets_path, "config.json")
+            try:
+                with open(cfg_path) as f:
+                    self._tie_word_embeddings = bool(
+                        json.load(f).get(
+                            "tie_word_embeddings", self._tie_word_embeddings
+                        )
+                    )
+            except FileNotFoundError:
+                pass
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         hf_state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
