@@ -194,6 +194,27 @@ def _uses_dsa(config) -> bool:
     return getattr(config, "index_topk", None) is not None
 
 
+def _rope_init_fn(module: nn.Module):
+    """The function that computes ``module``'s RoPE ``inv_freq``, or None.
+
+    transformers < 5.17 stored it on the rotary module as ``rope_init_fn``;
+    5.17 resolves it locally in ``__init__`` from ``rope_type`` instead (the
+    class's ``compute_default_rope_parameters`` for "default", else
+    ``ROPE_INIT_FUNCTIONS``), so resolve it the same way here.
+    """
+    rope_init_fn = getattr(module, "rope_init_fn", None)
+    if rope_init_fn is not None:
+        return rope_init_fn
+    rope_type = getattr(module, "rope_type", None)
+    if rope_type is None:
+        return None
+    if rope_type == "default":
+        return getattr(module, "compute_default_rope_parameters", None)
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    return ROPE_INIT_FUNCTIONS.get(rope_type)
+
+
 class HFTransformerModel(BaseModel):
     parallelize = parallelize_hf_transformers
     pipeline = pipeline_hf_transformers
@@ -1424,17 +1445,18 @@ class HFTransformerModel(BaseModel):
 
         # HF rotary embeddings compute their `inv_freq` buffer in __init__, not in
         # `_init_weights`. With meta-device init + `to_empty()`, that buffer is
-        # left uninitialized (zeros), which silently disables RoPE (no positional
-        # information -> near-random outputs). Recompute it from each rotary
-        # module's `rope_init_fn` so positions work after materialization.
+        # left uninitialized, which silently disables RoPE (no positional
+        # information -> near-random outputs). Recompute it with each rotary
+        # module's own init function so positions work after materialization.
         for module in self.model.modules():
-            rope_init_fn = getattr(module, "rope_init_fn", None)
+            rope_init_fn = _rope_init_fn(module)
             if rope_init_fn is not None and hasattr(module, "inv_freq"):
                 device = module.inv_freq.device
                 inv_freq, attention_scaling = rope_init_fn(module.config, device)
-                module.inv_freq.copy_(
-                    inv_freq.to(device=device, dtype=module.inv_freq.dtype)
-                )
+                inv_freq = inv_freq.to(device=device, dtype=module.inv_freq.dtype)
+                module.inv_freq.copy_(inv_freq)
+                if hasattr(module, "original_inv_freq"):
+                    module.original_inv_freq.copy_(inv_freq)
                 module.attention_scaling = attention_scaling
 
         # TODO(3outeille): For pipeline parallel, only tie weights if both input and output embeddings are on the same device

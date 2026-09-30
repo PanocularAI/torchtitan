@@ -3,8 +3,8 @@
 What this fork adds on top of upstream `pytorch/torchtitan`, why it cannot all live outside
 the fork, and which patches are candidates to send upstream.
 
-Measured vs upstream base `a182e530` (2026-09-29): **12 files, +396 / −44** — and 11 of
-those 12 are *modified upstream files*. The only added file is this one.
+Measured vs upstream base `a182e530` (2026-09-29): **14 files, +462 / −51** — and 12 of
+those 14 are *modified upstream files*. The added files are this one and one test.
 (It was 17 files / +766 on `1c7ab8089`, and 34 files / +5561 before everything RL moved to
 the engine.)
 
@@ -20,8 +20,8 @@ the engine.)
 ## The cost model
 
 A rebase conflicts only on files **both sides touched**. Added files never conflict. So the
-carrying cost of this fork is not the 396 added lines — it is the **44 deleted lines
-across 11 modified files**. Shrinking that set is the only thing that makes upstream syncs
+carrying cost of this fork is not the 462 added lines — it is the **51 deleted lines
+across 12 modified files**. Shrinking that set is the only thing that makes upstream syncs
 cheap.
 
 ### Added — never conflicts, stays here
@@ -61,6 +61,7 @@ upstream) and `experiments/__init__.py` (it only registered `decentralized_rl`).
 | `torchtitan/rl/controller.py` | +43 / −29 | `_start_rollout_producers` / `_stop_rollout_producers`, so the engine's windowed loop can drive the consume side. |
 | `torchtitan/rl/components/work_buffer.py` | +18 / −1 | `pause()` / `resume()`, so rollouts never straddle an outer weight merge. |
 | `torchtitan/distributed/utils.py` | +8 / −1 | `set_timeout` compat shim for torch nightlies that only have the private spelling. |
+| `torchtitan/experiments/transformers_modeling_backend/model.py` | +29 / −7 | Recomputes RoPE `inv_freq` after `to_empty()` with transformers 5.17 (its rotary modules no longer carry `rope_init_fn`, so every HF-backend model trained without positional information). Test: `tests/test_rope_init.py`. |
 | `torchtitan/experiments/transformers_modeling_backend/state_dict_adapter.py` | +19 / −0 | Takes the tie flag from the checkpoint's `config.json`, so a tied checkpoint loads into the untied model the engine builds for every HF-backend preset (FSDP can't shard one weight across two groups). Not RL-specific. |
 | `tests/unit_tests/cpu/test_config_manager.py` | +23 / −0 | Covers the `_import_registry` change. |
 
@@ -101,12 +102,13 @@ Each merged PR permanently deletes fork surface. All are small and independently
 | Patch | Size | Note |
 |---|---|---|
 | `_import_registry` re-raises the real `ImportError` | ~30 lines | Highest goodwill. Today a *broken* registry is indistinguishable from a *missing* one — "config function not found" when the truth is an ImportError three levels down. |
+| HF backend: recompute RoPE `inv_freq` with transformers 5.17 | ~30 lines + test | A real correctness bug upstream (same code on upstream main): after the meta build, HF-backend models get garbage `inv_freq`. A pretrained Qwen3-4B started SFT at loss 6.7 instead of ~3.4. |
 | `StdoutJsonLogger` metrics fallback | ~25 lines | Runs with neither wandb nor TensorBoard currently drop every metric but loss/tps/mfu. |
 | Don't hard-require `rank0_synchronization_only` on the FT manager (`23a45fbb7`) | small | |
 | Don't bound a multi-GB relay transfer with a total timeout (`fa05a8f05`) | small | |
 | Give the replica/worker mains a stdout log handler (`6a0741b41`) | small | |
 
-**Target: 11 modified files → 2–3.** Then the next upstream sync is minutes, not a branch.
+**Target: 12 modified files → 2–3.** Then the next upstream sync is minutes, not a branch.
 
 ## Rebased onto upstream `a182e530` (2026-09-30)
 
