@@ -39,13 +39,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from torchtitan.components.checkpoint import ModelWrapper
+from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.hf_datasets.multimodal.utils.image import (
     process_image,
-    resize_to_patch_budget,
+    resize_to_navit_patch_grid,
     vision_to_patches,
 )
-from torchtitan.models.common.attention import ScaledDotProductAttention
+from torchtitan.models.common.attention import ScaledDotProductInnerAttention
 from torchtitan.models.kimi_k2_7 import model_registry
 from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -162,7 +162,7 @@ def run_tt(model_flavor, checkpoint_path, ref, dtype, vision_dtype, force_hf_rou
     """torchtitan Kimi-VL: its own image processing + forward on the same image."""
     device = torch.device("cuda")
     print(f"Loading torchtitan Kimi-VL ({model_flavor}) on {device} ...")
-    model_config = model_registry(model_flavor).model
+    model_config = model_registry(model_flavor, enable_sp=True)
     with torch.device("meta"):
         model = model_config.build()
     model.to_empty(device="cpu")
@@ -175,7 +175,9 @@ def run_tt(model_flavor, checkpoint_path, ref, dtype, vision_dtype, force_hf_rou
 
     model.vision_encoder.to(vision_dtype)  # mixed precision: ViT in vision_dtype
     for layer in model.layers.values():
-        layer.attention.inner_attention = ScaledDotProductAttention.Config().build()
+        layer.attention.inner_attention = (
+            ScaledDotProductInnerAttention.Config().build()
+        )
     for layer in model.vision_encoder.layers.values():
         layer.attn.flex_attention = _VisionSDPA()
     model.eval()
@@ -189,7 +191,7 @@ def run_tt(model_flavor, checkpoint_path, ref, dtype, vision_dtype, force_hf_rou
         Image.fromarray(ref["raw_image"].numpy()),
         patch_size=_PATCH_SIZE,
         merge_size=_MERGE_SIZE,
-        resize_fn=resize_to_patch_budget,
+        resize_fn=resize_to_navit_patch_grid,
         max_patches=4096,
         max_patches_per_side=512,
         image_mean=(0.5, 0.5, 0.5),

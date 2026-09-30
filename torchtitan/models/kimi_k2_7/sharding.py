@@ -18,26 +18,27 @@ TP/EP/SP uniformly via the Module protocol.
   sharded for memory; norms and position embeddings stay ``Invariant``.
 """
 
-from typing import TYPE_CHECKING
+from typing import Literal, TYPE_CHECKING
 
 import spmd_types as spmd
-import torch
+from spmd_types import SpmdType
 
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
+    token_id_placement,
 )
 from torchtitan.models.common.vision_encoder_sharding import (
     invariant_norm_config,
     set_vision_transformer_block_sharding_config,
     vision_colwise_config,
     vision_invariant_linear_config,
-    vision_scaled_bias_rowwise_config,
+    vision_rowwise_config,
 )
 from torchtitan.models.deepseek_v3.sharding import set_deepseek_v3_sharding_config
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import ShardingConfig
 
 DP = MeshAxisName.DP
 TP = MeshAxisName.TP
@@ -45,29 +46,7 @@ TP = MeshAxisName.TP
 if TYPE_CHECKING:
     from torchtitan.models.kimi_k2_7.model import KimiK25Model
 
-_REPLICATE_ACT = dense_activation_placement(tp=spmd.R)
-
-
-def annotate_multimodal_input_spmd_types(
-    *,
-    pixel_values: torch.Tensor | None,
-    grid_thw: torch.Tensor | None,
-    pixel_values_videos: torch.Tensor | None,
-    grid_thw_videos: torch.Tensor | None,
-) -> None:
-    """Annotate Kimi K2.5 multimodal inputs with their local SPMD types."""
-    multimodal_type = {
-        MeshAxisName.DP: spmd.V,
-        MeshAxisName.TP: spmd.I,
-    }
-    for tensor in (
-        pixel_values,
-        grid_thw,
-        pixel_values_videos,
-        grid_thw_videos,
-    ):
-        if tensor is not None:
-            spmd.assert_type(tensor, multimodal_type)
+_REPLICATE_ACT = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
 
 
 def set_kimi_k2_5_sharding_config(
@@ -84,18 +63,26 @@ def set_kimi_k2_5_sharding_config(
     if config.vision_encoder is not None:
         if enable_sp:
             _shard_decoder_after_embedding_scatter(config)
-        _set_vision_encoder_sharding(config.vision_encoder)
+        set_moonvit_sharding_config(config.vision_encoder)
 
 
 def _shard_decoder_after_embedding_scatter(config: "KimiK25Model.Config") -> None:
-    """Keep the full embedding through vision scatter, then resume SP at layer 0."""
+    """Keep ``tok_embeddings`` ``Replicate`` and resume SP at layer 0's output.
+
+    The vision scatter writes features at arbitrary sequence positions, so it
+    needs the full (``Replicate``) embedding -- a ``Shard(0)`` one cannot be
+    indexed by sequence position locally. Layer 0 then takes a ``Replicate``
+    input and its rowwise ``wo`` reduce-scatters back to ``Shard(0)``, so the
+    residual is sequence-parallel from layer 0's output and layers ``1..N-1``
+    are unchanged full SP.
+    """
     config.tok_embeddings.sharding_config = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
-        in_src_shardings={"input": _REPLICATE_ACT},
-        in_dst_shardings={"input": _REPLICATE_ACT},
-        out_src_shardings=dense_activation_placement(tp=spmd.P),
+        in_src_shardings={"input": token_id_placement()},
+        in_dst_shardings={"input": token_id_placement()},
+        out_src_shardings=dense_activation_placement(tp=spmd.P, cp=spmd.S(0)),
         out_dst_shardings=_REPLICATE_ACT,
-        local_map=LocalMapConfig(in_grad_placements=None),
+        local_spmd=True,
     )
 
     layer0 = config.layers[0]
@@ -106,27 +93,30 @@ def _shard_decoder_after_embedding_scatter(config: "KimiK25Model.Config") -> Non
     )
 
 
-def _set_vision_encoder_sharding(ve_cfg) -> None:
+def set_moonvit_sharding_config(
+    ve_cfg, *, projector_norm: Literal["pre_norm", "post_norm"] = "pre_norm"
+) -> None:
     """Invariant-activation TP plan for the MoonViT3d vision encoder.
 
     Linear layers are Colwise/Rowwise sharded for memory; norms and the
     learnable position table stay Invariant. ``patch_embed`` wraps the plain
     ``pixel_values`` input as a TP-invariant tensor so the rest of the encoder
-    runs in distributed tensor space.
+    runs in distributed tensor space. ``projector_norm`` names the projector's
+    norm: ``pre_norm`` in Kimi K2.5, ``post_norm`` in Kimi K3.
     """
     # The encoder's own ``pos_embed`` table is invariant across TP ranks.
     ve_cfg.sharding_config = ShardingConfig(
         state_shardings={
-            "pos_embed": SpmdLayout({DP: spmd.R, TP: spmd.I}),
+            "pos_embed": SpmdType({DP: spmd.R, TP: spmd.I}),
         },
-        out_src_shardings=SpmdLayout({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdLayout({DP: spmd.V, TP: spmd.R}),
+        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
     )
     ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
         state_shardings={
-            "inv_freq": SpmdLayout({DP: spmd.R, TP: spmd.I}),
+            "inv_freq": SpmdType({DP: spmd.R, TP: spmd.I}),
         },
-        out_src_shardings=SpmdLayout({DP: spmd.R, TP: spmd.I}),
+        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
     )
 
     ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
@@ -139,6 +129,6 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     # Final norm + projector.
     ve_cfg.final_norm.sharding_config = invariant_norm_config()
     proj = ve_cfg.projector
-    proj.pre_norm.sharding_config = invariant_norm_config()
+    getattr(proj, projector_norm).sharding_config = invariant_norm_config()
     proj.linear_1.sharding_config = vision_colwise_config()
-    proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()
+    proj.linear_2.sharding_config = vision_rowwise_config()

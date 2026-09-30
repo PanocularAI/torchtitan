@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -20,7 +21,9 @@ from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torch.distributed.distributed_c10d import ReduceOp
 
 from torchtitan.config import Configurable
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
+
 
 if importlib.util.find_spec("torchft") is not None:
     import torchft
@@ -75,6 +78,19 @@ class TorchFTManager(Configurable):
         The algorithm to use for semi-sync training. Currently, only "local_sgd" and "diloco" from
         torchft are supported
         (https://github.com/pytorch/torchft/blob/360c5c534bdeac959507e9d238ba9f3902d3fda9/torchft/local_sgd.py#L41)
+        """
+
+        use_async_quorum: bool = True
+        """
+        Whether to run the quorum asynchronously, in the background of the step.
+        When False, the step blocks until the quorum, including any state export
+        or load it performs for healing, completes before the forward and
+        backward passes run. This serializes the quorum with training but keeps
+        the state export from overlapping the model's forward pass.
+
+        This is ignored when semi_sync_method is set, since semi-sync training
+        manages the quorum through its own synchronization hooks and always
+        requires a synchronous quorum.
         """
 
         manager_hostname: str | None = None
@@ -164,7 +180,7 @@ class TorchFTManager(Configurable):
             min_replica_size=config.min_replica_size,
             load_state_dict=None,
             state_dict=None,
-            use_async_quorum=self.use_async_quorum,
+            use_async_quorum=config.use_async_quorum and self.use_async_quorum,
             replica_id=f"torchtitan_ft_{config.replica_id}",
             hostname=config.manager_hostname,
             init_sync=init_sync,
@@ -208,7 +224,9 @@ class TorchFTManager(Configurable):
 
             def apply_set_all_reduce_hook(m):
                 if isinstance(m, FSDPModule):
-                    m.set_all_reduce_hook(all_reduce_hook)
+                    param_groups = m._get_fsdp_state()._fsdp_param_groups
+                    for param_group in param_groups:
+                        param_group._all_reduce_hook = all_reduce_hook
 
             for model_part in model_parts:
                 model_part.apply(apply_set_all_reduce_hook)

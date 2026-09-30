@@ -59,12 +59,14 @@ In a real-world scenario, `torchft_lighthouse` would likely be on a different ma
 TorchFT provides algorithms that do not require per-step synchronization and
 the replica groups can synchronize weights every N steps.
 
-**Note on Batch Sizes**: For DiLoCo, there's an important distinction in batch size terminology:
+**Note on Token Counts**: For DiLoCo, there is an important distinction in token-count terminology:
 
-The `--training.global_batch_size` parameter refers to global batch size that will be split across all replica groups.
+`--training.num_tokens_per_train_step` controls the global token budget. The
+number of forward/backward iterations accumulated before each optimizer step is
+derived from that budget.
 
-- **Global batch size**: The total batch size across all DiLoCo islands/replica groups
-- **Inner global batch size**: The batch size within each individual DiLoCo island. This is determined by dividing global batch size by number of replica groups.
+- **Tokens per step**: The total token count across all DiLoCo islands/replica groups
+- **Inner tokens per step**: The token count within each individual DiLoCo island. This is determined by dividing tokens per step by the number of replica groups.
 
 #### Replica Group 0
 ```bash
@@ -79,6 +81,13 @@ MODULE=torchft.llama3 CONFIG=llama3_torchft_debugmodel CUDA_VISIBLE_DEVICES=4,5,
 ## Fault Tolerance Configuration Options
 
 For complete configuration options, run `NGPU=1 ./run_train.sh --help`.
+
+For all training modes:
+
+- `--fault_tolerance.no-use_async_quorum`: Run the quorum synchronously, so the
+  step waits for the quorum, including any state export or load it performs for
+  healing, before the forward and backward passes. By default the quorum runs in
+  the background of the step.
 
 [Optional] Only for semi-synchronous training:
 

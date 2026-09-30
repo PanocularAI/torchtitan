@@ -9,32 +9,30 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
-
-from torchtitan.distributed.pipeline_parallel import pipeline_vlm
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
     Linear,
     RMSNorm,
-    ScaledBiasRowwiseLinear,
+    Sigmoid,
+    Softmax,
     TransformerBlock,
 )
 from torchtitan.models.common.nn_modules import LayerNorm
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.common.vision_encoder import (
+    InvariantRowParallelLinear,
     VisionAttention,
     VisionMLP,
     VisionTransformerBlock,
 )
 from torchtitan.models.deepseek_v3 import build_mla_moe_layers
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
-
 from .model import KimiK25Model
-from .parallelize import parallelize_kimi_k2_5
-from .state_dict_adapter import KimiK25StateDictAdapter
+from .qk_clip import QKClipFlexInnerAttention
 
 from .vision_encoder import (
     KimiK25VisionEncoder,
@@ -43,9 +41,7 @@ from .vision_encoder import (
 )
 
 __all__ = [
-    "parallelize_kimi_k2_5",
     "KimiK25Model",
-    "KimiK25StateDictAdapter",
     "KimiK25VisionEncoder",
     "VisionProjector",
     "VisionRotaryEmbedding2D",
@@ -105,10 +101,10 @@ def _vl_linear(in_features: int, out_features: int) -> Linear.Config:
     )
 
 
-def _scaled_bias_rowwise_linear(
+def _vision_row_parallel_linear(
     in_features: int, out_features: int
-) -> ScaledBiasRowwiseLinear.Config:
-    return ScaledBiasRowwiseLinear.Config(
+) -> InvariantRowParallelLinear.Config:
+    return InvariantRowParallelLinear.Config(
         in_features=in_features,
         out_features=out_features,
         bias=True,
@@ -150,11 +146,11 @@ def _vision_encoder_config(
             wq=_vl_linear(dim, dim),
             wk=_vl_linear(dim, dim),
             wv=_vl_linear(dim, dim),
-            proj=_scaled_bias_rowwise_linear(dim, dim),
+            proj=_vision_row_parallel_linear(dim, dim),
         ),
         mlp=VisionMLP.Config(
             fc1=_vl_linear(dim, ffn_dim),
-            fc2=_scaled_bias_rowwise_linear(ffn_dim, dim),
+            fc2=_vision_row_parallel_linear(ffn_dim, dim),
         ),
     )
 
@@ -180,9 +176,15 @@ def _vision_encoder_config(
             merged_dim=merged_dim,
             pre_norm=_vl_layernorm(dim),
             linear_1=_vl_linear(merged_dim, merged_dim),
-            linear_2=_scaled_bias_rowwise_linear(merged_dim, text_hidden_size),
+            linear_2=_vision_row_parallel_linear(merged_dim, text_hidden_size),
         ),
     )
+
+
+def _qk_clip_attention_config(attn_backend: str) -> QKClipFlexInnerAttention.Config:
+    if attn_backend != "flex":
+        raise ValueError("Kimi QK clipping requires the FlexInnerAttention backend.")
+    return QKClipFlexInnerAttention.Config()
 
 
 def _build_kimi_layers(**kwargs) -> list[TransformerBlock.Config]:
@@ -193,6 +195,7 @@ def _build_kimi_layers(**kwargs) -> list[TransformerBlock.Config]:
         norm_init=_NORM_INIT,
         depth_init=_depth_init,
         depth_experts_init=_depth_experts_init,
+        attention_config_factory=_qk_clip_attention_config,
     )
 
 
@@ -200,6 +203,9 @@ def _debugmodel(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    *,
+    enable_sp: bool,
+    seq_len: int,
 ) -> KimiK25Model.Config:
     dim = 256
     n_layers = 6
@@ -213,6 +219,7 @@ def _debugmodel(
     n_dense_layers = 1
 
     layers = _build_kimi_layers(
+        enable_sp=enable_sp,
         n_layers=n_layers,
         n_dense_layers=n_dense_layers,
         dim=dim,
@@ -228,13 +235,13 @@ def _debugmodel(
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         router_top_k=3,
-        router_score_func="softmax",
+        router_score_func=Softmax.Config(),
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=ComplexRoPE.Config(
             dim=rope_dim,
-            max_seq_len=4096 * 4,
+            max_context_length=seq_len,
             theta=10000.0,
             scaling="yarn",
             rope_factor=40.0,
@@ -244,6 +251,7 @@ def _debugmodel(
         ),
     )
     config = KimiK25Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         tok_embeddings=Embedding.Config(
@@ -272,22 +280,24 @@ def _debugmodel(
 
 def _moonlight_16b_a3b_config(
     *,
+    enable_sp: bool,
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
     rope_theta: float,
-    max_seq_len: int,
+    max_context_length: int,
     vision_encoder: "KimiK25VisionEncoder.Config | None" = None,
 ) -> KimiK25Model.Config:
     """Shared Moonshot 16B-A3B DeepSeekV3 text tower (MLA + sigmoid-routed MoE).
 
     Used by both Moonlight (text-only) and Kimi-VL (with a vision encoder): they
     share the architecture (no q-LoRA, no RoPE scaling, 64 experts top-6); only
-    the RoPE ``theta`` / ``max_seq_len`` and the vision tower differ.
+    the RoPE ``theta`` / ``max_context_length`` and the vision tower differ.
     """
     dim = 2048
     vocab_size = 163840
     layers = _build_kimi_layers(
+        enable_sp=enable_sp,
         n_layers=27,
         n_dense_layers=1,
         dim=dim,
@@ -303,17 +313,20 @@ def _moonlight_16b_a3b_config(
         num_experts=64,
         num_shared_experts=2,
         router_top_k=6,
-        router_score_func="sigmoid",
-        router_num_expert_groups=None,
-        router_num_limited_groups=None,
+        router_score_func=Sigmoid.Config(),
         router_route_scale=2.446,
         router_route_norm=True,
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
-        rope=ComplexRoPE.Config(dim=64, max_seq_len=max_seq_len, theta=rope_theta),
+        rope=ComplexRoPE.Config(
+            dim=64,
+            max_context_length=max_context_length,
+            theta=rope_theta,
+        ),
     )
     return KimiK25Model.Config(
+        max_context_length=max_context_length,
         vocab_size=vocab_size,
         dim=dim,
         tok_embeddings=Embedding.Config(
@@ -334,14 +347,18 @@ def _moonlight_16b_a3b(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    *,
+    enable_sp: bool,
+    seq_len: int,
 ) -> KimiK25Model.Config:
     """Build the text-only Moonlight 16B-A3B sibling without a vision tower."""
     return _moonlight_16b_a3b_config(
+        enable_sp=enable_sp,
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope_theta=50000.0,
-        max_seq_len=8192,
+        max_context_length=seq_len,
         vision_encoder=None,
     )
 
@@ -350,6 +367,9 @@ def _kimi_vl_a3b(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    *,
+    enable_sp: bool,
+    seq_len: int,
 ) -> KimiK25Model.Config:
     """Kimi-VL 16B-A3B: Moonlight text tower plus a 2D MoonViT vision tower.
 
@@ -358,11 +378,12 @@ def _kimi_vl_a3b(
     applied.
     """
     config = _moonlight_16b_a3b_config(
+        enable_sp=enable_sp,
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope_theta=800000.0,
-        max_seq_len=131072,
+        max_context_length=seq_len,
         vision_encoder=_vision_encoder_config(
             dim=1152,
             ffn_dim=4304,
@@ -381,6 +402,9 @@ def _kimi_k2_5(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    *,
+    enable_sp: bool,
+    seq_len: int,
 ) -> KimiK25Model.Config:
     """Architecture shared by Kimi K2.5, K2.6, and K2.7-Code: a ~1T-total /
     ~32B-active DeepSeekV3-style text tower (384 routed experts, top-8) plus a
@@ -403,6 +427,7 @@ def _kimi_k2_5(
     n_dense_layers = 1
 
     layers = _build_kimi_layers(
+        enable_sp=enable_sp,
         n_layers=n_layers,
         n_dense_layers=n_dense_layers,
         dim=dim,
@@ -418,9 +443,7 @@ def _kimi_k2_5(
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         router_top_k=8,
-        router_score_func="sigmoid",
-        router_num_expert_groups=None,
-        router_num_limited_groups=None,
+        router_score_func=Sigmoid.Config(),
         router_route_scale=2.827,
         router_route_norm=True,
         attn_backend=attn_backend,
@@ -428,7 +451,7 @@ def _kimi_k2_5(
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=ComplexRoPE.Config(
             dim=rope_dim,
-            max_seq_len=262144,
+            max_context_length=seq_len,
             theta=50000.0,
             scaling="yarn",
             rope_factor=64.0,
@@ -438,6 +461,7 @@ def _kimi_k2_5(
         ),
     )
     return KimiK25Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         tok_embeddings=Embedding.Config(
@@ -464,35 +488,39 @@ def _kimi_k2_5(
 
 
 kimi_k2_5_configs = {
-    "debugmodel": _debugmodel,
-    "moonlight-16B-A3B": _moonlight_16b_a3b,
-    "Kimi-VL-A3B": _kimi_vl_a3b,
-    "Kimi-K2.5": _kimi_k2_5,
+    "debugmodel": (_debugmodel, 16384),
+    "moonlight-16B-A3B": (_moonlight_16b_a3b, 8192),
+    "Kimi-VL-A3B": (_kimi_vl_a3b, 131072),
+    "Kimi-K2.5": (_kimi_k2_5, 262144),
 }
 
 
 def model_registry(
     flavor: str,
+    *,
+    enable_sp: bool,
+    seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> ModelSpec:
-    config = kimi_k2_5_configs[flavor](
+) -> KimiK25Model.Config:
+    get_config, max_context_len = kimi_k2_5_configs[flavor]
+    context_len = seq_len or max_context_len
+    if context_len > max_context_len:
+        raise ValueError(
+            f"Requested seq_len {context_len} exceeds max context length "
+            f"{max_context_len} for flavor {flavor}"
+        )
+    config = get_config(
+        enable_sp=enable_sp,
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        seq_len=context_len,
     )
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for c in converters:
             c.build().convert(config)
-    return ModelSpec(
-        name="kimi_k2_5",
-        flavor=flavor,
-        model=config,
-        parallelize_fn=parallelize_kimi_k2_5,
-        pipelining_fn=pipeline_vlm,
-        post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=KimiK25StateDictAdapter,
-    )
+    return config

@@ -7,26 +7,19 @@
 from dataclasses import fields
 
 from torchtitan.models.muse_glimmer import model_registry as muse_glimmer_model_registry
-from torchtitan.protocols.model_spec import ModelSpec
-
 from .model import GraphTrainerMuseGlimmerModel
-from .parallelize import parallelize_muse_glimmer
 
 
 def model_registry(
     flavor: str,
+    *,
+    seq_len: int | None = None,
     attn_backend: str = "flex",
-) -> ModelSpec:
-    base = muse_glimmer_model_registry(flavor, attn_backend=attn_backend)
+) -> GraphTrainerMuseGlimmerModel.Config:
+    base = muse_glimmer_model_registry(
+        flavor, seq_len=seq_len, attn_backend=attn_backend
+    )
     config = GraphTrainerMuseGlimmerModel.Config(
-        **{f.name: getattr(base.model, f.name) for f in fields(base.model)}
+        **{f.name: getattr(base, f.name) for f in fields(base)}
     )
-    return ModelSpec(
-        name="graph_trainer/muse_glimmer",
-        flavor=flavor,
-        model=config,
-        parallelize_fn=parallelize_muse_glimmer,
-        pipelining_fn=None,
-        post_optimizer_build_fn=None,
-        state_dict_adapter=None,
-    )
+    return config

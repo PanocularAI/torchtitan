@@ -6,7 +6,9 @@
 
 from .base import (
     BaseCheckpointManager,
+    CheckpointStorage,
     DATALOADER,
+    EMA,
     LR_SCHEDULER,
     MODEL,
     ModelWrapper,
@@ -19,7 +21,9 @@ __all__ = [
     "AsyncMode",
     "BaseCheckpointManager",
     "CheckpointManager",
+    "CheckpointStorage",
     "DATALOADER",
+    "EMA",
     "LR_SCHEDULER",
     "MODEL",
     "ModelWrapper",

@@ -4,30 +4,25 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from typing import Any, cast, TypeAlias
+from typing import Any
 
 import torch
-import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
-
-from torchtitan.components.dataloader import BaseDataLoader
-from torchtitan.components.loss import IGNORE_INDEX, LossFunction
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.components.loss import LossFunction
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.config import Configurable, ParallelismConfig
-from torchtitan.distributed import full_dtensor, ParallelDims, utils as dist_utils
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.models.common.attention import FlexAttention, VarlenAttention
-from torchtitan.models.common.decoder import Decoder
+from torchtitan.config import Configurable
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import ParallelismContext, utils as dist_utils
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.protocols.model import BaseModel
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
-
-ValidationContext: TypeAlias = Callable[[], AbstractContextManager[None]]
 
 
 class BaseValidator(Configurable):
@@ -36,6 +31,12 @@ class BaseValidator(Configurable):
         freq: int = 10
         """Frequency of validation"""
 
+        def __post_init__(self) -> None:
+            if self.freq <= 0:
+                raise ValueError(
+                    f"validation frequency must be positive, got {self.freq}"
+                )
+
     def __init__(
         self,
         config: Config,
@@ -43,7 +44,7 @@ class BaseValidator(Configurable):
     ):
         self.config = config
 
-    def validate(self, model_parts: list[nn.Module], step: int) -> None:
+    def validate(self, model_parts: list[BaseModel], step: int) -> None:
         raise NotImplementedError("validate method not implemented")
 
     def should_validate(self, step: int) -> bool:
@@ -60,9 +61,8 @@ class Validator(BaseValidator):
         dp_world_size: Data parallel world size
         dp_rank: Data parallel rank
         tokenizer: Tokenizer
-        parallel_dims: Parallel dimensions
+        parallelism_context: Parallel dimensions
         loss_fn: Loss function to use for validation
-        validation_context: Context manager for validation
         metrics_processor: Metrics processor
         pp_schedule: Pipeline schedule (optional)
         pp_has_first_stage: Whether this rank has the first PP stage (optional)
@@ -71,28 +71,31 @@ class Validator(BaseValidator):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseValidator.Config):
-        enable: bool = False
-        """Enable validation to default run validation after each training loop"""
-
         steps: int = -1
         """
-        Number of steps to take in the validation set, -1 means consuming
-        all the data in the validation dataset.
-        WARNING: When setting to -1 there could be hangs due to mismatch among ranks
+        Number of validation steps. -1 consumes the finite dataset once
+        (dataloader repeat=False). Ranks then stop independently, so this
+        requires data-parallel degree 1; otherwise validation collectives hang.
+        Use a positive count when DP > 1 so every rank runs the same number of
+        steps with repeat=True.
         """
 
         dataloader: BaseDataLoader.Config = field(
-            default_factory=lambda: HuggingFaceTextDataLoader.Config(
-                dataset="c4_validation",
-                infinite=False,
+            default_factory=lambda: GrainDataLoader.Config(
+                dataset=ConcatThenSplitPackingConfig(
+                    dataset=DATASETS["c4_validation"],
+                ),
+                repeat=False,
             )
         )
         """DataLoader configuration for validation"""
 
         def __post_init__(self):
-            assert (
-                self.steps > 0 or self.steps == -1
-            ), "validation steps must be positive or -1"
+            BaseValidator.Config.__post_init__(self)
+            if not (self.steps > 0 or self.steps == -1):
+                raise ValueError(
+                    f"validation steps must be positive or -1, got {self.steps}"
+                )
 
     # TODO: improve the constructor signature
     def __init__(
@@ -103,12 +106,11 @@ class Validator(BaseValidator):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         loss_fn: LossFunction,
-        validation_context: ValidationContext,
         metrics_processor: MetricsProcessor,
         seq_len: int,
-        local_batch_size: int,
+        num_tokens_per_microbatch: int,
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
         pp_has_last_stage: bool | None = None,
@@ -117,105 +119,33 @@ class Validator(BaseValidator):
         super().__init__(config=config)
         self.parallelism = parallelism
         self.tokenizer = tokenizer
-        self.parallel_dims = parallel_dims
+        self.parallelism_context = parallelism_context
         self.loss_fn = loss_fn
-        self.dl_config = replace(config.dataloader, infinite=config.steps != -1)
+        # A bounded validation run repeats data; steps=-1 consumes one finite pass.
+        self.dl_config = replace(config.dataloader, repeat=config.steps != -1)
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
+        if config.steps == -1 and self.dp_world_size > 1:
+            raise ValueError(
+                "validation.steps=-1 runs one finite pass (dataloader "
+                "repeat=False). With data-parallel degree > 1, ranks can exhaust "
+                "at different steps and hang on validation collectives. Got "
+                f"dp_world_size={self.dp_world_size}. Set validation.steps to a "
+                "positive count so every rank runs the same number of steps, "
+                "or run with data-parallel degree 1."
+            )
         self.seq_len = seq_len
-        self.local_batch_size = local_batch_size
-        self.validation_context = validation_context
+        self.num_tokens_per_microbatch = num_tokens_per_microbatch
         self.metrics_processor = metrics_processor
         self.pp_schedule = pp_schedule
         self.pp_has_first_stage = pp_has_first_stage
         self.pp_has_last_stage = pp_has_last_stage
 
-        if config.steps == -1:
-            logger.warning(
-                "Setting validation steps to -1 might cause hangs because of "
-                "unequal sample counts across ranks when dataset is exhausted."
-            )
-
-    def post_dataloading_process(
-        self,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        model_parts: list[nn.Module],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """
-        Post-processing hook after data loading and before model forward pass.
-
-        This method processes the raw data from the dataloader and prepares it for
-        the model's forward pass. It separates the main input tensor from auxiliary
-        inputs and constructs additional keyword arguments (e.g., attention masks).
-
-        Args:
-            input_dict: Dictionary containing tensors from the dataloader. Must
-                contain an "input" key with the main input tensor. May contain
-                additional keys for auxiliary inputs (e.g., position ids).
-            labels: Target labels for the batch.
-            model_parts: List of model parts for accessing model methods.
-
-        Returns:
-            A tuple of (inputs, labels, extra_kwargs) where:
-                - inputs: Main input tensor extracted from input_dict["input"].
-                - labels: Target labels (potentially modified by CP sharding).
-                - extra_kwargs: Additional keyword arguments for the model forward
-                    (e.g. positions, attention_masks), forwarded to every
-                    pipeline-parallel stage.
-        """
-        inputs = input_dict["input"]
-        extra_kwargs: dict[str, Any] = {
-            k: v for k, v in input_dict.items() if k != "input"
-        }
-
-        # TODO: deduplicate with Trainer.post_dataloading_process which has
-        # the same logic; extract a shared function to prevent further drift.
-        # The dataloader always provides per-document positions, which drive
-        # both RoPE and block_causal attention masking.
-        model_config = getattr(model_parts[0], "config", None)
-
-        positions = extra_kwargs.get("positions", None)
-        # positions and attention_masks are optional (Decoder.forward defaults
-        # both to None). Build masks only for the masked backends (Flex/Varlen),
-        # which is where get_attention_masks is defined. A maskless backend (the
-        # SDPA config used by the graph_trainer tests) still receives positions
-        # for RoPE but no masks — it relies on is_causal instead.
-        if isinstance(model_config, Decoder.Config) and positions is not None:
-            inner_attention = getattr(
-                model_config.first_attention, "inner_attention", None
-            )
-            if isinstance(
-                inner_attention, (FlexAttention.Config, VarlenAttention.Config)
-            ):
-                model = cast(Decoder, model_parts[0])
-                extra_kwargs["attention_masks"] = model.get_attention_masks(
-                    positions=positions,
-                )
-
-        if self.parallel_dims.cp_enabled:
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
-                inputs,
-                labels,
-                extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
-                inputs.device,
-                self.parallelism.context_parallel_load_balancer,
-                self.parallelism.context_parallel_ptrr_mask_key,
-            )
-
-        if self.parallelism.spmd_backend == "full_dtensor":
-            inputs, labels, extra_kwargs = full_dtensor.parallelize_inputs(
-                self.parallel_dims, inputs, labels, extra_kwargs
-            )
-
-        return inputs, labels, extra_kwargs
-
     @sl.log_trace_span("eval")
     @torch.no_grad()
     def validate(
         self,
-        model_parts: list[nn.Module],
+        model_parts: list[BaseModel],
         step: int,
     ) -> None:
         sl.add_step_tag("eval")
@@ -223,7 +153,7 @@ class Validator(BaseValidator):
         for model in model_parts:
             model.eval()
 
-        parallel_dims = self.parallel_dims
+        parallelism_context = self.parallelism_context
 
         accumulated_loss: torch.Tensor | None = None
         device_type = utils.device_type
@@ -231,9 +161,9 @@ class Validator(BaseValidator):
             (), dtype=torch.int64, device=device_type
         )
         num_steps = 0
-        num_microbatches = (
-            self.local_batch_size // self.parallelism.pipeline_parallel_microbatch_size
-            if parallel_dims.pp_enabled
+        num_pp_microbatches = (
+            self.parallelism.num_pp_microbatches
+            if parallelism_context.pp_enabled
             else 1
         )
 
@@ -241,46 +171,43 @@ class Validator(BaseValidator):
             dp_world_size=self.dp_world_size,
             dp_rank=self.dp_rank,
             tokenizer=self.tokenizer,
-            seq_len=self.seq_len,
-            local_batch_size=(
-                self.parallelism.pipeline_parallel_microbatch_size
-                if parallel_dims.pp_enabled
-                else self.local_batch_size
-            ),
+            max_context_length=self.seq_len,
+            num_tokens_per_microbatch=self.num_tokens_per_microbatch,
         )
 
-        validation_iterator = iter(validation_dataloader)
+        validation_iterator = iter(iterate_and_close_dataloader(validation_dataloader))
         while True:
             # pyrefly: ignore [missing-attribute, unsupported-operation]
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
             try:
-                microbatches = []
-                local_valid_tokens = torch.tensor(
-                    0, dtype=torch.int64, device=device_type
-                )
-                for _ in range(num_microbatches):
-                    input_dict, labels = next(validation_iterator)
-                    self.metrics_processor.ntokens_since_last_log += labels.numel()
-                    for k, v in input_dict.items():
-                        input_dict[k] = v.to(device_type)
-                    labels = labels.to(device_type)
-                    local_valid_tokens += (labels != IGNORE_INDEX).sum()
-                    microbatches.append((input_dict, labels))
+                microbatch_group = []
+                local_valid_tokens = 0
+                for _ in range(num_pp_microbatches):
+                    microbatch = next(validation_iterator)
+                    local_valid_tokens += microbatch.num_valid_tokens
+                    self.metrics_processor.ntokens_since_last_log += (
+                        microbatch.labels.numel()
+                    )
+                    input_dict = microbatch.to_input_dict(device_type)
+                    microbatch_group.append(input_dict)
             except StopIteration:
                 break
 
             # All-reduce token count across DP ranks while keeping it on device.
-            if parallel_dims.dp_enabled:
-                batch_mesh = parallel_dims.get_mesh("batch")
+            local_valid_tokens_tensor = torch.tensor(
+                local_valid_tokens, dtype=torch.int64, device=device_type
+            )
+            if parallelism_context.dp_enabled:
+                dp_mesh = parallelism_context.get_mesh("dp")
                 global_valid_tokens = dist_utils.dist_sum_tensor(
-                    local_valid_tokens, batch_mesh, None
+                    local_valid_tokens_tensor, dp_mesh, None
                 )
             else:
-                global_valid_tokens = local_valid_tokens
+                global_valid_tokens = local_valid_tokens_tensor
 
-            if parallel_dims.pp_enabled:
+            if parallelism_context.pp_enabled:
                 assert self.pp_schedule is not None
                 assert self.pp_has_first_stage is not None
                 assert self.pp_has_last_stage is not None
@@ -291,17 +218,20 @@ class Validator(BaseValidator):
                     [] if self.pp_has_last_stage else None
                 )
 
-                for input_dict, labels in microbatches:
-                    inputs, labels, extra_kwargs = self.post_dataloading_process(
-                        input_dict, labels, model_parts
-                    )
+                for input_dict in microbatch_group:
+                    with self.parallelism_context.activate_spmd():
+                        inputs, labels, extra_kwargs = model_parts[0].preprocess_inputs(
+                            input_dict,
+                            parallelism_context=self.parallelism_context,
+                            parallelism=self.parallelism,
+                        )
                     if self.pp_has_first_stage:
-                        arg_mbs.append((inputs,))
+                        arg_mbs.append((inputs,))  # pyrefly: ignore[bad-argument-type]
                     kwarg_mbs.append(extra_kwargs)
                     if target_mbs is not None:
-                        target_mbs.append(labels)
+                        target_mbs.append(labels)  # pyrefly: ignore[bad-argument-type]
 
-                with self.validation_context():
+                with self.parallelism_context.activate_spmd():
                     losses = [] if self.pp_has_last_stage else None
                     self.pp_schedule.eval(
                         arg_mbs=arg_mbs if self.pp_has_first_stage else None,
@@ -319,13 +249,14 @@ class Validator(BaseValidator):
                 else:
                     loss_sum = torch.tensor([-1.0], device=device_type)
             else:
-                assert len(microbatches) == 1
-                input_dict, labels = microbatches[0]
-                # Process data (extract inputs, handle attention masks, CP sharding)
-                inputs, labels, extra_kwargs = self.post_dataloading_process(
-                    input_dict, labels, model_parts
-                )
-                with self.validation_context():
+                assert len(microbatch_group) == 1
+                input_dict = microbatch_group[0]
+                with self.parallelism_context.activate_spmd():
+                    inputs, labels, extra_kwargs = model_parts[0].preprocess_inputs(
+                        input_dict,
+                        parallelism_context=self.parallelism_context,
+                        parallelism=self.parallelism,
+                    )
                     assert len(model_parts) == 1
                     predictions = model_parts[0](inputs, **extra_kwargs)
                     loss_sum, _ = self.loss_fn(predictions, labels)
@@ -338,11 +269,25 @@ class Validator(BaseValidator):
             total_global_valid_tokens.add_(global_valid_tokens)
             num_steps += 1
 
-        assert accumulated_loss is not None
+        if accumulated_loss is None:
+            raise ValueError(
+                "Validation ran zero batches on this rank. This happens when the "
+                "validation dataset supplies fewer than num_tokens_per_microbatch "
+                "tokens on this rank, because concat-then-split packing drops "
+                "partially filled batches. Decrease "
+                "training.num_tokens_per_microbatch_per_dp_rank or use a larger "
+                "validation dataset."
+            )
         num_global_valid_tokens = int(total_global_valid_tokens.item())
-        if parallel_dims.dp_cp_enabled:
+        if num_global_valid_tokens == 0:
+            raise ValueError(
+                "Validation ran on zero valid tokens; cannot compute an average "
+                "validation loss. Ensure the validation batches contain unmasked "
+                "labels."
+            )
+        if parallelism_context.dp_cp_enabled:
             global_loss_sum = dist_utils.dist_sum(
-                accumulated_loss, parallel_dims.get_optional_mesh("loss")
+                accumulated_loss, parallelism_context.get_optional_mesh("loss")
             )
         else:
             global_loss_sum = float(accumulated_loss.item())
@@ -353,3 +298,13 @@ class Validator(BaseValidator):
         # Set model back to train mode
         for model in model_parts:
             model.train()
+
+
+def iterate_and_close_dataloader(
+    dataloader: BaseDataLoader,
+) -> Iterator[TrainingMicrobatch]:
+    """Close a temporary dataloader when its consumer stops iterating."""
+    try:
+        yield from dataloader
+    finally:
+        dataloader.close()

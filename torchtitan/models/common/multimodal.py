@@ -4,54 +4,162 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Model-agnostic vision<->text fusion for VLMs.
+"""Model-agnostic multimodal model support.
 
-The decoder embeds the full token sequence; the placeholder tokens
-get a throwaway text embedding that ``scatter_vision_embeds``
-overwrites with the vision encoder's per-item features at the positions
-``get_vision_positions`` locates.
+``get_vision_positions`` and ``scatter_vision_embeds`` support span-based
+fusion over a full token sequence. ``build_vision_bank_indices`` and
+``gather_vision_embeds`` support gather-based fusion by carrying an absolute
+packed-bank row for every placeholder token.
 """
 
-import contextlib
+from typing import Self
 
 import spmd_types as spmd
 import torch
 
-from torchtitan.distributed.spmd_types import spmd_mesh_size
-from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.config import CompileConfig, TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
+
+from .decoder import Decoder
 
 
-def multimodal_context() -> contextlib.AbstractContextManager[None]:
-    """Use a DP-local mesh while preparing multimodal inputs.
+class MultimodalModel(Decoder):
+    """Language model with modality-specific encoders."""
 
-    Under ``spmd_types`` the vision encoder and the vision->text scatter run
-    per-DP-rank on that rank's own images: the pixel tensors are DP-local
-    (``V@DP``), so the region must execute with DP treated as a local axis.
-    After the scatter the tensor is token-aligned again and global DP batch
-    sharding resumes. A no-op outside ``spmd_types`` (or when DP is size 1).
-    """
-    if get_spmd_backend() == "spmd_types" and spmd_mesh_size("dp") > 1:
-        return spmd.set_current_mesh(local_axes=("dp",))
-    return contextlib.nullcontext()
+    multimodal_encoder_fqns: tuple[str, ...] = ()
+
+    def parallelize(
+        self,
+        *,
+        parallelism_context: ParallelismContext,
+        training: TrainingConfig,
+        parallelism: ParallelismConfig,
+        compile_config: CompileConfig | None,
+        ac_config: ActivationCheckpointingConfig | None,
+        dump_folder: str,
+        skip_dp: bool = False,
+    ) -> Self:
+        with parallelism_context.activate_spmd():
+            self._parallelize(parallelism_context)
+            encoders = [
+                encoder
+                for encoder_fqn in self.multimodal_encoder_fqns
+                if (encoder := getattr(self, encoder_fqn)) is not None
+            ]
+            if ac_config is not None:
+                policy = ac_config.build(dump_folder=dump_folder)
+                policy.apply(self)
+                for encoder in encoders:
+                    policy.apply(encoder)
+
+            if compile_config is not None and "model" in compile_config.components:
+                from torchtitan.distributed.compile import apply_compile
+
+                apply_compile(
+                    self,
+                    compile_config=compile_config,
+                    parallelism_context=parallelism_context,
+                )
+                for encoder in encoders:
+                    apply_compile(
+                        encoder,
+                        compile_config=compile_config,
+                        parallelism_context=parallelism_context,
+                    )
+
+            if not skip_dp:
+                self._apply_fsdp(
+                    parallelism_context=parallelism_context,
+                    training=training,
+                    parallelism=parallelism,
+                )
+        return self
+
+    def _apply_fsdp(
+        self,
+        *,
+        parallelism_context: ParallelismContext,
+        training: TrainingConfig,
+        parallelism: ParallelismConfig,
+    ) -> None:
+        from torchtitan.distributed.fsdp import (
+            apply_fsdp_to_multimodal_encoder,
+            resolve_fsdp_mesh,
+        )
+
+        if not parallelism_context.pp_enabled:
+            dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+            for encoder_fqn in self.multimodal_encoder_fqns:
+                encoder = getattr(self, encoder_fqn)
+                if encoder is not None:
+                    apply_fsdp_to_multimodal_encoder(
+                        encoder,
+                        dp_mesh,
+                        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+                        reshard_after_forward_policy=(
+                            parallelism.fsdp_reshard_after_forward
+                        ),
+                        pp_enabled=parallelism_context.pp_enabled,
+                        cpu_offload=training.enable_cpu_offload,
+                        dp_mesh_dims=dp_mesh_dims,
+                    )
+        super()._apply_fsdp(
+            parallelism_context=parallelism_context,
+            training=training,
+            parallelism=parallelism,
+        )
+
+
+def build_dummy_vision_inputs(
+    *,
+    patch_dim: int,
+    grid_thw: tuple[int, int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build zero patches for one valid packed vision item."""
+    t, h, w = grid_thw
+    pixel_values_TP = torch.zeros(t * h * w, patch_dim, device=device)
+    grid_thw_N3 = torch.tensor([grid_thw], device=device)
+    if spmd.is_type_checking():
+        for tensor in (pixel_values_TP, grid_thw_N3):
+            spmd.mutate_type(tensor, "dp", src=spmd.R, dst=spmd.V)
+            spmd.mutate_type(tensor, "tp", src=spmd.R, dst=spmd.I)
+    return pixel_values_TP, grid_thw_N3
+
+
+def add_zero_vision_dependency(
+    inputs_TD: torch.Tensor,
+    vision_output_VD: torch.Tensor,
+) -> torch.Tensor:
+    """Connect a dummy vision forward to text activations without changing them."""
+    dependency = (vision_output_VD * 0.0).sum()
+    if spmd.is_type_checking():
+        dependency = spmd.mutate_type(dependency, "dp", src=spmd.V, dst=spmd.R)
+    with spmd.local():
+        output_TD = inputs_TD + dependency
+    if spmd.is_type_checking():
+        spmd.assert_type_like(output_TD, inputs_TD)
+    return output_TD
 
 
 def get_vision_positions(
     tokens: torch.Tensor,
     num_vision_tokens_per_item: torch.Tensor,
     placeholder_id: int,
-) -> list[tuple[int, int, int, int]]:
+) -> list[tuple[int, int, int]]:
     """Locate each visual item's placeholder run in the token sequence.
 
     Args:
-        tokens: (bsz, seq_len) token IDs.
+        tokens: ``(T,)`` token IDs.
         num_vision_tokens_per_item: (num_items,) valid token count per visual item, in
             the order the items appear in ``tokens``.
         placeholder_id: token id whose contiguous runs mark vision spans.
 
     Returns:
-        ``(item_idx, sample_idx, vision_start, n_tokens)`` per item, where
-        ``vision_start`` is the position of the run's first placeholder token
-        within its sample.
+        ``(item_idx, vision_start, n_tokens)`` per item.
 
     Raises:
         ValueError: if the number of placeholder runs does not equal the number
@@ -60,18 +168,13 @@ def get_vision_positions(
             misaligned; scattering anyway would silently corrupt the embeddings,
             so fail loudly with the offending counts.
     """
-    vision_mask = tokens == placeholder_id  # (bsz, seq_len)
-    # Shift within each row (row boundaries padded False) so a placeholder
-    # ending one sample and starting the next are NOT merged into one run across
-    # the flattened batch boundary.
+    vision_mask = tokens == placeholder_id
     prev_mask = torch.zeros_like(vision_mask)
-    prev_mask[:, 1:] = vision_mask[:, :-1]
+    prev_mask[1:] = vision_mask[:-1]
     next_mask = torch.zeros_like(vision_mask)
-    next_mask[:, :-1] = vision_mask[:, 1:]
-    flat_mask = vision_mask.view(-1)
-    region_starts = torch.where(flat_mask & ~prev_mask.view(-1))[0]
-    region_ends = torch.where(flat_mask & ~next_mask.view(-1))[0]
-    seq_len = tokens.shape[1]
+    next_mask[:-1] = vision_mask[1:]
+    region_starts = torch.where(vision_mask & ~prev_mask)[0]
+    region_ends = torch.where(vision_mask & ~next_mask)[0]
 
     num_items = int(num_vision_tokens_per_item.shape[0])
     num_runs = int(region_starts.shape[0])
@@ -83,11 +186,15 @@ def get_vision_positions(
             f"exactly one placeholder run."
         )
 
+    # Convert each metadata tensor once. Per-item ``.item()`` calls would
+    # synchronize CUDA once per scalar.
+    region_starts_list = region_starts.tolist()
     run_lengths = (region_ends - region_starts + 1).tolist()
-    positions: list[tuple[int, int, int, int]] = []
+    num_vision_tokens_per_item_list = num_vision_tokens_per_item.tolist()
+    positions: list[tuple[int, int, int]] = []
     for i in range(num_items):
-        start = int(region_starts[i].item())
-        n_tokens = int(num_vision_tokens_per_item[i].item())
+        start = int(region_starts_list[i])
+        n_tokens = int(num_vision_tokens_per_item_list[i])
         if run_lengths[i] != n_tokens:
             raise ValueError(
                 f"Multimodal misalignment: placeholder run {i} spans "
@@ -95,25 +202,66 @@ def get_vision_positions(
                 f"{n_tokens} embedding(s). The placeholder count in the prompt "
                 f"must match the vision token count for that item."
             )
-        positions.append((i, start // seq_len, start % seq_len, n_tokens))
+        positions.append((i, start, n_tokens))
     return positions
+
+
+def build_vision_bank_indices(
+    tokens_T: torch.Tensor,
+    *,
+    placeholder_id: int,
+) -> torch.Tensor:
+    """Map vision placeholder tokens to absolute packed-bank rows."""
+    vision_mask_T = tokens_T == placeholder_id
+    vision_bank_indices_T = torch.cumsum(vision_mask_T.to(torch.long), dim=0) - 1
+    return vision_bank_indices_T.masked_fill(~vision_mask_T, -1)
+
+
+def gather_vision_embeds(
+    inputs_TD: torch.Tensor,
+    *,
+    vision_bank_VD: torch.Tensor,
+    vision_bank_indices_T: torch.Tensor,
+) -> torch.Tensor:
+    """Gather packed vision features into their placeholder token positions."""
+    if vision_bank_VD.shape[0] == 0:
+        return inputs_TD
+    vision_bank_VD = vision_bank_VD.to(inputs_TD.dtype)
+    is_vision_T1 = (vision_bank_indices_T >= 0).unsqueeze(-1)
+    gathered_TD = vision_bank_VD[vision_bank_indices_T.clamp(min=0)]
+    # The vision bank is DP-local, so global propagation through where omits
+    # DP from the token PartitionSpec. Validate locally, then restore the exact
+    # token layout at the fusion boundary.
+    with spmd.local():
+        fused_TD = torch.where(is_vision_T1, gathered_TD, inputs_TD)
+    if spmd.is_type_checking():
+        spmd.assert_type_like(fused_TD, inputs_TD)
+    return fused_TD
 
 
 def scatter_vision_embeds(
     inputs_embeds: torch.Tensor,
     *,
     vision_embeds: torch.Tensor,
-    vision_positions: list[tuple[int, int, int, int]],
+    vision_positions: list[tuple[int, int, int]],
 ) -> torch.Tensor:
-    """Copy padded vision features into the text sequence at placeholder runs.
+    """Copy packed vision features into the text sequence at placeholder runs.
 
     Args:
-        inputs_embeds: (batch, seq_len, dim) text embeddings, modified in place.
-        vision_embeds: (num_items, max_tokens, dim) padded vision features.
+        inputs_embeds: ``(T, D)`` text embeddings, modified in place.
+        vision_embeds: Packed vision features ``(total_tokens, dim)``.
         vision_positions: from ``get_vision_positions``.
     """
-    for item_idx, sample_idx, vision_start, n_tokens in vision_positions:
-        inputs_embeds[
-            sample_idx, vision_start : vision_start + n_tokens, :
-        ] = vision_embeds[item_idx, :n_tokens, :].to(inputs_embeds.dtype)
+    vision_offset = 0
+    for _, vision_start, num_tokens in vision_positions:
+        inputs_embeds[vision_start : vision_start + num_tokens] = vision_embeds[
+            vision_offset : vision_offset + num_tokens
+        ].to(inputs_embeds.dtype)
+        vision_offset += num_tokens
+
+    if vision_offset != vision_embeds.shape[0]:
+        raise ValueError(
+            f"Vision placeholder runs consume {vision_offset} embeddings but "
+            f"the packed vision output contains {vision_embeds.shape[0]}."
+        )
     return inputs_embeds

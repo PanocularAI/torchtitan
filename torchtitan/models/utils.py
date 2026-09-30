@@ -4,37 +4,27 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
+from collections.abc import Iterable
+from fractions import Fraction
+
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import _StridedShard, Replicate, Shard
+from torch.distributed.tensor.placement_types import (
+    _StridedShard,
+    Placement,
+    Replicate,
+    Shard,
+)
 
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
-from torchtitan.tools.logging import logger
 
 
-def validate_converter_order(converters: list) -> None:
-    """Validate that quantization/QAT converters precede LoRA.
-
-    Raises ``ValueError`` if a quantization converter appears after a LoRA
-    converter in the list.
-    """
-    from torchtitan.components.lora import LoRAConverter
-    from torchtitan.components.quantization import QuantizationConverter
-
-    _BEFORE_LORA = (QuantizationConverter.Config,)
-
-    seen_lora = False
-    for converter in converters:
-        if isinstance(converter, LoRAConverter.Config):
-            seen_lora = True
-        elif seen_lora and isinstance(converter, _BEFORE_LORA):
-            raise ValueError(
-                f"{type(converter).__name__} must be applied before "
-                f"LoRAConverter. Reorder the converters list."
-            )
+logger = logging.getLogger(__name__)
 
 
 class MoEStateDictAdapter(StateDictAdapter):
@@ -55,11 +45,23 @@ class MoEStateDictAdapter(StateDictAdapter):
         super().__init__(model_config, hf_assets_path)
         self.model_config = model_config
         self.hf_assets_path = hf_assets_path
-        # Store metadata for GroupedExperts <-> individual experts conversion
+        # Store metadata for grouped-weight <-> individual-expert conversion.
         self.grouped_expert_weight_placements = {}  # {titan_abstract_key: placements}
         self.grouped_expert_weight_shape = {}  # {titan_abstract_key: shape}
         self.grouped_expert_weight_mesh = {}  # {titan_abstract_key: device_mesh}
         self.local_experts_indices = {}  # {titan_abstract_key: (start_idx, end_idx)}
+
+    @staticmethod
+    def _is_expert_weight_key(key: str) -> bool:
+        """Return whether ``key`` is a canonical or logical expert projection."""
+        return key.endswith(
+            (
+                ".moe.routed_experts.w1_EFD",
+                ".moe.routed_experts.w13.weight",
+                ".moe.routed_experts.w2.weight",
+                ".moe.routed_experts.w3_EFD",
+            )
+        )
 
     def _calculate_strided_shard_shard_indices(
         self,
@@ -127,7 +129,7 @@ class MoEStateDictAdapter(StateDictAdapter):
         # pyrefly: ignore [bad-argument-type]
         for i, name in enumerate(device_mesh.mesh_dim_names):
             placement = dtensor_placements[i]
-            if placement.dim == dim:
+            if isinstance(placement, (Shard, _StridedShard)) and placement.dim == dim:
                 mesh_names.append(name)
                 dim_i_placements.append(placement)
 
@@ -176,7 +178,7 @@ class MoEStateDictAdapter(StateDictAdapter):
 
         else:
             raise NotImplementedError(
-                f"Unsupported DTensor placements for GroupedExperts: {dtensor_placements} {dim_i_placements} {mesh_names}"
+                f"Unsupported grouped-weight DTensor placements: {dtensor_placements} {dim_i_placements} {mesh_names}"
             )
 
         return start_index, end_index
@@ -189,7 +191,7 @@ class MoEStateDictAdapter(StateDictAdapter):
         grouped_expert_weight: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """
-        Split GroupedExperts weight into individual expert weights for local processing.
+        Split a grouped weight into individual expert weights for local processing.
 
         This method handles various sharding strategies for expert weights:
         - FSDP + EP: StridedShard(0)Shard(0) or Shard(0)
@@ -224,7 +226,7 @@ class MoEStateDictAdapter(StateDictAdapter):
         # exclude expert dimension
         # and build new sub-mesh/placements for individual expert weights
         sub_mesh_names = []
-        sub_placements = []
+        sub_placements: list[Placement] = []
 
         for i, name in enumerate(device_mesh.mesh_dim_names):
             placement = dtensor_placements[i]
@@ -305,12 +307,12 @@ class MoEStateDictAdapter(StateDictAdapter):
                         }
                     }
                 }
-                Used to collect individual expert weights before concatenating them into GroupedExperts.
+                Used to collect individual expert weights before concatenating them.
             abstract_key: TorchTitan templage key with {} placeholders for layer and expert IDs
             layer_num: Layer identifier
 
         Returns:
-            Concatenated GroupedExperts weight DTensor if all experts are available, otherwise None
+            Concatenated grouped-weight DTensor if all experts are available, otherwise None
         """
         # If we have all the experts for this abstract_key, concatenate them
         experts = expert_weights_by_layer[layer_num][abstract_key]
@@ -333,7 +335,7 @@ class MoEStateDictAdapter(StateDictAdapter):
             abstract_key in self.grouped_expert_weight_placements
             and abstract_key in self.grouped_expert_weight_shape
             and abstract_key in self.grouped_expert_weight_mesh
-        ), "GroupedExperts weight metadata (placements, shape, mesh) can not be None!"
+        ), "Grouped-weight metadata (placements, shape, mesh) can not be None!"
 
         stacked_dtensor = DTensor.from_local(
             local_tensor,
@@ -369,7 +371,7 @@ class MoEStateDictAdapter(StateDictAdapter):
         n_experts: int,
     ) -> torch.Tensor | None:
         """
-        Concatenated GroupedExperts weight using torch.stack(). Used for offline conversion.
+        Concatenate a grouped weight with torch.stack() for offline conversion.
 
         Args:
             expert_weights_by_layer: Dictionary tracking expert weights by layer, abstract key, and expert ID.
@@ -380,13 +382,13 @@ class MoEStateDictAdapter(StateDictAdapter):
                         }
                     }
                 }
-                Used to collect individual expert weights before concatenating them into GroupedExperts.
+                Used to collect individual expert weights before concatenating them.
             abstract_key: TorchTitan templage key with {} placeholders for layer and expert IDs
             layer_num: Layer identifier
-            n_experts: Number of experts in the GroupedExperts module
+            n_experts: Number of experts in the grouped weight.
 
         Returns:
-            Concatenated GroupedExperts weight if all experts are available, otherwise None
+            Concatenated grouped weight if all experts are available, otherwise None.
         """
         # If we have all the experts for this abstract_key, concatenate them
         experts = expert_weights_by_layer[layer_num][abstract_key]
@@ -404,137 +406,128 @@ class MoEStateDictAdapter(StateDictAdapter):
         return stacked_tensor
 
 
-def get_dense_model_nparams_and_flops(
-    model: nn.Module,
-    n_layers: int,
-    n_heads: int,
-    head_dims: int,
+def quadratic_attention_flops_per_token(
+    *,
+    num_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
     seq_len: int,
-    enable_weight_tying: bool = False,
-) -> tuple[int, int]:
+    sliding_window_size: int | None = None,
+) -> int:
+    """Training FLOPs per token for quadratic or windowed attention.
+
+    Reasoning behind the factor of 6 for the self-attention part of the formula:
+    1. each self-attention has 2 matmul in the forward and 4 (counted as 2)
+       in the backward                                                      (3)
+       The 2 matmuls per token are:
+       a. tmp = q @ K^T: [1, qk_head_dim] @ [qk_head_dim, seq_len]
+       b. tmp @ V: [1, seq_len] @ [seq_len, v_head_dim]
+       so we get
+       seq_len * qk_head_dim + seq_len * v_head_dim = seq_len * (qk_head_dim + v_head_dim)
+    2. the flash attention does 1 more matmul recomputation in the backward
+       but recomputation should not be counted in calculating MFU           (+0)
+    3. each matmul performs 1 multiplication and 1 addition                 (*2)
+    4. we follow the convention and do not account for sparsity in causal attention
+
+    ``qk_head_dim`` and ``v_head_dim`` describe the two attention
+    contractions. The factor of 6 accounts for multiply-adds in forward and
+    backward. As in the existing MFU convention, causal sparsity and backward
+    recomputation are not counted.
     """
+    attended_tokens = (
+        seq_len if sliding_window_size is None else min(seq_len, sliding_window_size)
+    )
+    return 6 * num_heads * (qk_head_dim + v_head_dim) * attended_tokens
+
+
+def delta_rule_flops_per_token(
+    *,
+    num_heads: int,
+    key_head_dim: int,
+    v_head_dim: int,
+) -> int:
+    """Training FLOPs per token for a recurrent delta-rule state update.
+
+    Omitting batch dimensions,
+    ``state``: ``[num_heads, key_head_dim, v_head_dim]``
+    ``key`` and ``query``: ``[num_heads, key_head_dim]``
+    ``value`` and ``delta``: ``[num_heads, v_head_dim]``
+
+    For each token, the recurrence performs:
+    1. Decay the state: ``decayed_state = exp(decay) * state``.
+    2. Read the stored value: ``memory = decayed_state.T @ key``.
+    3. Form the gated correction: ``delta = beta * (value - memory)``.
+    4. Update the state: ``state = decayed_state + key[:, None] * delta[None, :]``.
+    5. Read the output: ``output = state.T @ query``.
+
+    Steps 2, 4, and 5 each scale as ``key_head_dim * v_head_dim``, producing the
+    factor of 3. The factor of 6 accounts for multiply-adds in forward and
+    backward. Gate-producing linear projections are covered by the model's
+    ``6 * active_nparams`` term. The elementwise work in steps 1 and 3, output
+    gating, normalization, nonlinearities, and backward recomputation are not
+    counted.
+    """
+    return 6 * 3 * num_heads * key_head_dim * v_head_dim
+
+
+def get_nparams_and_active_nparams(
+    model: nn.Module,
+    *,
+    modules_excluded_from_active_params: Iterable[nn.Module | None] = (),
+) -> tuple[int, int]:
+    """Count total and matmul-active parameters for a native decoder.
+
+    Routed-expert parameters are weighted by the owning MoE module's active
+    expert ratio. Embedding tables are excluded unless their parameter is shared
+    with the output head. Explicitly excluded subtrees are also assigned zero
+    per-token parameter cost.
+
     Args:
-        model: nn.Module representing the model.
-        n_layers: The number of transformer layers.
-        n_heads: The number of attention heads.
-        head_dims: The sum of qk and v head dimensions.
-        seq_len: The sequence length in training configs.
-        enable_weight_tying: Whether weight tying is enabled.
+        model: Built model whose parameters are counted.
+        modules_excluded_from_active_params: Module subtrees whose cost does not
+            scale per text token, such as a vision encoder.
 
     Returns:
-        Tuple of (nparams, num_flops_per_token):
-            nparams: Total number of model parameters.
-            num_flops_per_token: Estimated number of floating point operations per token.
+        Total parameter count and effective parameter count for the conventional
+        ``6 * active_parameters`` training FLOP estimate.
     """
-    # model.parameters() de-duplicates shared parameters, so tied input/output
-    # embeddings are counted once.
-    nparams = sum(p.numel() for p in model.parameters())
-    nparams_embedding = sum(
-        sum(p.numel() for p in m.parameters())
-        for m in model.children()
-        if isinstance(m, nn.Embedding)
+    named_parameters = list(model.named_parameters())
+    nparams = sum(param.numel() for _, param in named_parameters)
+    parameter_weights = {id(param): Fraction(1) for _, param in named_parameters}
+
+    for module in model.modules():
+        if isinstance(module, MoE):
+            active_expert_ratio = Fraction(
+                module.router.top_k, module.router.num_experts
+            )
+            for param in module.routed_experts.parameters():
+                parameter_weights[id(param)] = active_expert_ratio
+
+    lm_head = getattr(model, "lm_head", None)
+    lm_head_parameter_ids = (
+        {id(param) for param in lm_head.parameters()}
+        if isinstance(lm_head, nn.Module)
+        else set()
     )
+    for module in model.modules():
+        if isinstance(module, nn.Embedding):
+            for param in module.parameters(recurse=False):
+                if id(param) not in lm_head_parameter_ids:
+                    parameter_weights[id(param)] = Fraction(0)
 
-    # Reasoning behind the factor of 6 for the self-attention part of the formula:
-    # 1. each self-attention has 2 matmul (attention scores and value aggregation,
-    #    combined in head_dims, counted as 1) in the forward and 4 (counted as 2)
-    #    in the backward                                                      (3)
-    # 2. the flash attention does 1 more matmul recomputation in the backward
-    #    but recomputation should not be counted in calculating MFU           (+0)
-    # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
-    # 4. we follow the convention and do not account for sparsity in causal attention
-    # With tied embeddings, PyTorch's parameter iterator already counts the
-    # shared input/output parameter once. That parameter still participates in
-    # the lm_head matmul, so do not subtract it for either size or FLOPs.
-    nparams_for_matmul = nparams if enable_weight_tying else nparams - nparams_embedding
-    num_flops_per_token = (
-        6 * nparams_for_matmul + 6 * n_layers * n_heads * head_dims * seq_len
+    for module_excluded_from_active_params in modules_excluded_from_active_params:
+        if module_excluded_from_active_params is None:
+            continue
+        for param in module_excluded_from_active_params.parameters():
+            parameter_weights[id(param)] = Fraction(0)
+
+    nparams_for_matmul = sum(
+        param.numel() * parameter_weights[id(param)] for _, param in named_parameters
     )
-
-    return nparams, num_flops_per_token
-
-
-def get_moe_model_nparams_and_flops(
-    model_config: Decoder.Config,
-    model: nn.Module,
-    n_heads: int,
-    head_dims: int,
-    seq_len: int,
-) -> tuple[int, int]:
-    """
-    Calculate nparams and nflops for MoE models.
-
-    Args:
-        model_config: Decoder.Config object containing model configuration parameters including MoE settings.
-        model: nn.Module representing the MoE model.
-        n_heads: The number of attention heads.
-        head_dims: The sum of qk and v head dimensions.
-        seq_len: The sequence length in training configs.
-
-    Returns:
-        Tuple of (nparams, num_flops_per_token):
-            nparams: Total number of model parameters including all experts.
-            num_flops_per_token: Estimated number of floating point operations per token
-                                based on active parameters only.
-    """
-    nparams_embedding = 0
-    nparams_moe_router = 0
-    nparams_shared_experts = 0
-    nparams_experts = 0
-    nparams_dense = 0
-    # TODO: add a per-batch vision encoder FLOP term for accurate VLM MFU.
-    nparams_vision = 0
-
-    for name, p in model.named_parameters():
-        if "vision_encoder" in name:
-            nparams_vision += p.numel()
-        elif "embedding" in name:
-            nparams_embedding += p.numel()
-            nparams_dense += p.numel()
-        elif "moe.shared_experts" in name:
-            nparams_shared_experts += p.numel()
-        elif "moe.router" in name:
-            nparams_moe_router += p.numel()
-        elif "moe.routed_experts" in name:
-            nparams_experts += p.numel()
-        else:
-            nparams_dense += p.numel()
-
-    nparams_sparse = nparams_moe_router + nparams_shared_experts + nparams_experts
-    nparams = nparams_dense + nparams_sparse + nparams_vision
-
-    moe_config = next((l.moe for l in model_config.layers if l.moe is not None), None)
-    if moe_config is not None:
-        nparams_sparse_active = (
-            nparams_moe_router
-            + nparams_shared_experts
-            + nparams_experts * moe_config.router.top_k // moe_config.num_experts
-        )
-    else:
-        nparams_sparse_active = 0
+    assert nparams_for_matmul.denominator == 1
+    active_nparams = nparams_for_matmul.numerator
 
     logger.info(
-        f"Total parameter count: dense {nparams_dense:,}, "
-        f"sparse {nparams_sparse:,}, vision {nparams_vision:,}, "
-        f"active {nparams_dense + nparams_sparse_active:,}"
+        f"Total parameter count: {nparams:,}, active parameters: {active_nparams:,}"
     )
-
-    # With tied embeddings, PyTorch's parameter iterator already counts the
-    # shared input/output parameter once. That parameter still participates in
-    # the lm_head matmul, so do not subtract it for either size or FLOPs.
-    if getattr(model_config, "enable_weight_tying", False):
-        nparams_for_matmul = nparams_dense + nparams_sparse_active
-    else:
-        nparams_for_matmul = nparams_dense - nparams_embedding + nparams_sparse_active
-    # Only full attention layers contribute the quadratic O(L²) FLOPs
-    # term. Hybrid models mix full attention with linear attention
-    # layers whose block leaves ``attention=None``; standard decoders carry
-    # full attention on every layer, so this counts all of them.
-    num_full_attn = sum(
-        1 for l in model_config.layers if getattr(l, "attention", None) is not None
-    )
-    num_flops_per_token = (
-        6 * nparams_for_matmul + 6 * num_full_attn * n_heads * head_dims * seq_len
-    )
-
-    return nparams, num_flops_per_token
+    return nparams, active_nparams

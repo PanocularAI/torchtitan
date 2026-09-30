@@ -4,34 +4,54 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.checkpoint import CheckpointManager
+from dataclasses import dataclass
+
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data import (
+    ConcatThenSplitPackingConfig,
+    FirstFitPackingConfig,
+    GrainDataLoader,
+    HuggingFaceRandomAccessSource,
+    SingleDatasetConfig,
+)
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
-from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
+from torchtitan.components.optimizer import (
+    AdamW,
+    LRSchedulersContainer,
+    OptimizersContainer,
+)
+from torchtitan.config import CompileConfig, DebugConfig, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.experiments.transformers_modeling_backend.configs import (
-    TransformersBackendConfig,
-)
-from torchtitan.hf_datasets.text_datasets import (
-    ChatDataLoader,
-    HuggingFaceTextDataLoader,
-)
-from torchtitan.tools.profiler import Profiler
+from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
+from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.observability.profiler import Profiler
+from torchtitan.trainer import Trainer
 from . import model_registry
 from .tokenizer import HFBackendTokenizer
 
 
-def transformers_modeling_backend_debugmodel() -> TransformersBackendConfig:
-    model_spec = model_registry("debugmodel")
+@dataclass(kw_only=True, slots=True)
+class TransformersBackendConfig(Trainer.Config):
+    hf_model: str = ""
+    """HuggingFace model ID (e.g., 'Qwen/Qwen2.5-7B')"""
+
+
+def transformers_modeling_backend_debugmodel(
+    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> TransformersBackendConfig:
+    model_config = model_registry("debugmodel", seq_len=seq_len)
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         debug=DebugConfig(print_config=True),
-        model_spec=model_spec,
+        model=model_config,
         profiler=Profiler.Config(profile_freq=5),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -39,33 +59,43 @@ def transformers_modeling_backend_debugmodel() -> TransformersBackendConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
+            max_context_length=seq_len,
             steps=10,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
-            spmd_backend="partial_dtensor",
         ),
-        checkpoint=CheckpointManager.Config(
-            interval=10,
-            last_save_model_only=False,
-        ),
+        checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )
 
 
-def transformers_modeling_backend_debugmodel_moe() -> TransformersBackendConfig:
+def transformers_modeling_backend_debugmodel_compile(
+    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> TransformersBackendConfig:
+    config = transformers_modeling_backend_debugmodel(seq_len=seq_len)
+    config.compile = CompileConfig()
+    return config
+
+
+def transformers_modeling_backend_debugmodel_moe(
+    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> TransformersBackendConfig:
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-30B-A3B",
         debug=DebugConfig(print_config=True),
-        model_spec=model_registry("debugmodel_moe"),
+        model=model_registry("debugmodel_moe", seq_len=seq_len),
         profiler=Profiler.Config(profile_freq=5),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -73,31 +103,41 @@ def transformers_modeling_backend_debugmodel_moe() -> TransformersBackendConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
+            max_context_length=seq_len,
             steps=10,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
-            spmd_backend="partial_dtensor",
         ),
-        checkpoint=CheckpointManager.Config(
-            interval=10,
-            last_save_model_only=False,
-        ),
+        checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )
 
 
-def transformers_modeling_backend_full_moe() -> TransformersBackendConfig:
+def transformers_modeling_backend_debugmodel_moe_compile(
+    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> TransformersBackendConfig:
+    config = transformers_modeling_backend_debugmodel_moe(seq_len=seq_len)
+    config.compile = CompileConfig()
+    return config
+
+
+def transformers_modeling_backend_full_moe(
+    seq_len: int = 2048,
+) -> TransformersBackendConfig:
     return TransformersBackendConfig(
         hf_model="Qwen/Qwen3-30B-A3B",
         debug=DebugConfig(print_config=True),
-        model_spec=model_registry("full_moe"),
+        model=model_registry("full_moe", seq_len=seq_len),
         profiler=Profiler.Config(profile_freq=5),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=200,
             decay_ratio=0.8,
@@ -105,33 +145,35 @@ def transformers_modeling_backend_full_moe() -> TransformersBackendConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
+            max_context_length=seq_len,
             steps=1000,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        ),
         metrics=MetricsProcessor.Config(log_freq=10),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
-            spmd_backend="partial_dtensor",
         ),
-        checkpoint=CheckpointManager.Config(
-            interval=500,
-            last_save_model_only=False,
-        ),
+        checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )
 
 
-def transformers_modeling_backend_full() -> TransformersBackendConfig:
-    model_spec = model_registry("full")
+def transformers_modeling_backend_full(
+    seq_len: int = 2048,
+) -> TransformersBackendConfig:
+    model_config = model_registry("full", seq_len=seq_len)
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         debug=DebugConfig(print_config=True),
-        model_spec=model_spec,
+        model=model_config,
         profiler=Profiler.Config(profile_freq=5),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -139,25 +181,25 @@ def transformers_modeling_backend_full() -> TransformersBackendConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
+            max_context_length=seq_len,
             steps=10,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
-            spmd_backend="partial_dtensor",
         ),
-        checkpoint=CheckpointManager.Config(
-            interval=10,
-            last_save_model_only=False,
-        ),
+        checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )
 
 
-def transformers_modeling_backend_sft_full() -> TransformersBackendConfig:
+def transformers_modeling_backend_sft_full(
+    seq_len: int = 2048,
+) -> TransformersBackendConfig:
     """SFT config with real HF pretrained weights loaded via initial_load_in_hf."""
 
     def process_sample(sample):
@@ -170,9 +212,11 @@ def transformers_modeling_backend_sft_full() -> TransformersBackendConfig:
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/qwen3_0.6b",
         hf_model="Qwen/Qwen3-0.6B",
-        model_spec=model_registry("sft_full"),
+        model=model_registry("sft_full", seq_len=seq_len),
         tokenizer=HFBackendTokenizer.Config(),
-        optimizer=default_adamw(lr=2e-5),
+        optimizer=OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=2e-5)]
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -180,25 +224,30 @@ def transformers_modeling_backend_sft_full() -> TransformersBackendConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
+            max_context_length=seq_len,
             steps=10,
         ),
-        dataloader=ChatDataLoader.Config(
-            dataset_path="json",
-            load_dataset_kwargs={
-                "data_files": "tests/assets/sft_test/data.json",
-                "split": "train",
-            },
-            sample_processor=process_sample,
+        dataloader=GrainDataLoader.Config(
+            dataset=FirstFitPackingConfig(
+                dataset=SingleDatasetConfig(
+                    source=HuggingFaceRandomAccessSource.Config(
+                        path="json",
+                        split="train",
+                        load_dataset_kwargs={
+                            "data_files": "tests/assets/sft_test/data.json",
+                        },
+                    ),
+                    processor=ChatProcessor.Config(messages_fn=process_sample),
+                    post_filters=(lambda sample: sample is not None,),
+                ),
+            ),
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
-            spmd_backend="partial_dtensor",
         ),
-        checkpoint=CheckpointManager.Config(
-            enable=True,
+        checkpointer=CheckpointManager.Config(
             initial_load_in_hf=True,
             initial_load_model_only=True,
             interval=10,
@@ -208,8 +257,10 @@ def transformers_modeling_backend_sft_full() -> TransformersBackendConfig:
     )
 
 
-def transformers_modeling_backend_sft_debugmodel() -> TransformersBackendConfig:
-    """SFT debug config for the transformers backend using ChatDataLoader."""
+def transformers_modeling_backend_sft_debugmodel(
+    seq_len: int = 1024,
+) -> TransformersBackendConfig:
+    """SFT debug config for the transformers backend."""
 
     def process_sample(sample):
         return [
@@ -221,9 +272,11 @@ def transformers_modeling_backend_sft_debugmodel() -> TransformersBackendConfig:
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
-        model_spec=model_registry("sft_debugmodel"),
+        model=model_registry("sft_debugmodel", seq_len=seq_len),
         tokenizer=HFBackendTokenizer.Config(),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -232,29 +285,32 @@ def transformers_modeling_backend_sft_debugmodel() -> TransformersBackendConfig:
         ),
         training=TrainingConfig(
             # Keep this small: this debug model uses the full Qwen3 vocab
-            # (~152k), so cross-entropy materializes a
-            # local_batch_size * seq_len * vocab logits tensor. batch=8,
-            # seq=2048 is ~9GB in fp32 and OOMs the 22GB CI GPUs.
-            local_batch_size=1,
-            seq_len=1024,
+            # (~152k), so cross-entropy materializes a num_tokens * vocab
+            # logits tensor. 16384 tokens is ~9GB in fp32 and OOMs the 22GB
+            # CI GPUs.
+            num_tokens_per_microbatch_per_dp_rank=1 * seq_len,
+            max_context_length=seq_len,
             steps=10,
         ),
-        dataloader=ChatDataLoader.Config(
-            dataset_path="json",
-            load_dataset_kwargs={
-                "data_files": "tests/assets/sft_test/data.json",
-                "split": "train",
-            },
-            sample_processor=process_sample,
+        dataloader=GrainDataLoader.Config(
+            dataset=FirstFitPackingConfig(
+                dataset=SingleDatasetConfig(
+                    source=HuggingFaceRandomAccessSource.Config(
+                        path="json",
+                        split="train",
+                        load_dataset_kwargs={
+                            "data_files": "tests/assets/sft_test/data.json",
+                        },
+                    ),
+                    processor=ChatProcessor.Config(messages_fn=process_sample),
+                    post_filters=(lambda sample: sample is not None,),
+                ),
+            ),
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
-            spmd_backend="partial_dtensor",
         ),
-        checkpoint=CheckpointManager.Config(
-            interval=10,
-            last_save_model_only=False,
-        ),
+        checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )

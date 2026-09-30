@@ -21,9 +21,11 @@ The EP passes use this module as their common contract layer:
 from __future__ import annotations
 
 import fnmatch
+import logging
 
 import operator
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,7 +34,9 @@ import torch.fx as fx
 from torch.utils._pytree import tree_leaves, tree_map
 
 from torchtitan.experiments.graph_trainer.common_utils import _is_backward_node
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
+
 
 aten = torch.ops.aten
 CHUNK_SYMBOL_HINTS_META = "torchtitan_chunk_symbol_hints"
@@ -157,19 +161,47 @@ class ChunkedRegion:
 
 
 def _chunk_owner(node: fx.Node) -> ChunkOwner | None:
-    if node.meta.get("chunked_region_role") != "body":
+    custom = node.meta.get("custom", {})
+    if not isinstance(custom, dict):
+        custom = {}
+
+    def get_meta(key: str) -> object:
+        return node.meta.get(key, custom.get(key))
+
+    if get_meta("chunked_region_role") != "body":
         return None
-    chunk_id = node.meta.get("chunk_id")
-    root = node.meta.get("chunked_region_fqn")
+    chunk_id = get_meta("chunk_id")
+    root = get_meta("chunked_region_fqn")
+    is_backward = get_meta("chunked_region_is_backward")
     if chunk_id not in (0, 1) or not isinstance(root, str):
         raise ValueError(f"Chunk body node {node.name} has incomplete chunk metadata.")
     return ChunkOwner(
         root_fqn=root,
         is_backward=bool(
-            node.meta.get("chunked_region_is_backward", _is_backward_node(node))
+            is_backward if is_backward is not None else _is_backward_node(node)
         ),
         chunk_id=chunk_id,
     )
+
+
+def _clear_chunk_ownership(nodes: Iterable[fx.Node]) -> None:
+    """Mark nodes shared by multiple chunks as outside every chunk body."""
+    keys = (
+        "chunk_id",
+        "chunked_region_fqn",
+        "chunked_region_is_backward",
+        "chunked_region_producer",
+        "chunked_region_role",
+    )
+    for node in nodes:
+        for key in keys:
+            node.meta.pop(key, None)
+        custom = node.meta.get("custom")
+        if isinstance(custom, dict):
+            custom = dict(custom)
+            for key in keys:
+                custom.pop(key, None)
+            node.meta["custom"] = custom
 
 
 def collect_chunked_regions(
@@ -313,9 +345,9 @@ def chunk_symbol_hints_for_mode(
             or (val := tensor_meta(node)) is None
         ):
             continue
-        dim = {"batch": 0, "seq": 1}.get(mode)
-        if dim is None:
+        if mode not in ("batch", "seq"):
             raise ValueError(f"Unknown chunk mode: {mode!r}")
+        dim = 0
         if dim < len(val.shape):
             _record_symbols_from_extent(
                 hints, val.shape[dim], source=f"{node.name}.shape[{dim}]"
@@ -324,9 +356,14 @@ def chunk_symbol_hints_for_mode(
 
 
 def _placeholder_symbol_hints(gm: fx.GraphModule) -> dict[object, int]:
+    chunk_symbols = chunk_symbol_hints_for_mode(gm).keys()
     hints: dict[object, int] = {}
     for node in gm.graph.nodes:
         if node.op != "placeholder" or (val := tensor_meta(node)) is None:
+            continue
+        # Keep all dimension hints of chunk inputs, but exclude independent
+        # metadata inputs whose runtime size queries must remain dynamic.
+        if not any(free_symbols(extent) & chunk_symbols for extent in val.shape):
             continue
         for dim, extent in enumerate(val.shape):
             _record_symbols_from_extent(

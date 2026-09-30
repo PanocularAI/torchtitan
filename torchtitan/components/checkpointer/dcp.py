@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 import enum
+import logging
 import os
 import queue
-import re
 import threading
 import time
 from concurrent.futures import Future
@@ -31,12 +31,12 @@ from torch.distributed.checkpoint.state_dict_saver import (
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
     BaseCheckpointManager,
     DATALOADER,
+    EMA,
     LR_SCHEDULER,
     MODEL,
     ModelWrapper,
@@ -44,11 +44,18 @@ from .base import (
     purge_thread,
 )
 
+logger = logging.getLogger(__name__)
+
+
 if TYPE_CHECKING:
     import torch.nn as nn
 
-    from torchtitan.components.dataloader import BaseDataLoader
-    from torchtitan.components.optimizer import (
+    from torchtitan.components.data.loader import BaseDataLoader
+
+    # The EMA class shares its name with the ``EMA = "ema"`` state-dict key
+    # constant imported above, so alias it here.
+    from torchtitan.components.optimizer import (  # noqa: N811
+        EMA as EMAContainer,
         LRSchedulersContainer,
         OptimizersContainer,
     )
@@ -63,6 +70,27 @@ class AsyncMode(str, enum.Enum):
 
 class SaveDone:
     pass
+
+
+class _FilesystemCheckpointStorage:
+    """``CheckpointStorage`` backed by ``torchtitan.tools.filesystem``.
+
+    Local paths go through ``os``/``shutil`` and remote fsspec URIs through
+    fsspec, so DCP keeps reading and writing remote checkpoint folders exactly
+    as it did before.
+    """
+
+    def isdir(self, path: str) -> bool:
+        return filesystem.isdir(path)
+
+    def isfile(self, path: str) -> bool:
+        return filesystem.isfile(path)
+
+    def listdir(self, path: str) -> list[str]:
+        return filesystem.listdir(path)
+
+    def remove(self, path: str) -> None:
+        filesystem.rmtree(path)
 
 
 class CheckpointManager(BaseCheckpointManager):
@@ -102,11 +130,13 @@ class CheckpointManager(BaseCheckpointManager):
         optimizers (OptimizersContainer): The optimizers used to optimize the model.
         lr_schedulers (LRSchedulersContainer): The lr schedulers used to optimize
             the model.
+        ema (Optional[EMA]): Online EMA of model weights, or None when the
+            user hasn't configured one (see torchtitan.components.optimizer.ema.EMA).
         states (Dict[str, Any]): The states that need to be saved, other than the
-            previous 4 components.
+            previous components.
         sd_adapter (Optional[type[BaseStateDictAdapter]]): The adapter used to convert
             model state dicts between native format and other formats.
-        base_folder (str): The base folder to save the checkpoint. Will be concatenated
+        base_folder (str): The base folder to save the checkpointer. Will be concatenated
             with config.folder
 
     """
@@ -135,17 +165,15 @@ class CheckpointManager(BaseCheckpointManager):
         model_parts: list[nn.Module],
         optimizers: OptimizersContainer,
         lr_schedulers: LRSchedulersContainer,
+        ema: EMAContainer | None,
         states: dict[str, Any],
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
     ) -> None:
 
-        self.enable = config.enable
-        if not self.enable:
-            return
-
         self.folder = filesystem.join(base_folder, config.folder)
         self.interval = config.interval
+        self._storage = _FilesystemCheckpointStorage()
 
         self.states = states
         self.states.update(
@@ -156,6 +184,8 @@ class CheckpointManager(BaseCheckpointManager):
                 LR_SCHEDULER: lr_schedulers,
             }
         )
+        if ema is not None:
+            self.states[EMA] = ema
 
         # Loading & Saving Policy
         self.load_only = config.load_only
@@ -173,7 +203,7 @@ class CheckpointManager(BaseCheckpointManager):
         self.sd_adapter = sd_adapter
         if self.last_save_in_hf and self.sd_adapter is None:
             raise ValueError(
-                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
+                "checkpointer.last_save_in_hf is True, but sd_adapter is not provided."
             )
 
         # Async & Distributed Infrastructure
@@ -194,12 +224,15 @@ class CheckpointManager(BaseCheckpointManager):
 
         # Retention Policy (Purge)
         self.keep_latest_k = config.keep_latest_k
+        self.purge_exempt = (
+            config.purge_exempt.build() if config.purge_exempt is not None else None
+        )
         self.purge_thread: threading.Thread | None = None
         if self.keep_latest_k > 0:
             self.purge_queue: queue.Queue[str | None] = queue.Queue()
             self.purge_thread = threading.Thread(
                 target=purge_thread,
-                args=(self.purge_queue, filesystem.rmtree),
+                args=(self.purge_queue, self._storage.remove),
                 daemon=True,
             )
             self.purge_thread.start()
@@ -210,7 +243,8 @@ class CheckpointManager(BaseCheckpointManager):
         )
 
     def __del__(self):
-        self.close()
+        if hasattr(self, "staging_future"):
+            self.close()
 
     def _close(self):
         if (
@@ -224,7 +258,6 @@ class CheckpointManager(BaseCheckpointManager):
         if self.stager is not None:
             self.stager.close()
 
-    @torch.no_grad()
     def dcp_save(
         self,
         state_dict: dict[str, Any],
@@ -241,7 +274,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         Args:
             state_dict (dict): The state dict to save.
-            checkpoint_id (str): Unique identifier (usually a path) for the checkpoint.
+            checkpoint_id (str): Unique identifier (usually a path) for the checkpointer.
             async_mode (AsyncMode): The saving/staging strategy.
             enable_garbage_collection (bool): To trigger a manual GC collect after save.
             to_hf (bool): If True, uses a HuggingFaceStorageWriter and adapts the
@@ -327,31 +360,33 @@ class CheckpointManager(BaseCheckpointManager):
 
         return ret
 
-    def dcp_load(
+    def _load_checkpoint(
         self,
-        state_dict: dict[str, Any],
+        states: dict[str, Any],
         checkpoint_id: str,
+        *,
         from_hf: bool,
         from_quantized: bool,
     ) -> None:
-        """Load a DCP into the provided state dictionary.
+        """Restore selected states through DCP or its Hugging Face reader.
 
         This method handles both standard DCP sharded checkpoints and HuggingFace
         safetensors. If loading from HF, it utilizes an adapter to map FQNs and
         handle format-specific sharding logic.
 
         Args:
-            state_dict (dict): The target dictionary to populate with checkpoint data.
-            checkpoint_id (str): Path or identifier for the source checkpoint.
-            from_hf (bool): If True, adapts the load process for HuggingFace model
+            states: Live state objects selected for restoration.
+            checkpoint_id: Path or identifier for the source checkpointer.
+            from_hf: If True, adapts the load process for HuggingFace model
                 definitions and safetensors format.
-            from_quantized (bool): Indicates if the source is in a quantized format
+            from_quantized: Indicates if the source is in a quantized format
                 (e.g., 4-bit/8-bit), requiring the storage reader to handle
                 specialized data types and sharding structures.
 
         Raises:
             AssertionError: If `from_hf` is True but no `sd_adapter` is available.
         """
+        state_dict = self._flattened_model_states_sd(states)
 
         if from_hf:
             assert self.sd_adapter is not None, (
@@ -367,17 +402,22 @@ class CheckpointManager(BaseCheckpointManager):
             dcp.load(hf_state_dict, storage_reader=hf_storage_reader)
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
-            self.states[MODEL].load_state_dict(state_dict)
+            states[MODEL].load_state_dict(state_dict)
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
-            if MODEL in self.states:
-                self.states[MODEL].load_state_dict(state_dict)
+            if MODEL in states:
+                states[MODEL].load_state_dict(state_dict)
 
-    @sl.log_trace_span("checkpoint_save")
-    @torch.no_grad()
+        # Reseed EMA from the just-loaded weights if it wasn't itself restored
+        # (excluded, or a model_only load). MODEL is never excludable, so its
+        # presence rules out torchft's per-replica dataloader-only load, which
+        # also calls _load_checkpoint but never includes MODEL.
+        if MODEL in states and EMA in self.states and EMA not in states:
+            self.states[EMA].load_state_dict({})
+
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         """Save the checkpoint for the current step.
 
@@ -403,12 +443,13 @@ class CheckpointManager(BaseCheckpointManager):
         sl.add_step_tag("checkpoint_save")
 
         self.maybe_wait_for_saving()
+        self._purge_stale_checkpoints(saving_step=curr_step)
 
         begin = time.monotonic()
         checkpoint_phase = (
             "saving" if self.async_mode == AsyncMode.DISABLED else "staging"
         )
-        logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
+        logger.info(f"{checkpoint_phase.capitalize()} the checkpointer.")
 
         if last_step:
             self._save_last_step(curr_step)
@@ -419,6 +460,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
         states = self._flattened_model_states_sd()
+        async_save_started_at: float | None = None
 
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             GarbageCollection.collect("GC collection invoked by checkpointer.")
@@ -432,6 +474,7 @@ class CheckpointManager(BaseCheckpointManager):
                     )
                 )
 
+            async_save_started_at = time.monotonic()
             result = self.dcp_save(
                 states,
                 checkpoint_id=checkpoint_id,
@@ -445,6 +488,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         elif self.async_mode == AsyncMode.ASYNC:
             GarbageCollection.collect("GC collection invoked by checkpointer.")
+            async_save_started_at = time.monotonic()
             result = self.dcp_save(
                 states,
                 checkpoint_id=checkpoint_id,
@@ -463,126 +507,22 @@ class CheckpointManager(BaseCheckpointManager):
                 enable_garbage_collection=True,
             )
 
-        self._purge_stale_checkpoints()
-
+        if async_save_started_at is not None:
+            assert self.save_future is not None
+            self.save_future.add_done_callback(
+                lambda _: sl.log_trace_scalar(
+                    {
+                        "train.checkpoint_write.native_dcp.execute.async_total.latency_ms": (
+                            time.monotonic() - async_save_started_at
+                        )
+                        * 1000
+                    }
+                )
+            )
         logger.info(
             f"Finished {checkpoint_phase} the checkpoint in "
             f"{time.monotonic() - begin:.2f} seconds."
         )
-        return True
-
-    @sl.log_trace_span("checkpoint_load")
-    @torch.no_grad()
-    def _load(self, step: int = -1) -> bool:
-        """Load the checkpoint for the given step.
-
-        This function orchestrates the states loading process.
-        If the local checkpoint folder contains a valid checkpoint, it retrieves the
-        checkpoint corresponding to the specified step, defaulting to the latest
-        available if the `step` is -1. Otherwise, it attempts an initial load from a
-        specified path (in either native or HF format) or performs loading using
-        provided HF assets path from the state dict adapter.
-
-        Args:
-            step (int, optional): The training step to restore.
-                Defaults to -1 (latest available).
-
-        Returns:
-            bool: Whether the checkpoint was successfully located and loaded.
-        """
-
-        model_only = False
-        from_hf = False
-        from_quantized = False
-
-        has_checkpoint_folder = filesystem.exists(self.folder)
-        load_step = -1
-        if has_checkpoint_folder:
-            load_step = self._find_load_step() if step == -1 else step
-
-        if step != -1 and not has_checkpoint_folder:
-            raise FileNotFoundError(
-                f"--checkpoint.load_step={step} not found because "
-                f"checkpoint.folder {self.folder} does not exist"
-            )
-
-        if load_step == -1:
-            model_only = self.initial_load_model_only
-            from_hf = self.initial_load_in_hf
-            from_quantized = self.initial_load_in_hf_quantized
-
-            if from_hf:
-                assert model_only, (
-                    "Only model can be loaded when loading from "
-                    "HF's safetensors checkpoint."
-                )
-            if from_quantized:
-                assert from_hf, "Quantized checkpoint can only be loaded from HF format"
-
-            if self.initial_load_path:
-                checkpoint_id = self.initial_load_path
-                if not filesystem.isdir(checkpoint_id):
-                    raise ValueError(
-                        f"Checkpoint.initial_load_path is invalid: {checkpoint_id}"
-                    )
-                if from_hf:
-                    logger.info(
-                        "Loading from HF safetensors from "
-                        f"--checkpoint.initial_load_path: {checkpoint_id}"
-                    )
-
-            elif from_hf:
-                assert (
-                    self.sd_adapter and self.sd_adapter.hf_assets_path
-                ), "from_hf=True requires sd_adapter and hf_assets_path."
-                checkpoint_id = self.sd_adapter.hf_assets_path
-                if not filesystem.isdir(checkpoint_id):
-                    raise ValueError(
-                        "model.hf_assets_path is being used to load HF weights "
-                        "but the path is not valid. Either make sure hf_assets_path is "
-                        "correct or provide a valid checkpoint.initial_load_path"
-                    )
-                logger.info(
-                    "Loading HF safetensors from "
-                    f"--model.hf_assets_path: {checkpoint_id}"
-                )
-
-            else:
-                logger.info("No checkpoint was provided, this is a fresh start.")
-                return False
-
-        else:
-            # This is the fault-tolerance branch: checkpoint.folder already
-            # contains valid checkpoints from a previous run, so we resume from
-            # it and all initial_* options are ignored by design. This allows a
-            # job to keep the same arguments across automatic restarts after
-            # failures.
-            step = load_step
-            model_only = step == 0
-            checkpoint_id = self._create_checkpoint_id(step)
-
-            if not filesystem.isdir(checkpoint_id):
-                raise FileNotFoundError(
-                    f"--checkpoint.load_step={step} not found at {checkpoint_id}"
-                )
-
-        logger.info(f"Loading the checkpoint from {checkpoint_id}.")
-        begin = time.monotonic()
-
-        states = self._states_to_load(model_only)
-        self.dcp_load(
-            states,
-            checkpoint_id=checkpoint_id,
-            from_hf=from_hf,
-            from_quantized=from_quantized,
-        )
-
-        GarbageCollection.collect("GC collection for checkpoint loading.")
-        logger.info(
-            "Finished loading the checkpoint in "
-            f"{time.monotonic() - begin:.2f} seconds."
-        )
-
         return True
 
     def _maybe_wait_for_staging(self) -> None:
@@ -631,63 +571,22 @@ class CheckpointManager(BaseCheckpointManager):
                 "self.save_future is not None, but self.async_mode is DISABLED."
             )
 
-        # Narrowing for the type checker: maybe_wait_for_saving only dispatches
-        # here when save_future is set.
-        assert self.save_future is not None
-        self.save_future.result()
+        # Clear before awaiting so a failed save is not retried by a later
+        # close() or __del__ call.
+        save_future = self.save_future
+        assert save_future is not None
         self.save_future = None
+        save_future.result()
 
-    def _find_load_step(self, folder: str = "") -> int:
-        """Identify the highest available checkpoint step in the specified directory.
+    def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
+        return self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata"))
 
-        This method scans the target folder for subdirectories matching the
-        'step-N' pattern. A folder is only considered a valid checkpoint if
-        it contains either a DCP metadata file or a HuggingFace safetensors
-        index.
-
-        Args:
-            folder (str, optional): The directory to scan. Defaults to `self.folder`.
-
-        Returns:
-            int: The maximum step number found among valid checkpoints,
-                or -1 if no valid checkpoints are detected.
-
-        Note:
-            This function is not remote friendly: it issues one listdir plus
-            up to two isfile probes per step folder, each a network round trip
-            on remote (fsspec) storage instead of a single batched listing.
-            Acceptable for now since it only runs once at load time.
-        """
-
-        folder = folder or self.folder
-        if not filesystem.isdir(folder):
-            return -1
-
-        pattern = r"step-(\d+)"
-        valid_steps = []
-
-        for filename in filesystem.listdir(folder):
-            match = re.search(pattern, filename)
-            if not match:
-                continue
-
-            # A checkpoint is valid only if it contains core metadata
-            checkpoint_path = filesystem.join(folder, filename)
-            is_dcp = filesystem.isfile(filesystem.join(checkpoint_path, ".metadata"))
-            is_hf = filesystem.isfile(
-                filesystem.join(checkpoint_path, "model.safetensors.index.json")
+    def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
+        return self._is_resumable_checkpoint(checkpoint_dir) or (
+            self._storage.isfile(
+                filesystem.join(checkpoint_dir, "model.safetensors.index.json")
             )
-
-            if is_dcp or is_hf:
-                valid_steps.append(int(match.group(1)))
-
-        return max(valid_steps) if valid_steps else -1
-
-    def _create_checkpoint_id(self, step: int, folder: str = "") -> str:
-        """Generate the standardized filesystem path for a checkpoint
-        (e.g., 'checkpoints/step-100')."""
-        folder = folder or self.folder
-        return filesystem.join(folder, f"step-{step}")
+        )
 
     def _flattened_model_states_sd(
         self, state_dict: dict[str, Any] | None = None
@@ -711,36 +610,6 @@ class CheckpointManager(BaseCheckpointManager):
         if MODEL in states:
             sd.update(states[MODEL].state_dict())
         return sd
-
-    def _states_to_load(self, model_only: bool) -> dict[str, Any]:
-        """Determine which state objects should be restored during loading.
-
-        This method filters the checkpointer's state dictionary based on the
-        loading context. It supports partial restoration for specific steps
-        (e.g., loading only model weights for step 0) and respects explicit
-        exclusion rules for auxiliary states.
-
-        Args:
-            model_only (bool): If True, returns only the model's parameters,
-                bypassing optimizers and other training metadata.
-
-        Returns:
-            dict[str, Any]: A prepared dictionary of states to be passed to
-                the loader.
-        """
-        # For the first step, we will only load the model.
-        if model_only:
-            return self.states[MODEL].state_dict()
-
-        for exclude_key in self.exclude_from_loading:
-            if exclude_key not in self.states:
-                raise ValueError(f"{exclude_key} not found in state_dict.")
-
-        states_to_load = {
-            k: v for k, v in self.states.items() if k not in self.exclude_from_loading
-        }
-
-        return self._flattened_model_states_sd(states_to_load)
 
     def _save_last_step(self, curr_step: int) -> None:
         """Execute the final checkpoint save at the completion of training.
@@ -790,52 +659,3 @@ class CheckpointManager(BaseCheckpointManager):
             enable_garbage_collection=True,
             to_hf=self.last_save_in_hf,
         )
-
-    def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
-        """Determine whether a checkpoint should be saved based on
-        the current step, interval, and training status."""
-
-        if not self.enable or self.load_only:
-            return False
-
-        if curr_step == 1 and self.enable_first_step_checkpoint:
-            return True
-
-        if last_step:
-            return True
-
-        if curr_step % self.interval == 0:
-            return True
-
-        return False
-
-    def _should_purge(self) -> bool:
-        """Whether this rank should purge stale checkpoints.
-
-        Extracted so subclasses (e.g. TorchFTCheckpointManager) can add
-        additional guards (like participating_rank) without duplicating
-        the purge loop in _purge_stale_checkpoints.
-        """
-        return (
-            self.keep_latest_k > 0
-            and dist.get_rank() == 0
-            and filesystem.isdir(self.folder)
-        )
-
-    def _purge_stale_checkpoints(self):
-        """Remove older checkpoint directories from storage to maintain
-        only the most recent 'k' copies."""
-        if self._should_purge():
-            discovered_checkpoints = []
-            for filename in filesystem.listdir(self.folder):
-                match = re.search(r"step-(\d+)", filename)
-                if match:
-                    path = filesystem.join(self.folder, filename)
-                    discovered_checkpoints.append((int(match.group(1)), path))
-
-            discovered_checkpoints.sort()
-            to_delete = discovered_checkpoints[: -1 * self.keep_latest_k]
-
-            for _, path in to_delete:
-                assert self.purge_thread is not None
-                self.purge_queue.put(path)

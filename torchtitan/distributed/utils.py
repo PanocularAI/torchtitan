@@ -6,73 +6,32 @@
 
 from __future__ import annotations
 
-import contextlib
+import logging
 import math
 import os
-from abc import abstractmethod
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed._functional_collectives as funcol
+import torch.distributed.config as dist_config
 import torch.distributed.distributed_c10d as c10d
 import torch.distributed.tensor._random
 import torch.distributed.tensor.parallel
-from spmd_types.checker import typecheck as spmd_typecheck
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Placement, Shard
 
 from torchtitan.config import CommConfig, DebugConfig
-from torchtitan.tools.logging import logger
+from torchtitan.distributed.parallelism_context import DistributedTopology
 from torchtitan.tools.utils import device_module, device_type, get_local_device
 
+logger = logging.getLogger(__name__)
+
+
 if TYPE_CHECKING:
-    from torchtitan.distributed.parallel_dims import ParallelDims
-
-
-_spmd_backend = "spmd_types"
-
-
-def set_spmd_backend(spmd_backend: str) -> None:
-    """Set the active SPMD backend for distributed runtime helpers."""
-    global _spmd_backend
-    _spmd_backend = spmd_backend
-
-
-def get_spmd_backend() -> str:
-    """Return the active SPMD backend."""
-    return _spmd_backend
-
-
-def check_dtensor_placements_match(
-    actual: tuple[Placement, ...],
-    expected: tuple[Placement, ...],
-    tensor_ndim: int,
-) -> bool:
-    """Compare DTensor placements, normalizing negative Shard dims to tensor rank."""
-    if len(actual) != len(expected):
-        return False
-
-    def normalize_dim(dim: int, ndim: int) -> int:
-        return dim + ndim if dim < 0 else dim
-
-    for actual_placement, expected_placement in zip(actual, expected, strict=True):
-        if isinstance(actual_placement, Shard) and isinstance(
-            expected_placement, Shard
-        ):
-            if normalize_dim(actual_placement.dim, tensor_ndim) != normalize_dim(
-                expected_placement.dim, tensor_ndim
-            ):
-                return False
-            continue
-
-        if actual_placement != expected_placement:
-            return False
-
-    return True
+    from torchtitan.distributed.parallelism_context import ParallelismContext
 
 
 def _dist_reduce(
@@ -103,25 +62,6 @@ def _dist_reduce_tensor(
 ) -> torch.Tensor:
     """Perform a distributed reduction without moving the result to the CPU."""
     needs_wait = False
-    if isinstance(x, DTensor):
-        # loss being a DTensor can be 1) full dtensor or 2) non-full dtensor but
-        # TP is enabled. For the former one, a single `full_tensor()` call is enough
-        # but for the later one, we need to treat it as a plain tensor. Since there
-        # is no robust way to distinguish the two and `full_tensor()` may result in
-        # multiple all_reduce() (one for dp_shard and one for CP), we always use
-        # `to_local()` to ensure loss parity in both cases.
-        assert all(p.is_replicate() or p.is_partial() for p in x.placements), (
-            f"_dist_reduce received a DTensor with unsupported placements "
-            f"{x.placements}; only Replicate/Partial are supported."
-        )
-        if extra_pg is not None:
-            raise ValueError(
-                "_dist_reduce does not support DTensor input combined with "
-                "extra_pg: pass a plain tensor when using extra_pg."
-            )
-        x = x.to_local()
-
-    # Plain tensor path.
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
         needs_wait = True
@@ -174,26 +114,27 @@ def dist_mean(
 
 
 def set_determinism(
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
     device: torch.device,
     debug_config: DebugConfig,
-    distinct_seed_mesh_dims: list[str],
+    distinct_seed_mesh_axes: list[str],
 ) -> None:
     """
-    Set the same DTensor manual seed for all dimensions in world mesh, but only different seeds
-    across dimensions denoted by `distinct_seed_mesh_dims`. An example use case is pipeline parallelism,
-    where we want to have the same seed across SPMD groups, but different seeds across PP groups.
+    Set the same distributed RNG seed for all axes in the world mesh, but use
+    different seeds across axes named by ``distinct_seed_mesh_axes``. For
+    example, pipeline stages should use different seeds while ranks within an
+    SPMD group use the same seed.
 
-    Currently, does not set seeds for the CUDA RNG since TorchTitan always uses DTensor for SPMD parallelisms,
-    and DTensor manages its own RNG tracker, but we could extend to support both if needed.
+    This uses PyTorch's DTensor RNG tracker because it provides mesh-aware RNG
+    offsets for sharded parameter initialization.
 
     Set Determinism flags for increased reproducibility with loss of performance.
 
     Args:
-        world_mesh: Device mesh for distributed training
+        parallelism_context: Parallelism context for distributed training.
         device: Device to use
         debug_config: Debug config to use
-        distinct_seed_mesh_dims: List of mesh dimension names to have distinct seeds across.
+        distinct_seed_mesh_axes: Mesh axis names that receive distinct seeds.
     """
     if debug_config.deterministic:
         logger.info("Deterministic algorithm enabled (expect perf degradation).")
@@ -214,7 +155,7 @@ def set_determinism(
 
         from torch.nn.attention.flex_attention import flex_attention
 
-        from torchtitan.models.common.attention import FlexAttention
+        from torchtitan.models.common.attention import FlexInnerAttention
 
         if torch.version.hip is not None:
             # Compiled ROCm flex attention is not deterministic.
@@ -222,17 +163,17 @@ def set_determinism(
             logger.info(
                 "Using eager (non-compiled) flex_attention for determinism on ROCm."
             )
-            FlexAttention._compiled_flex_attn = flex_attention
+            FlexInnerAttention._compiled_flex_attn = flex_attention
         else:
             # Ensure flex_attention is compiled without max-autotune. This is needed to ensure
             # reproducibility, since the autotune results may not be deterministic. We disable
-            # autotune in-place on FlexAttention.inductor_configs (rather than recompiling with
+            # autotune in-place on FlexInnerAttention.inductor_configs (rather than recompiling with
             # no options) so the regional-inductor scoop configs are preserved.
-            FlexAttention.inductor_configs["max_autotune"] = False
-            FlexAttention.inductor_configs["coordinate_descent_tuning"] = False
+            FlexInnerAttention.inductor_configs["max_autotune"] = False
+            FlexInnerAttention.inductor_configs["coordinate_descent_tuning"] = False
             # pyrefly: ignore [no-matching-overload]
-            FlexAttention._compiled_flex_attn = torch.compile(
-                flex_attention, options=FlexAttention.inductor_configs
+            FlexInnerAttention._compiled_flex_attn = torch.compile(
+                flex_attention, options=FlexInnerAttention.inductor_configs
             )
 
     if debug_config.detect_anomaly:
@@ -246,7 +187,7 @@ def set_determinism(
         torch.autograd.set_detect_anomaly(True, check_nan=False)
 
     seed = debug_config.seed
-    if parallel_dims.world_size == 1:
+    if parallelism_context.world_size == 1:
         if seed is not None:
             torch.manual_seed(seed)
             os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
@@ -263,34 +204,34 @@ def set_determinism(
         seed = seed_tensor.to("cpu").view(torch.uint64).item()
     assert isinstance(seed, int)
 
-    # Set distinct seed for each rank in mesh dimensions, with dimension names provided by `distinct_seed_mesh_dims`
+    # Set distinct seeds across the requested mesh axes.
     # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
     # and choose a unique seed for each rank on the PP mesh.
     # We support multiple distinct dimensions by adding each distinct dimension's local rank to the seed.
     distinct_seed_meshes = [
-        parallel_dims.get_optional_mesh(dim) for dim in distinct_seed_mesh_dims
+        parallelism_context.get_optional_mesh(axis) for axis in distinct_seed_mesh_axes
     ]
     distinct_seed_meshes = [mesh for mesh in distinct_seed_meshes if mesh is not None]
     assert all(mesh is not None for mesh in distinct_seed_meshes)
 
     if distinct_seed_meshes:
-        # Each dimension contributes: local_rank * (product of all previous dimension sizes)
+        # Each axis contributes: local_rank * (product of all previous axis sizes).
         # This guarantees uniqueness like multi-dimensional array indexing
         seed_offset = 0
         cumulative_size = 1
 
         for distinct_mesh in distinct_seed_meshes:
             local_rank = distinct_mesh.get_local_rank()
-            # Add contribution from this dimension
+            # Add this axis's contribution.
             seed_offset += local_rank * cumulative_size
-            # Update cumulative size for next dimension
+            # Update cumulative size for the next axis.
             cumulative_size *= distinct_mesh.size()
 
         seed += seed_offset
         seed %= 2**64
 
         logger.debug(
-            f"Distinct dims {distinct_seed_mesh_dims}, Global rank {c10d.get_rank()} using seed: {seed}"
+            f"Distinct axes {distinct_seed_mesh_axes}, Global rank {c10d.get_rank()} using seed: {seed}"
         )
 
     else:
@@ -305,10 +246,12 @@ def set_determinism(
     # all ranks of the SPMD mesh. If PP is also used, this seed is unique per PP rank.
     # TODO: remove the need of passing in a mesh once
     # torch.distributed.tensor._random.manual_seed doesn't require a mesh input.
-    if parallel_dims.world_size > parallel_dims.pp:
+    if parallelism_context.world_size > parallelism_context.pp:
         # We just need to pass the world_mesh as the device_id is the only information
         # this API uses.
-        torch.distributed.tensor._random.manual_seed(seed, parallel_dims.world_mesh)
+        torch.distributed.tensor._random.manual_seed(
+            seed, parallelism_context.world_mesh
+        )
 
 
 _batch_invariant_enabled: bool = False
@@ -317,6 +260,28 @@ _batch_invariant_enabled: bool = False
 def is_in_batch_invariant_mode() -> bool:
     """Return whether batch-invariant mode is active."""
     return _batch_invariant_enabled
+
+
+def enable_fp32_matmul_emulation_with_bf16x9() -> None:
+    """Enable BF16x9 emulation for FP32 CUDA matmuls where supported."""
+    if (
+        device_type != "cuda"
+        or not torch.cuda.is_available()
+        or torch.version.hip is not None
+        or torch.cuda.get_device_capability() < (10, 0)
+    ):
+        return
+
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "bfx9"
+    except (AttributeError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "TorchTitan on NVIDIA GPUs with compute capability 10.0 or later "
+            "requires PyTorch with CUDA BFX9 matmul support "
+            "(pytorch/pytorch#195301) and CUDA 12.9 or later."
+        ) from exc
+
+    logger.info("Enabled BF16x9 emulation for FP32 CUDA matmuls")
 
 
 def set_batch_invariance(enable: bool) -> None:
@@ -345,7 +310,7 @@ def set_batch_invariance(enable: bool) -> None:
 
     # Set NCCL env vars for deterministic inter-GPU collectives.
     # Must be set BEFORE dist.init_process_group.
-    # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/batch_invariant.py
+    # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/determinism/batch_invariant.py
     os.environ["NCCL_LAUNCH_MODE"] = "GROUP"  # Fixed kernel launch ordering
     os.environ[
         "NCCL_COLLNET_ENABLE"
@@ -392,46 +357,8 @@ def set_batch_invariance(enable: bool) -> None:
     )
 
 
-class SpmdContext(Protocol):
-    @abstractmethod
-    def __call__(self) -> contextlib.AbstractContextManager[None]:
-        pass
-
-
-def get_spmd_context(
-    *,
-    parallel_dims: "ParallelDims | None" = None,
-    spmd_typechecking: bool = False,
-) -> SpmdContext:
-    @contextlib.contextmanager
-    def context():
-        with contextlib.ExitStack() as stack:
-            if parallel_dims is not None and parallel_dims.spmd_backend == "spmd_types":
-                if not parallel_dims._single_axis_meshes:
-                    parallel_dims.build_mesh()
-                from torchtitan.distributed.spmd_types import (
-                    set_current_spmd_mesh,
-                    set_spmd_meshes,
-                    spmd_dense_mesh,
-                )
-
-                set_spmd_meshes(
-                    dense_mesh=parallel_dims.spmd_dense_mesh(),
-                    sparse_mesh=parallel_dims.spmd_sparse_mesh(),
-                )
-
-                stack.enter_context(set_current_spmd_mesh(spmd_dense_mesh()))
-            if spmd_typechecking:
-                stack.enter_context(spmd_typecheck(local=False))
-
-            yield
-
-    return context
-
-
 def init_fake_mode(
     world_size: int,
-    comm_mode: str = "fake_backend",
     *,
     rank: int = 0,
 ) -> None:
@@ -439,9 +366,7 @@ def init_fake_mode(
 
     Args:
         world_size: The number of GPUs to simulate
-        comm_mode: Communication mode ("fake_backend" or "local_tensor")
         rank: Global rank to simulate
-
     """
     torch.distributed.init_process_group(
         "fake",
@@ -449,12 +374,105 @@ def init_fake_mode(
         world_size=world_size,
     )
 
-    # If local_tensor mode is enabled, initialize LocalTensorMode context
-    if comm_mode == "local_tensor":
-        from torch.distributed import _local_tensor
 
-        lm = _local_tensor.LocalTensorMode(world_size)
-        lm.__enter__()
+def _env_int(name: str, *, default: int | None = None) -> int:
+    """Read an integer environment variable with an actionable error."""
+    value = os.environ.get(name)
+    if value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{name} environment variable must be set")
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{name} environment variable must be a valid integer, got: {value}"
+        ) from error
+
+
+def _fake_logical_rank(logical_world_size: int, pp_degree: int) -> int:
+    """Resolve a pure-fake logical rank with SPMD coordinate zero."""
+    if logical_world_size % pp_degree != 0:
+        raise ValueError(
+            f"Logical world size {logical_world_size} must be divisible by PP "
+            f"degree {pp_degree}"
+        )
+    pp_rank = _env_int("FAKE_PP_RANK", default=0 if pp_degree == 1 else None)
+    spmd_world_size = logical_world_size // pp_degree
+    if not 0 <= pp_rank < pp_degree:
+        raise ValueError(f"FAKE_PP_RANK must be in [0, {pp_degree}), got {pp_rank}")
+    return pp_rank * spmd_world_size
+
+
+def _init_real_pp_fake_spmd(
+    logical_world_size: int,
+    pp_degree: int,
+    timeout: timedelta,
+) -> DistributedTopology:
+    """Initialize real PP communication inside a fake logical SPMD world."""
+    physical_world_size = _env_int("WORLD_SIZE")
+    physical_rank = _env_int("RANK")
+    if physical_world_size != pp_degree:
+        raise ValueError(
+            "real-PP/fake-SPMD mode requires one physical process per PP rank: "
+            f"WORLD_SIZE={physical_world_size}, PP={pp_degree}"
+        )
+    if not 0 <= physical_rank < physical_world_size:
+        raise ValueError(
+            f"RANK must be in [0, {physical_world_size}), got {physical_rank}"
+        )
+    if logical_world_size % pp_degree != 0:
+        raise ValueError(
+            f"Logical world size {logical_world_size} must be divisible by PP "
+            f"degree {pp_degree}"
+        )
+
+    if "FAKE_PP_RANK" in os.environ:
+        raise ValueError(
+            "FAKE_PP_RANK is invalid with the real_pp_fake_spmd backend; "
+            "physical RANK selects the PP coordinate"
+        )
+    spmd_world_size = logical_world_size // pp_degree
+    logical_rank = physical_rank * spmd_world_size
+    logical_pp_ranks = [pp_rank * spmd_world_size for pp_rank in range(pp_degree)]
+    init_fake_mode(logical_world_size, rank=logical_rank)
+
+    rendezvous = dist.rendezvous(
+        "env://",
+        rank=physical_rank,
+        world_size=physical_world_size,
+        timeout=timeout,
+    )
+    store, rendezvous_rank, rendezvous_world_size = next(rendezvous)
+    if (rendezvous_rank, rendezvous_world_size) != (
+        physical_rank,
+        physical_world_size,
+    ):
+        raise RuntimeError("Physical PP rendezvous returned inconsistent topology")
+
+    group_name = c10d.GroupName("torchtitan_real_pp")
+    pp_group, _ = c10d._new_process_group_helper(
+        group_size=physical_world_size,
+        group_rank=physical_rank,
+        global_ranks_in_group=logical_pp_ranks,
+        backend="nccl",
+        store=store,
+        group_name=group_name,
+        timeout=timeout,
+        pg_tag=group_name,
+        device_id=get_local_device(),
+        group_desc="TorchTitan real pipeline group",
+    )
+    if not isinstance(pp_group, dist.ProcessGroup):
+        raise RuntimeError("Failed to construct the real PP process group")
+    c10d._world.pg_group_ranks[pp_group] = {
+        logical_rank: group_rank
+        for group_rank, logical_rank in enumerate(logical_pp_ranks)
+    }
+    return DistributedTopology(
+        world_size=logical_world_size,
+        real_pp_group_for_fake_spmd=pp_group,
+    )
 
 
 def init_distributed(
@@ -462,45 +480,47 @@ def init_distributed(
     enable_cpu_backend: bool = False,
     base_folder: str = "",
     ranks: list[int] | None = None,
-) -> int:
+    *,
+    pipeline_parallel_degree: int = 1,
+) -> DistributedTopology:
+    """Initialize communication and return the logical distributed topology."""
+    enable_fp32_matmul_emulation_with_bf16x9()
+
     # Skip initialization if already initialized
     if torch.distributed.is_initialized():
         logger.warning(
             "torch.distributed is already initialized. Skipping init_distributed. "
             "The provided comm_config and other settings will not take effect."
         )
-        return torch.distributed.get_world_size()
+        return DistributedTopology(torch.distributed.get_world_size())
+
+    # Directed physical PP edges need independent, preinitialized communicator
+    # FIFOs so eager execution and CUDA graph replay use deterministic ordering.
+    # Use setattr because this config is absent from some PyTorch type stubs.
+    setattr(  # noqa: B010
+        dist_config, "pipeline_per_edge_p2p", pipeline_parallel_degree > 1
+    )
 
     # disable autograd multithreading, to enable TLS DeviceMesh stack for spmd_types backend.
     # this is needed for AC functionality; multi-threaded autograd means BWD threads performing recompute,
     # cannot access PGs, e.g. current_spmd_mesh().get_group("tp") to perform the collectives they need.
     torch.autograd.set_multithreading_enabled(False)
 
-    if comm_config.mode in ("fake_backend", "local_tensor"):
-        ngpu_str = os.environ.get("NGPU")
-        if ngpu_str is None:
-            raise ValueError(
-                f"NGPU environment variable must be set when using comm_mode={comm_config.mode}"
+    if comm_config.backend in {"fake", "real_pp_fake_spmd"}:
+        logical_world_size = _env_int("NGPU")
+        if comm_config.backend == "real_pp_fake_spmd":
+            return _init_real_pp_fake_spmd(
+                logical_world_size,
+                pipeline_parallel_degree,
+                timedelta(seconds=comm_config.init_timeout_seconds),
             )
-        try:
-            world_size = int(ngpu_str)
-        except ValueError as e:
+        rank = _fake_logical_rank(logical_world_size, pipeline_parallel_degree)
+        if not 0 <= rank < logical_world_size:
             raise ValueError(
-                f"NGPU environment variable must be a valid integer, got: {ngpu_str}"
-            ) from e
-        rank_str = os.environ.get("RANK", "0")
-        try:
-            rank = int(rank_str)
-        except ValueError as e:
-            raise ValueError(
-                f"RANK environment variable must be a valid integer, got: {rank_str}"
-            ) from e
-        if not 0 <= rank < world_size:
-            raise ValueError(
-                f"RANK must be in [0, {world_size}) for fake mode, got: {rank}"
+                f"Fake rank must be in [0, {logical_world_size}), got {rank}"
             )
-        init_fake_mode(world_size, comm_config.mode, rank=rank)
-        return world_size
+        init_fake_mode(logical_world_size, rank=rank)
+        return DistributedTopology(logical_world_size)
 
     def _warn_overwrite_env(env, val):
         if env in os.environ:
@@ -541,32 +561,18 @@ def init_distributed(
         os.makedirs(dump_dir, exist_ok=True)
         _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
-    device_id: torch.device | None = None
-    if comm_config.mode == "torchcomms":
-        try:
-            import torchcomms  # noqa: F401
-        except ImportError as err:
-            raise ImportError(
-                "torchcomms package is required for --comm.mode=torchcomms."
-            ) from err
-        import torch.distributed.config as dist_config
-
-        dist_config.use_torchcomms = True
-        device_id = get_local_device()
-
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),
         timeout=timedelta(seconds=comm_config.init_timeout_seconds),
         _ranks=ranks if ranks is not None else [],
-        device_id=device_id,
     )
 
-    return torch.distributed.get_world_size()
+    return DistributedTopology(torch.distributed.get_world_size())
 
 
 def set_pg_timeouts(
     timeout: timedelta,
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
 ):
     """
     Sets the timeout for all PGs in the provided mesh, and the default (world) group.
@@ -589,7 +595,7 @@ def set_pg_timeouts(
     # None represents the 'default' PG, not part of the mesh
     groups: list[torch.distributed.ProcessGroup | None] = [
         mesh.get_group()
-        for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
+        for mesh in parallelism_context.get_all_one_dimensional_meshes().values()
     ] + [None]
     # torch nightlies around 2.13 ship only the private spelling of this API
     # (fork compat shim; drops out once the pin has the public one again).
